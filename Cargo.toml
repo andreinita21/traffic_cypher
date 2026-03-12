@@ -1,8 +1,8 @@
 [package]
 name = "traffic_cypher"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Derive cryptographic keys from live traffic stream entropy"
+description = "Traffic-entropy password manager with rotating encryption keys"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -21,3 +21,8 @@ aes-gcm = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rpassword = "7"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+totp-rs = { version = "5", features = ["gen_secret"] }
+rand = "0.8"

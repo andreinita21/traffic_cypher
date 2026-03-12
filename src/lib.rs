@@ -1,1 +1,12 @@
 pub mod vault;
+pub mod crypto_derivation;
+pub mod entropy_extractor;
+pub mod entropy_pool;
+pub mod frame_sampler;
+pub mod stream_ingestion;
+pub mod system_entropy_mixer;
+pub mod multi_stream;
+pub mod key_rotation;
+pub mod totp;
+pub mod password_gen;
+pub mod web;
