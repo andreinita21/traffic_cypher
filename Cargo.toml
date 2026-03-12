@@ -1,0 +1,23 @@
+[package]
+name = "traffic_cypher"
+version = "0.1.0"
+edition = "2021"
+description = "Derive cryptographic keys from live traffic stream entropy"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+hex = "0.4"
+base64 = "0.22"
+getrandom = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["pnm"] }
+aes-gcm = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rpassword = "7"
