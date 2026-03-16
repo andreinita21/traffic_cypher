@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
     println!(r#"
 ╔══════════════════════════════════════════════════════════╗
 ║                                                          ║
-║   🚦  T R A F F I C   C Y P H E R  🔐                  ║
+║     T R A F F I C   C Y P H E R                          ║
 ║   Entropy-Driven Password Manager                        ║
 ║                                                          ║
 ║   Dashboard: http://127.0.0.1:9876                       ║

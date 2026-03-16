@@ -16,6 +16,10 @@ pub struct AppState {
     pub last_activity: Arc<RwLock<Instant>>,
     pub auto_lock_minutes: Arc<RwLock<u64>>,
     pub rotation_cancel: Arc<RwLock<Option<tokio::sync::watch::Sender<bool>>>>,
+    /// The unwrapped Data Encryption Key — held in memory only while unlocked
+    pub current_dek: Arc<RwLock<Option<[u8; 32]>>>,
+    /// Where the current DEK's entropy came from ("traffic" or "os")
+    pub entropy_source: Arc<RwLock<String>>,
 }
 
 impl AppState {
@@ -30,6 +34,8 @@ impl AppState {
             last_activity: Arc::new(RwLock::new(Instant::now())),
             auto_lock_minutes: Arc::new(RwLock::new(5)),
             rotation_cancel: Arc::new(RwLock::new(None)),
+            current_dek: Arc::new(RwLock::new(None)),
+            entropy_source: Arc::new(RwLock::new("os".to_string())),
         }
     }
 

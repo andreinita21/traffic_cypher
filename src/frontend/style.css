@@ -1035,3 +1035,361 @@ input[type="password"] {
     justify-content: center;
     height: 100%;
 }
+
+/* ===================================================================
+   DANGER MODE
+   =================================================================== */
+
+.danger-mode {
+    border-color: rgba(239, 68, 68, 0.4) !important;
+    box-shadow:
+        0 0 0 1px rgba(239, 68, 68, 0.1) inset,
+        0 8px 32px rgba(0, 0, 0, 0.4),
+        0 0 80px -20px rgba(239, 68, 68, 0.3),
+        0 0 120px -40px rgba(239, 68, 68, 0.15) !important;
+    animation: dangerPulseBorder 2s ease-in-out infinite;
+}
+
+.danger-mode::before {
+    background: linear-gradient(90deg, transparent, rgba(239, 68, 68, 0.2), transparent) !important;
+}
+
+.danger-mode::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: rgba(239, 68, 68, 0.03);
+    border-radius: inherit;
+    pointer-events: none;
+    z-index: 0;
+}
+
+.danger-field {
+    border-color: rgba(239, 68, 68, 0.3) !important;
+    background: rgba(239, 68, 68, 0.06) !important;
+    box-shadow: 0 0 30px -10px rgba(239, 68, 68, 0.2);
+}
+
+.danger-timer {
+    position: relative;
+    width: 36px;
+    height: 36px;
+    flex-shrink: 0;
+}
+
+.danger-timer svg {
+    transform: rotate(-90deg);
+}
+
+.danger-countdown-text {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--danger);
+    text-shadow: 0 0 8px rgba(239, 68, 68, 0.5);
+}
+
+.danger-modal h3 {
+    color: var(--danger);
+}
+
+@keyframes dangerPulseBorder {
+    0%, 100% { border-color: rgba(239, 68, 68, 0.4); }
+    50% { border-color: rgba(239, 68, 68, 0.15); }
+}
+
+/* ===================================================================
+   ENCRYPTION VISUALIZER
+   =================================================================== */
+
+.visualizer-page {
+    padding: 32px 40px;
+    max-width: 900px;
+    margin: 0 auto;
+    overflow-y: auto;
+    height: calc(100vh - 56px);
+}
+
+.viz-header {
+    text-align: center;
+    margin-bottom: 36px;
+}
+
+.viz-header h2 {
+    font-size: 24px;
+    font-weight: 700;
+    background: linear-gradient(135deg, var(--green-bright), var(--green-glow));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin-bottom: 6px;
+}
+
+.viz-header p {
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
+.viz-live-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 12px;
+    padding: 4px 14px;
+    border-radius: 20px;
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.2);
+    color: #f87171;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
+}
+
+.viz-live-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #ef4444;
+    box-shadow: 0 0 8px #ef4444;
+    animation: pulse 1.5s infinite;
+}
+
+/* Pipeline layout */
+.viz-pipeline {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+    margin-bottom: 36px;
+}
+
+/* Nodes */
+.viz-node {
+    width: 100%;
+    max-width: 520px;
+    padding: 20px 24px;
+    text-align: center;
+    position: relative;
+    transition: all 0.3s ease;
+}
+
+.viz-node-active {
+    border-color: rgba(80, 255, 120, 0.25) !important;
+    box-shadow:
+        0 0 0 1px rgba(80, 255, 120, 0.08) inset,
+        0 8px 32px rgba(0, 0, 0, 0.4),
+        0 0 40px -10px rgba(34, 197, 94, 0.3) !important;
+}
+
+.viz-node-accent {
+    border-color: rgba(80, 255, 120, 0.2);
+    box-shadow:
+        0 0 0 1px rgba(80, 255, 120, 0.06) inset,
+        0 8px 32px rgba(0, 0, 0, 0.4),
+        0 0 60px -15px rgba(34, 197, 94, 0.25);
+}
+
+.viz-node-icon {
+    font-size: 28px;
+    margin-bottom: 6px;
+    filter: drop-shadow(0 0 12px var(--green-neon));
+}
+
+.viz-node-label {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text-primary);
+    letter-spacing: 0.3px;
+    margin-bottom: 4px;
+}
+
+.viz-node-detail {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+/* Connectors */
+.viz-connector {
+    width: 2px;
+    height: 28px;
+    position: relative;
+    background: rgba(80, 255, 120, 0.1);
+}
+
+.viz-particles {
+    position: absolute;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--green-glow);
+    box-shadow: 0 0 6px var(--green-glow), 0 0 12px var(--green-neon);
+    animation: particleFlow 1s ease-in-out infinite;
+}
+
+@keyframes particleFlow {
+    0% { top: 0; opacity: 0; }
+    20% { opacity: 1; }
+    80% { opacity: 1; }
+    100% { top: 100%; opacity: 0; }
+}
+
+/* Scanlines overlay */
+.viz-scanlines {
+    position: absolute;
+    inset: 0;
+    background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(80, 255, 120, 0.015) 2px,
+        rgba(80, 255, 120, 0.015) 4px
+    );
+    pointer-events: none;
+    border-radius: inherit;
+    animation: scanlineScroll 3s linear infinite;
+}
+
+@keyframes scanlineScroll {
+    0% { background-position-y: 0; }
+    100% { background-position-y: 40px; }
+}
+
+/* Hex flow */
+.viz-hex-flow {
+    font-family: 'SF Mono', 'Fira Code', monospace !important;
+    font-size: 13px !important;
+    color: var(--green-bright) !important;
+    letter-spacing: 1.5px;
+    text-shadow: 0 0 8px var(--green-neon);
+    transition: all 0.15s;
+}
+
+/* Pool slots */
+.viz-pool-slots {
+    display: flex;
+    gap: 6px;
+    justify-content: center;
+    margin: 10px 0 6px;
+}
+
+.viz-slot {
+    width: 32px;
+    height: 18px;
+    border-radius: 4px;
+    background: rgba(80, 255, 120, 0.04);
+    border: 1px solid rgba(80, 255, 120, 0.08);
+    transition: all 0.4s ease;
+}
+
+.viz-slot.filled {
+    background: rgba(34, 197, 94, 0.25);
+    border-color: rgba(80, 255, 120, 0.3);
+    box-shadow: 0 0 8px rgba(34, 197, 94, 0.2);
+}
+
+/* Mixer ring */
+.viz-mixer-ring {
+    position: absolute;
+    top: 50%;
+    right: 20px;
+    transform: translateY(-50%);
+    width: 32px;
+    height: 32px;
+    border: 2px solid rgba(80, 255, 120, 0.15);
+    border-top-color: var(--green-glow);
+    border-radius: 50%;
+    animation: spin 2s linear infinite;
+}
+
+/* Chain links */
+.viz-chain-links {
+    display: flex;
+    gap: 4px;
+    justify-content: center;
+    margin-top: 8px;
+}
+
+.viz-chain-link {
+    width: 20px;
+    height: 10px;
+    border: 2px solid rgba(80, 255, 120, 0.2);
+    border-radius: 5px;
+    animation: chainPulse 1.5s ease-in-out infinite;
+}
+
+.viz-chain-link:nth-child(2) { animation-delay: 0.3s; }
+.viz-chain-link:nth-child(3) { animation-delay: 0.6s; }
+
+@keyframes chainPulse {
+    0%, 100% { border-color: rgba(80, 255, 120, 0.15); }
+    50% { border-color: rgba(80, 255, 120, 0.4); box-shadow: 0 0 6px rgba(34, 197, 94, 0.2); }
+}
+
+/* Key hex display */
+.viz-key-hex {
+    font-family: 'SF Mono', 'Fira Code', monospace !important;
+    font-size: 13px !important;
+    color: var(--green-bright) !important;
+    letter-spacing: 0.8px;
+    text-shadow: 0 0 10px var(--green-neon);
+    word-break: break-all;
+}
+
+/* Lock pulse */
+.viz-lock-icon {
+    transition: transform 0.3s ease;
+}
+
+.viz-lock-pulse {
+    animation: lockBounce 0.5s ease;
+}
+
+@keyframes lockBounce {
+    0% { transform: scale(1); }
+    40% { transform: scale(1.25); }
+    100% { transform: scale(1); }
+}
+
+/* Bottom stats bar */
+.viz-stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+}
+
+.viz-stat {
+    padding: 16px;
+    text-align: center;
+}
+
+.viz-stat-value {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--green-bright);
+    text-shadow: 0 0 12px var(--green-neon);
+}
+
+.viz-stat-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 4px;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .viz-stats {
+        grid-template-columns: repeat(2, 1fr);
+    }
+    .visualizer-page {
+        padding: 20px;
+    }
+}

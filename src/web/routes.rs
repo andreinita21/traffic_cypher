@@ -61,6 +61,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/auth/unlock", post(unlock))
         .route("/auth/lock", post(lock))
         .route("/auth/status", get(auth_status))
+        .route("/auth/verify-password", post(verify_password))
         // Credentials
         .route("/credentials", get(list_credentials))
         .route("/credentials", post(create_credential))
@@ -70,12 +71,16 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/credentials/{id}/totp", get(get_totp))
         // Password generator
         .route("/generate-password", post(generate_password))
+        // Key rotation
+        .route("/rotate-key", post(rotate_key))
         // Streams
         .route("/streams", get(list_streams))
         .route("/streams", post(add_stream))
         .route("/streams/{index}", delete(remove_stream))
-        // Status
+        .route("/streams/{index}", put(update_stream))
+        // Status & entropy
         .route("/status", get(get_status))
+        .route("/entropy-snapshot", get(entropy_snapshot))
         // Settings
         .route("/settings", get(get_settings))
         .route("/settings", put(update_settings))
@@ -95,11 +100,17 @@ struct UnlockRequest {
 struct UnlockResponse {
     token: String,
     entry_count: usize,
+    entropy_source: String,
 }
 
 #[derive(Serialize)]
 struct AuthStatusResponse {
     unlocked: bool,
+}
+
+#[derive(Deserialize)]
+struct VerifyPasswordRequest {
+    master_password: String,
 }
 
 #[derive(Deserialize)]
@@ -147,6 +158,12 @@ struct AddStreamRequest {
     label: String,
 }
 
+#[derive(Deserialize)]
+struct UpdateStreamRequest {
+    url: Option<String>,
+    label: Option<String>,
+}
+
 #[derive(Serialize)]
 struct TotpResponse {
     code: String,
@@ -159,6 +176,18 @@ struct StatusResponse {
     stream_count: usize,
     streams: Vec<multi_stream::StreamStatus>,
     entry_count: usize,
+    entropy_source: String,
+}
+
+#[derive(Serialize)]
+struct EntropySnapshotResponse {
+    key_epoch: u64,
+    frames_processed: u64,
+    pool_depth: usize,
+    has_traffic_entropy: bool,
+    is_running: bool,
+    entropy_source: String,
+    latest_key_hex: String,
 }
 
 #[derive(Serialize)]
@@ -177,12 +206,33 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Serialize)]
+struct RotateKeyResponse {
+    status: String,
+    entropy_source: String,
+}
+
 fn err_json(status: StatusCode, msg: &str) -> Response {
     (status, Json(ErrorResponse { error: msg.to_string() })).into_response()
 }
 
 fn unauthorized() -> Response {
     err_json(StatusCode::UNAUTHORIZED, "Not authenticated")
+}
+
+// ---------------------------------------------------------------------------
+// Helper: save vault using current DEK from state
+// ---------------------------------------------------------------------------
+
+async fn save_vault_with_state(state: &Arc<AppState>) -> Result<(), String> {
+    let v = state.vault.read().await;
+    let master = state.master_password.read().await;
+    let dek_opt = state.current_dek.read().await;
+    let entropy_src = state.entropy_source.read().await;
+
+    let dek = dek_opt.ok_or("No DEK available — vault not unlocked")?;
+    vault::save_vault(&v, &master, &dek, &entropy_src)
+        .map_err(|e| format!("Save failed: {}", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -193,17 +243,20 @@ async fn unlock(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UnlockRequest>,
 ) -> Response {
-    // Try to load vault with master password
-    match vault::load_vault(&req.master_password, None) {
-        Ok(v) => {
-            let entry_count = v.entries.len();
+    // Try to load vault with master password only (envelope encryption)
+    match vault::load_vault(&req.master_password) {
+        Ok(unlocked) => {
+            let entry_count = unlocked.vault.entries.len();
+            let entropy_source = unlocked.entropy_source.clone();
             let token = Uuid::new_v4().to_string();
 
             // Store session
             *state.session_token.write().await = Some(token.clone());
             *state.master_password.write().await = req.master_password.clone();
-            *state.vault.write().await = v;
+            *state.vault.write().await = unlocked.vault;
             *state.is_unlocked.write().await = true;
+            *state.current_dek.write().await = Some(unlocked.dek);
+            *state.entropy_source.write().await = entropy_source.clone();
             state.touch_activity().await;
 
             // Load stream config and start streams
@@ -225,21 +278,19 @@ async fn unlock(
                 }
             });
 
-            // Start key rotation daemon
+            // Start entropy collection daemon
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
             *state.rotation_cancel.write().await = Some(cancel_tx);
 
             let sm_clone = state.stream_manager.clone();
             let rs_clone = state.rotation_state.clone();
-            let mp_clone = state.master_password.clone();
-            let vd_clone = state.vault.clone();
             tokio::spawn(async move {
                 key_rotation::start_rotation_daemon(
-                    sm_clone, rs_clone, mp_clone, vd_clone, cancel_rx,
+                    sm_clone, rs_clone, cancel_rx,
                 ).await;
             });
 
-            (StatusCode::OK, Json(UnlockResponse { token, entry_count })).into_response()
+            (StatusCode::OK, Json(UnlockResponse { token, entry_count, entropy_source })).into_response()
         }
         Err(e) => {
             err_json(StatusCode::UNAUTHORIZED, &format!("Failed to unlock: {}", e))
@@ -255,16 +306,17 @@ async fn lock(
         return unauthorized();
     }
 
-    // Stop rotation daemon
+    // Stop entropy collection daemon
     if let Some(cancel) = state.rotation_cancel.write().await.take() {
         let _ = cancel.send(true);
     }
 
-    // Clear session
+    // Clear session and DEK from memory
     *state.session_token.write().await = None;
     *state.master_password.write().await = String::new();
     *state.vault.write().await = vault::Vault::default();
     *state.is_unlocked.write().await = false;
+    *state.current_dek.write().await = None;
 
     (StatusCode::OK, Json(serde_json::json!({"status": "locked"}))).into_response()
 }
@@ -275,15 +327,33 @@ async fn auth_status(
     let unlocked = *state.is_unlocked.read().await;
     // Check auto-lock
     if unlocked && state.check_auto_lock().await {
-        // Auto-lock
+        // Auto-lock: clear DEK and session
         if let Some(cancel) = state.rotation_cancel.write().await.take() {
             let _ = cancel.send(true);
         }
         *state.session_token.write().await = None;
         *state.is_unlocked.write().await = false;
+        *state.current_dek.write().await = None;
         return Json(AuthStatusResponse { unlocked: false });
     }
     Json(AuthStatusResponse { unlocked })
+}
+
+async fn verify_password(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<VerifyPasswordRequest>,
+) -> Response {
+    if !validate_session(&headers, &state).await {
+        return unauthorized();
+    }
+
+    let master = state.master_password.read().await;
+    if *master == req.master_password {
+        (StatusCode::OK, Json(serde_json::json!({"valid": true}))).into_response()
+    } else {
+        (StatusCode::OK, Json(serde_json::json!({"valid": false}))).into_response()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -375,14 +445,13 @@ async fn create_credential(
     let id = entry.id.clone();
     v.add_or_update(entry);
 
-    // Save to disk
-    let master = state.master_password.read().await;
-    let traffic_key = state.rotation_state.current_key.read().await;
-    let tk = if traffic_key.iter().any(|&b| b != 0) { Some(traffic_key.as_slice()) } else { None };
-    if let Err(e) = vault::save_vault(&v, &master, tk) {
-        return err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("Save failed: {}", e));
+    // Save to disk using current DEK
+    drop(v); // release write lock before calling save
+    if let Err(e) = save_vault_with_state(&state).await {
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e);
     }
 
+    let v = state.vault.read().await;
     match v.get_by_id(&id) {
         Some(entry) => (StatusCode::CREATED, Json(entry.clone())).into_response(),
         None => err_json(StatusCode::INTERNAL_SERVER_ERROR, "Entry created but not found"),
@@ -448,11 +517,9 @@ async fn update_credential(
     let entry_clone = entry.clone();
 
     // Save
-    let master = state.master_password.read().await;
-    let traffic_key = state.rotation_state.current_key.read().await;
-    let tk = if traffic_key.iter().any(|&b| b != 0) { Some(traffic_key.as_slice()) } else { None };
-    if let Err(e) = vault::save_vault(&v, &master, tk) {
-        return err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("Save failed: {}", e));
+    drop(v);
+    if let Err(e) = save_vault_with_state(&state).await {
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e);
     }
 
     (StatusCode::OK, Json(entry_clone)).into_response()
@@ -473,11 +540,9 @@ async fn delete_credential(
     }
 
     // Save
-    let master = state.master_password.read().await;
-    let traffic_key = state.rotation_state.current_key.read().await;
-    let tk = if traffic_key.iter().any(|&b| b != 0) { Some(traffic_key.as_slice()) } else { None };
-    if let Err(e) = vault::save_vault(&v, &master, tk) {
-        return err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("Save failed: {}", e));
+    drop(v);
+    if let Err(e) = save_vault_with_state(&state).await {
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e);
     }
 
     (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response()
@@ -539,6 +604,44 @@ async fn generate_password(
 }
 
 // ---------------------------------------------------------------------------
+// Key rotation handler
+// ---------------------------------------------------------------------------
+
+async fn rotate_key(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    if !validate_session(&headers, &state).await {
+        return unauthorized();
+    }
+
+    // Try to generate a new DEK from traffic entropy
+    let (new_dek, source) = match state.rotation_state.generate_traffic_dek().await {
+        Some(dek) => (dek, "traffic"),
+        None => {
+            // Fallback to OS entropy
+            (vault::generate_dek_from_os(), "os")
+        }
+    };
+
+    // Re-encrypt vault with new DEK
+    let v = state.vault.read().await;
+    let master = state.master_password.read().await;
+    if let Err(e) = vault::rotate_dek(&v, &master, &new_dek, source) {
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("Key rotation failed: {}", e));
+    }
+
+    // Update in-memory DEK
+    *state.current_dek.write().await = Some(new_dek);
+    *state.entropy_source.write().await = source.to_string();
+
+    (StatusCode::OK, Json(RotateKeyResponse {
+        status: "rotated".to_string(),
+        entropy_source: source.to_string(),
+    })).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Stream handlers
 // ---------------------------------------------------------------------------
 
@@ -564,25 +667,33 @@ async fn add_stream(
         return unauthorized();
     }
 
-    // Save to config
-    let mut config = vault::load_stream_config();
-    config.streams.push(vault::StreamEntry {
-        url: req.url.clone(),
-        label: req.label.clone(),
-        enabled: true,
-    });
-    if let Err(e) = vault::save_stream_config(&config) {
-        return err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("Config save failed: {}", e));
-    }
-
-    // Start the stream
-    let mut mgr = state.stream_manager.lock().await;
-    match mgr.add_stream(req.url, req.label).await {
-        Ok(index) => {
-            (StatusCode::CREATED, Json(serde_json::json!({"index": index}))).into_response()
+    // Start the stream resolution in the background (non-blocking).
+    // Config is saved only after the stream is successfully added to the manager.
+    let sm = state.stream_manager.clone();
+    let url = req.url.clone();
+    let label = req.label.clone();
+    tokio::spawn(async move {
+        let mut mgr = sm.lock().await;
+        match mgr.add_stream(url.clone(), label.clone()).await {
+            Ok(_) => {
+                // Persist to config only on success
+                let mut config = vault::load_stream_config();
+                config.streams.push(vault::StreamEntry {
+                    url,
+                    label: label.clone(),
+                    enabled: true,
+                });
+                if let Err(e) = vault::save_stream_config(&config) {
+                    tracing::warn!("Config save failed for '{}': {}", label, e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Background stream resolution failed for '{}': {}", label, e);
+            }
         }
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("Stream failed: {}", e)),
-    }
+    });
+
+    (StatusCode::CREATED, Json(serde_json::json!({"status": "connecting", "label": req.label}))).into_response()
 }
 
 async fn remove_stream(
@@ -609,6 +720,36 @@ async fn remove_stream(
     }
 }
 
+async fn update_stream(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Path(index): Path<usize>,
+    Json(req): Json<UpdateStreamRequest>,
+) -> Response {
+    if !validate_session(&headers, &state).await {
+        return unauthorized();
+    }
+
+    let mut mgr = state.stream_manager.lock().await;
+    match mgr.update_stream(index, req.label.clone(), req.url.clone()) {
+        Ok(()) => {
+            // Persist to config
+            let mut config = vault::load_stream_config();
+            if index < config.streams.len() {
+                if let Some(ref l) = req.label {
+                    config.streams[index].label = l.clone();
+                }
+                if let Some(ref u) = req.url {
+                    config.streams[index].url = u.clone();
+                }
+                let _ = vault::save_stream_config(&config);
+            }
+            (StatusCode::OK, Json(serde_json::json!({"status": "updated"}))).into_response()
+        }
+        Err(e) => err_json(StatusCode::BAD_REQUEST, &format!("{}", e)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Status & Settings handlers
 // ---------------------------------------------------------------------------
@@ -627,12 +768,42 @@ async fn get_status(
     let stream_count = mgr.stream_count();
     let v = state.vault.read().await;
     let entry_count = v.entries.len();
+    let entropy_source = state.entropy_source.read().await.clone();
 
     (StatusCode::OK, Json(StatusResponse {
         rotation,
         stream_count,
         streams,
         entry_count,
+        entropy_source,
+    })).into_response()
+}
+
+async fn entropy_snapshot(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    if !validate_session(&headers, &state).await {
+        return unauthorized();
+    }
+
+    let rotation = state.rotation_state.status().await;
+    let entropy_source = state.entropy_source.read().await.clone();
+    let latest_entropy = state.rotation_state.latest_entropy.read().await;
+    let latest_key_hex = if latest_entropy.is_empty() {
+        "0000000000000000".to_string()
+    } else {
+        hex::encode(&latest_entropy[..std::cmp::min(latest_entropy.len(), 32)])
+    };
+
+    (StatusCode::OK, Json(EntropySnapshotResponse {
+        key_epoch: rotation.key_epoch,
+        frames_processed: rotation.frames_processed,
+        pool_depth: rotation.pool_depth,
+        has_traffic_entropy: rotation.has_traffic_entropy,
+        is_running: rotation.is_running,
+        entropy_source,
+        latest_key_hex,
     })).into_response()
 }
 

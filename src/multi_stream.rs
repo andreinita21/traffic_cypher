@@ -142,17 +142,13 @@ impl MultiStreamManager {
     }
 
     /// Stop and remove a stream by index. Sends a cancel signal to the
-    /// forwarding task.
+    /// forwarding task, then removes the entry from the vec entirely.
     pub fn remove_stream(&mut self, index: usize) -> Result<()> {
         if index >= self.streams.len() {
             bail!("Stream index {} out of range (have {})", index, self.streams.len());
         }
 
         let handle = &mut self.streams[index];
-        if handle.status == StreamState::Stopped {
-            bail!("Stream #{} '{}' is already stopped", index, handle.label);
-        }
-
         info!("Removing stream #{} '{}'", index, handle.label);
 
         // Send cancel signal; if the receiver is already gone that is fine
@@ -160,7 +156,23 @@ impl MultiStreamManager {
             let _ = cancel_tx.send(());
         }
 
-        handle.status = StreamState::Stopped;
+        self.streams.remove(index);
+        Ok(())
+    }
+
+    /// Update a stream's label and/or URL (metadata only — does not restart
+    /// the capture pipeline).
+    pub fn update_stream(&mut self, index: usize, label: Option<String>, url: Option<String>) -> Result<()> {
+        if index >= self.streams.len() {
+            bail!("Stream index {} out of range (have {})", index, self.streams.len());
+        }
+        let handle = &mut self.streams[index];
+        if let Some(l) = label {
+            handle.label = l;
+        }
+        if let Some(u) = url {
+            handle.url = u;
+        }
         Ok(())
     }
 

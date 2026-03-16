@@ -10,9 +10,11 @@
     let sessionToken = null;
     let credentials = [];
     let selectedId = null;
-    let currentView = 'vault'; // vault | settings | help
+    let currentView = 'vault'; // vault | settings | help | visualizer
     let totpTimers = {};
     let statusInterval = null;
+    let dangerModeTimer = null;
+    let visualizerInterval = null;
 
     // -----------------------------------------------------------------------
     // API Layer
@@ -31,12 +33,12 @@
             opts.body = JSON.stringify(body);
         }
         const res = await fetch(`${API}${path}`, opts);
-        if (res.status === 401) {
+        const data = await res.json();
+        if (res.status === 401 && path !== '/auth/unlock') {
             sessionToken = null;
             renderApp();
             throw new Error('Session expired');
         }
-        const data = await res.json();
         if (!res.ok) {
             throw new Error(data.error || 'Request failed');
         }
@@ -134,6 +136,7 @@
                 <span style="font-weight:700;font-size:15px;color:var(--green-bright)">\u{1F6A6} Traffic Cypher</span>
                 <div class="nav-tabs">
                     <button class="nav-tab ${currentView === 'vault' ? 'active' : ''}" data-view="vault">\u{1F513} Vault</button>
+                    <button class="nav-tab ${currentView === 'visualizer' ? 'active' : ''}" data-view="visualizer">\u26A1 Visualizer</button>
                     <button class="nav-tab ${currentView === 'settings' ? 'active' : ''}" data-view="settings">\u2699\uFE0F Settings</button>
                     <button class="nav-tab ${currentView === 'help' ? 'active' : ''}" data-view="help">\u2753 Help</button>
                 </div>
@@ -175,7 +178,9 @@
 
         // Render current view
         const content = $('#main-content');
+        stopVisualizerPolling();
         if (currentView === 'vault') renderVault(content);
+        else if (currentView === 'visualizer') renderVisualizer(content);
         else if (currentView === 'settings') renderSettings(content);
         else if (currentView === 'help') renderHelp(content);
     }
@@ -254,6 +259,7 @@
     }
 
     function renderDetailPane() {
+        deactivateDangerMode();
         const pane = $('#detail-pane');
         if (!pane) return;
 
@@ -353,11 +359,12 @@
                     </div>
                 </div>` : ''}
 
-                <div class="field-group">
+                <div class="field-group" id="pw-field-group">
                     <div class="field-label">PASSWORD</div>
-                    <div class="field-value">
+                    <div class="field-value" id="pw-field-value">
                         <span class="text mono" id="pw-display"><span class="password-masked">\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022</span></span>
-                        <button class="copy-btn" id="toggle-pw" title="Show/hide">\u{1F441}\uFE0F</button>
+                        <div id="danger-countdown-wrap" style="display:none"></div>
+                        <button class="copy-btn" id="toggle-pw" title="Reveal password">\u{1F441}\uFE0F</button>
                         <button class="copy-btn" id="copy-pw">Copy</button>
                     </div>
                 </div>
@@ -374,15 +381,8 @@
             </div>
         `;
 
-        // Password toggle
-        let pwVisible = false;
-        $('#toggle-pw').addEventListener('click', () => {
-            pwVisible = !pwVisible;
-            $('#pw-display').innerHTML = pwVisible
-                ? `<span style="word-break:break-all">${esc(c.password)}</span>`
-                : '<span class="password-masked">\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022</span>';
-        });
-
+        // Password toggle — Danger Mode
+        $('#toggle-pw').addEventListener('click', () => openDangerModeModal(c));
         $('#copy-pw').addEventListener('click', () => copyToClipboard(c.password, 'Password'));
 
         // Copy buttons
@@ -612,6 +612,306 @@
     }
 
     // -----------------------------------------------------------------------
+    // Danger Mode — Master Password Verification + Timed Reveal
+    // -----------------------------------------------------------------------
+    function openDangerModeModal(credential) {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.innerHTML = `
+            <div class="modal glass danger-modal">
+                <h3>\u{1F6A8} Danger Mode</h3>
+                <p style="font-size:14px;color:var(--text-secondary);margin-bottom:20px">Enter your master password to reveal this credential's password for 30 seconds.</p>
+                <form id="danger-form">
+                    <div class="form-group">
+                        <label>Master Password</label>
+                        <input type="password" id="danger-pw" placeholder="Enter master password" autocomplete="current-password" autofocus>
+                    </div>
+                    <p id="danger-error" style="color:var(--danger);font-size:13px;display:none;margin-bottom:12px"></p>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" id="danger-cancel">Cancel</button>
+                        <button type="submit" class="btn btn-danger" id="danger-submit">\u{1F513} Reveal Password</button>
+                    </div>
+                </form>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+        overlay.querySelector('#danger-cancel').addEventListener('click', () => overlay.remove());
+        overlay.querySelector('#danger-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const pw = overlay.querySelector('#danger-pw').value;
+            if (!pw) return;
+            const btn = overlay.querySelector('#danger-submit');
+            btn.disabled = true;
+            btn.textContent = 'Verifying...';
+            try {
+                const res = await api('POST', '/auth/verify-password', { master_password: pw });
+                if (res.valid) {
+                    overlay.remove();
+                    activateDangerMode(credential);
+                } else {
+                    overlay.querySelector('#danger-error').style.display = 'block';
+                    overlay.querySelector('#danger-error').textContent = 'Invalid master password';
+                    btn.disabled = false;
+                    btn.textContent = '\u{1F513} Reveal Password';
+                }
+            } catch (err) {
+                overlay.querySelector('#danger-error').style.display = 'block';
+                overlay.querySelector('#danger-error').textContent = err.message;
+                btn.disabled = false;
+                btn.textContent = '\u{1F513} Reveal Password';
+            }
+        });
+    }
+
+    function activateDangerMode(credential) {
+        if (dangerModeTimer) clearTimeout(dangerModeTimer);
+
+        const card = document.querySelector('.detail-card');
+        const fieldValue = document.getElementById('pw-field-value');
+        const pwDisplay = document.getElementById('pw-display');
+        const countdownWrap = document.getElementById('danger-countdown-wrap');
+
+        if (!card || !pwDisplay) return;
+
+        // Reveal password
+        pwDisplay.innerHTML = `<span style="word-break:break-all;color:var(--danger)">${esc(credential.password)}</span>`;
+
+        // Apply Danger Mode styling
+        card.classList.add('danger-mode');
+        if (fieldValue) fieldValue.classList.add('danger-field');
+
+        // Show 30-second countdown SVG
+        if (countdownWrap) {
+            countdownWrap.style.display = 'flex';
+            countdownWrap.innerHTML = `
+                <div class="danger-timer">
+                    <svg width="36" height="36" viewBox="0 0 36 36">
+                        <circle cx="18" cy="18" r="15" fill="none" stroke="rgba(239,68,68,0.15)" stroke-width="2.5"/>
+                        <circle cx="18" cy="18" r="15" fill="none" stroke="var(--danger)" stroke-width="2.5"
+                            stroke-dasharray="94.25" stroke-dashoffset="0" stroke-linecap="round" id="danger-ring"
+                            style="transition:stroke-dashoffset 1s linear;filter:drop-shadow(0 0 4px var(--danger))"/>
+                    </svg>
+                    <span class="danger-countdown-text" id="danger-seconds">30</span>
+                </div>
+            `;
+        }
+
+        let remaining = 30;
+        const tickInterval = setInterval(() => {
+            remaining--;
+            const secEl = document.getElementById('danger-seconds');
+            const ringEl = document.getElementById('danger-ring');
+            if (secEl) secEl.textContent = remaining;
+            if (ringEl) {
+                const offset = ((30 - remaining) / 30) * 94.25;
+                ringEl.setAttribute('stroke-dashoffset', offset.toString());
+            }
+            if (remaining <= 0) clearInterval(tickInterval);
+        }, 1000);
+
+        dangerModeTimer = setTimeout(() => {
+            clearInterval(tickInterval);
+            deactivateDangerMode();
+        }, 30000);
+    }
+
+    function deactivateDangerMode() {
+        if (dangerModeTimer) { clearTimeout(dangerModeTimer); dangerModeTimer = null; }
+
+        const card = document.querySelector('.detail-card');
+        const fieldValue = document.getElementById('pw-field-value');
+        const pwDisplay = document.getElementById('pw-display');
+        const countdownWrap = document.getElementById('danger-countdown-wrap');
+
+        if (card) card.classList.remove('danger-mode');
+        if (fieldValue) fieldValue.classList.remove('danger-field');
+        if (pwDisplay) pwDisplay.innerHTML = '<span class="password-masked">\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022</span>';
+        if (countdownWrap) { countdownWrap.style.display = 'none'; countdownWrap.innerHTML = ''; }
+    }
+
+    // -----------------------------------------------------------------------
+    // Encryption Visualizer
+    // -----------------------------------------------------------------------
+    function renderVisualizer(container) {
+        container.innerHTML = `
+            <div class="visualizer-page">
+                <div class="viz-header">
+                    <h2>\u26A1 Encryption Pipeline</h2>
+                    <p>Real-time visualization of the entropy-driven key derivation process</p>
+                    <div class="viz-live-badge"><span class="viz-live-dot"></span> LIVE</div>
+                </div>
+                <div class="viz-pipeline">
+                    <div class="viz-node glass" id="viz-frame-capture">
+                        <div class="viz-node-icon">\u{1F4F9}</div>
+                        <div class="viz-node-label">Frame Capture</div>
+                        <div class="viz-node-detail" id="viz-source">Waiting...</div>
+                        <div class="viz-scanlines"></div>
+                    </div>
+                    <div class="viz-connector"><div class="viz-particles"></div></div>
+
+                    <div class="viz-node glass" id="viz-entropy-extract">
+                        <div class="viz-node-icon">\u{1F9EC}</div>
+                        <div class="viz-node-label">Entropy Extraction</div>
+                        <div class="viz-node-detail viz-hex-flow" id="viz-hex-digits">SHA-256</div>
+                    </div>
+                    <div class="viz-connector"><div class="viz-particles"></div></div>
+
+                    <div class="viz-node glass" id="viz-entropy-pool">
+                        <div class="viz-node-icon">\u{1F4A7}</div>
+                        <div class="viz-node-label">Entropy Pool</div>
+                        <div class="viz-pool-slots" id="viz-pool-slots">
+                            <div class="viz-slot"></div><div class="viz-slot"></div>
+                            <div class="viz-slot"></div><div class="viz-slot"></div>
+                            <div class="viz-slot"></div><div class="viz-slot"></div>
+                            <div class="viz-slot"></div><div class="viz-slot"></div>
+                        </div>
+                        <div class="viz-node-detail" id="viz-pool-info">Depth: 0/8</div>
+                    </div>
+                    <div class="viz-connector"><div class="viz-particles"></div></div>
+
+                    <div class="viz-node glass" id="viz-sys-mixer">
+                        <div class="viz-node-icon">\u{1F300}</div>
+                        <div class="viz-node-label">System Mixer</div>
+                        <div class="viz-node-detail">OS Random + Traffic Entropy</div>
+                        <div class="viz-mixer-ring"></div>
+                    </div>
+                    <div class="viz-connector"><div class="viz-particles"></div></div>
+
+                    <div class="viz-node glass" id="viz-hkdf">
+                        <div class="viz-node-icon">\u{1F517}</div>
+                        <div class="viz-node-label">HKDF Key Derivation</div>
+                        <div class="viz-node-detail" id="viz-epoch-info">Epoch: 0</div>
+                        <div class="viz-chain-links">
+                            <span class="viz-chain-link"></span>
+                            <span class="viz-chain-link"></span>
+                            <span class="viz-chain-link"></span>
+                        </div>
+                    </div>
+                    <div class="viz-connector"><div class="viz-particles"></div></div>
+
+                    <div class="viz-node glass viz-node-accent" id="viz-dek">
+                        <div class="viz-node-icon">\u{1F511}</div>
+                        <div class="viz-node-label">DEK Generation</div>
+                        <div class="viz-node-detail viz-key-hex" id="viz-key-hex">0x0000...0000</div>
+                    </div>
+                    <div class="viz-connector"><div class="viz-particles"></div></div>
+
+                    <div class="viz-node glass" id="viz-vault-enc">
+                        <div class="viz-node-icon viz-lock-icon" id="viz-lock">\u{1F512}</div>
+                        <div class="viz-node-label">Vault Encryption</div>
+                        <div class="viz-node-detail">AES-256-GCM Sealed</div>
+                    </div>
+                </div>
+                <div class="viz-stats">
+                    <div class="viz-stat glass-sm">
+                        <div class="viz-stat-value" id="viz-stat-epoch">—</div>
+                        <div class="viz-stat-label">Key Epoch</div>
+                    </div>
+                    <div class="viz-stat glass-sm">
+                        <div class="viz-stat-value" id="viz-stat-frames">—</div>
+                        <div class="viz-stat-label">Frames Processed</div>
+                    </div>
+                    <div class="viz-stat glass-sm">
+                        <div class="viz-stat-value" id="viz-stat-pool">—</div>
+                        <div class="viz-stat-label">Pool Depth</div>
+                    </div>
+                    <div class="viz-stat glass-sm">
+                        <div class="viz-stat-value" id="viz-stat-running">—</div>
+                        <div class="viz-stat-label">Pipeline Status</div>
+                    </div>
+                </div>
+            </div>
+        `;
+        startVisualizerPolling();
+    }
+
+    function startVisualizerPolling() {
+        stopVisualizerPolling();
+        let hexChars = '0123456789abcdef';
+        let tick = 0;
+        async function poll() {
+            try {
+                const snap = await api('GET', '/entropy-snapshot');
+                tick++;
+
+                // Update stats
+                const epochEl = document.getElementById('viz-stat-epoch');
+                const framesEl = document.getElementById('viz-stat-frames');
+                const poolEl = document.getElementById('viz-stat-pool');
+                const runningEl = document.getElementById('viz-stat-running');
+                if (epochEl) epochEl.textContent = snap.key_epoch;
+                if (framesEl) framesEl.textContent = snap.frames_processed;
+                if (poolEl) poolEl.textContent = snap.pool_depth + '/8';
+                if (runningEl) {
+                    runningEl.textContent = snap.is_running ? 'ACTIVE' : 'STOPPED';
+                    runningEl.style.color = snap.is_running ? 'var(--green-bright)' : 'var(--danger)';
+                }
+
+                // Update pipeline nodes
+                const sourceEl = document.getElementById('viz-source');
+                if (sourceEl) sourceEl.textContent = snap.entropy_source || (snap.has_traffic_entropy ? 'Traffic Stream' : 'OS Entropy');
+
+                // Flowing hex digits
+                const hexEl = document.getElementById('viz-hex-digits');
+                if (hexEl) {
+                    let fakeHash = '';
+                    for (let i = 0; i < 16; i++) fakeHash += hexChars[Math.floor(Math.random() * 16)];
+                    hexEl.textContent = fakeHash;
+                }
+
+                // Pool slots
+                const slots = document.querySelectorAll('.viz-slot');
+                slots.forEach((slot, i) => {
+                    if (i < snap.pool_depth) {
+                        slot.classList.add('filled');
+                    } else {
+                        slot.classList.remove('filled');
+                    }
+                });
+
+                const poolInfo = document.getElementById('viz-pool-info');
+                if (poolInfo) poolInfo.textContent = `Depth: ${snap.pool_depth}/8`;
+
+                // Epoch info
+                const epochInfo = document.getElementById('viz-epoch-info');
+                if (epochInfo) epochInfo.textContent = `Epoch: ${snap.key_epoch}`;
+
+                // Key hex
+                const keyHex = document.getElementById('viz-key-hex');
+                if (keyHex && snap.latest_key_hex) {
+                    keyHex.textContent = snap.latest_key_hex;
+                }
+
+                // Animate lock icon
+                const lockIcon = document.getElementById('viz-lock');
+                if (lockIcon) {
+                    lockIcon.classList.add('viz-lock-pulse');
+                    setTimeout(() => lockIcon.classList.remove('viz-lock-pulse'), 500);
+                }
+
+                // Pulse nodes on update
+                document.querySelectorAll('.viz-node').forEach((node, i) => {
+                    setTimeout(() => {
+                        node.classList.add('viz-node-active');
+                        setTimeout(() => node.classList.remove('viz-node-active'), 600);
+                    }, i * 80);
+                });
+
+            } catch {}
+        }
+        poll();
+        visualizerInterval = setInterval(poll, 1000);
+    }
+
+    function stopVisualizerPolling() {
+        if (visualizerInterval) {
+            clearInterval(visualizerInterval);
+            visualizerInterval = null;
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Delete Confirmation
     // -----------------------------------------------------------------------
     function confirmDelete(credential) {
@@ -742,6 +1042,7 @@
                         <div class="stream-url">${esc(s.url)}</div>
                     </div>
                     <span style="font-size:12px;color:var(--text-muted)">${s.frames_captured} frames</span>
+                    <button class="btn btn-secondary btn-icon" data-edit="${i}" title="Edit">\u270F\uFE0F</button>
                     <button class="btn btn-danger btn-icon" data-remove="${i}" title="Remove">\u2715</button>
                 </div>
             `).join('');
@@ -757,10 +1058,61 @@
                     }
                 });
             });
+
+            listEl.querySelectorAll('[data-edit]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const idx = parseInt(btn.dataset.edit);
+                    const s = streams[idx];
+                    openEditStreamModal(idx, s);
+                });
+            });
         } catch (e) {
             const listEl = $('#stream-list');
             if (listEl) listEl.innerHTML = `<p style="color:var(--danger);font-size:13px">${e.message}</p>`;
         }
+    }
+
+    function openEditStreamModal(index, stream) {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.innerHTML = `
+            <div class="modal glass">
+                <h3>\u270F\uFE0F Edit Stream</h3>
+                <form id="edit-stream-form">
+                    <div class="form-group">
+                        <label>Label</label>
+                        <input type="text" id="es-label" value="${esc(stream.label)}" placeholder="Stream label">
+                    </div>
+                    <div class="form-group">
+                        <label>URL</label>
+                        <input type="text" id="es-url" value="${esc(stream.url)}" placeholder="YouTube livestream URL">
+                    </div>
+                    <div style="font-size:12px;color:var(--text-muted);margin-bottom:16px">
+                        Status: <strong>${esc(stream.status)}</strong> &middot; ${stream.frames_captured} frames captured
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" id="es-cancel">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Save Changes</button>
+                    </div>
+                </form>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+        overlay.querySelector('#es-cancel').addEventListener('click', () => overlay.remove());
+        overlay.querySelector('#edit-stream-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const label = overlay.querySelector('#es-label').value.trim();
+            const url = overlay.querySelector('#es-url').value.trim();
+            try {
+                await api('PUT', `/streams/${index}`, { label: label || null, url: url || null });
+                showToast('Stream updated');
+                overlay.remove();
+                loadStreams();
+            } catch (err) {
+                showToast(err.message, 'error');
+            }
+        });
     }
 
     async function loadPipelineStatus() {

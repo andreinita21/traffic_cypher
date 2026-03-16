@@ -1,3 +1,22 @@
+# Build artifacts
 /target/
 debug_frames/
+
+# OS files
+.DS_Store
+**/.DS_Store
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# Binary tools
 yt-dlp
+
+# Resolved task files
+*.resolved
