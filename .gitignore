@@ -1,0 +1,59 @@
+# OS files
+.DS_Store
+**/.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Tool / agent metadata
+.claude/
+*.resolved
+
+# C build artifacts
+*.o
+*.obj
+*.so
+*.dylib
+*.a
+*.exe
+traffic_cypher_in_C/traffic-cypher
+traffic_cypher_in_C/traffic-cypher-pm
+
+# Rust build artifacts
+traffic_cypher_in_Rust/target/
+traffic_cypher_in_Rust/**/*.rs.bk
+
+# Benchmark build artifacts
+benchmark/bench_c
+benchmark/bench_c.o
+benchmark/bench_c.exe
+benchmark/results/
+benchmark/*.bench.o
+
+# C source intermediate objects
+traffic_cypher_in_C/src_c/*.o
+traffic_cypher_in_C/src_c/*.bench.o
+
+# Bundled tool binaries (download separately)
+traffic_cypher_in_Rust/yt-dlp
+traffic_cypher_in_Rust/yt-dlp.exe
+
+# Vault / runtime files (never commit user data)
+*.vault.json
+vault.json
+.env
+.env.local
+
+# Debug output
+debug_frames/
+**/debug_frames/
+
+# Logs
+*.log
+logs/
