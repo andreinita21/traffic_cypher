@@ -572,6 +572,9 @@ fn load_vault_v3(master_password: &str, contents: &str) -> Result<UnlockedVault>
 
 /// Shared hex-decoding + length-validation for the four envelope fields
 /// that are identical between v2 and v3.
+// reason: 4-tuple is the cheapest shape for a 2-call-site internal helper;
+// promoting to a named struct just to satisfy type_complexity adds noise.
+#[allow(clippy::type_complexity)]
 fn decode_envelope_fields(
     wrapped_dek_nonce: &str,
     wrapped_dek: &str,
@@ -842,7 +845,7 @@ mod tests {
 
         let kek = derive_kek_argon2id(password, &salt, m_cost, t_cost, p_cost)
             .expect("derive");
-        assert_eq!(hex::encode(&*kek), expected_hex,
+        assert_eq!(hex::encode(*kek), expected_hex,
             "Argon2id KEK output diverged from pinned KAT — check the argon2 \
              crate version, Algorithm/Version flags, and parameter wiring.");
     }
