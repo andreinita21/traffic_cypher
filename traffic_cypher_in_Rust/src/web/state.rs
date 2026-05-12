@@ -2,6 +2,7 @@ use crate::key_rotation::KeyRotationState;
 use crate::multi_stream::MultiStreamManager;
 use crate::vault::Vault;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
@@ -41,6 +42,28 @@ impl AppState {
             current_dek: Arc::new(RwLock::new(None)),
             entropy_source: Arc::new(RwLock::new("os".to_string())),
         }
+    }
+
+    /// Test-only constructor: points the vault at `vault_path` (a fresh
+    /// `tempfile::tempdir()` per test) so HTTP integration tests in
+    /// `tests/http.rs` can exercise the real `web::create_router` without
+    /// clobbering the developer's `$HOME/.traffic_cypher_vault.json`.
+    ///
+    /// Implementation note: this sets the `TRAFFIC_CYPHER_VAULT_PATH` env
+    /// var, which `vault::vault_path()` reads on every call. The simpler
+    /// alternative — threading an override field through `AppState` — would
+    /// require plumbing `&AppState` into the many free-function call sites
+    /// in `vault.rs`, which is out of scope for this PR.
+    ///
+    /// THREADING CONSTRAINT: because the env var is process-global, tests
+    /// using `for_test` MUST run with `--test-threads=1`. `tests/17_rust_http.sh`
+    /// enforces this. This matches the existing constraint already documented
+    /// on `tests/10_rust_unit_tests.sh`.
+    pub fn for_test(vault_path: PathBuf) -> Self {
+        // SAFETY: env vars are process-global. Tests that use this constructor
+        // must run serially (see doc comment above).
+        std::env::set_var("TRAFFIC_CYPHER_VAULT_PATH", &vault_path);
+        Self::new()
     }
 
     pub async fn touch_activity(&self) {

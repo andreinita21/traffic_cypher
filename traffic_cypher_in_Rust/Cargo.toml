@@ -25,3 +25,8 @@ totp-rs = { version = "5", features = ["gen_secret"] }
 rand = "0.8"
 libc = "0.2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"
