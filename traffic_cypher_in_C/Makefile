@@ -15,7 +15,8 @@ endif
 LDFLAGS += -lssl -lcrypto -lpthread -lm
 
 SRC_DIR = src_c
-SOURCES = $(SRC_DIR)/hex_utils.c \
+SOURCES = $(SRC_DIR)/str_buf.c \
+          $(SRC_DIR)/hex_utils.c \
           $(SRC_DIR)/base64_utils.c \
           $(SRC_DIR)/uuid_gen.c \
           $(SRC_DIR)/crypto_derivation.c \
