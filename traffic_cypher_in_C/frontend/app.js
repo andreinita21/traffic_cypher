@@ -1355,9 +1355,75 @@
     }
 
     // -----------------------------------------------------------------------
+    // Build-info banner — surfaces when the running daemon does not derive
+    // entropy from traffic streams (e.g., the current C build). The banner is
+    // non-modal, dismissable, and remembers its dismissed state in
+    // localStorage so it doesn't re-render every page load.
+    // -----------------------------------------------------------------------
+    async function maybeRenderBuildBanner() {
+        try {
+            const info = await fetch(`${API}/build/info`).then(r => r.json());
+            if (!info || info.traffic_entropy !== false) return;
+
+            const dismissKey = `tc-build-banner-dismissed:${info.build || 'unknown'}`;
+            try {
+                if (localStorage.getItem(dismissKey) === '1') return;
+            } catch {}
+
+            const existing = document.getElementById('tc-build-banner');
+            if (existing) existing.remove();
+
+            const banner = document.createElement('div');
+            banner.id = 'tc-build-banner';
+            banner.setAttribute('role', 'status');
+            banner.style.cssText = [
+                'position:fixed', 'top:0', 'left:0', 'right:0',
+                'z-index:9999',
+                'padding:10px 16px',
+                'background:rgba(234,179,8,0.12)',
+                'border-bottom:1px solid rgba(234,179,8,0.5)',
+                'color:#fde68a',
+                'font-size:13px',
+                'font-family:system-ui,-apple-system,sans-serif',
+                'display:flex',
+                'align-items:center',
+                'gap:12px',
+                'backdrop-filter:blur(8px)',
+                '-webkit-backdrop-filter:blur(8px)',
+            ].join(';');
+            const msg = document.createElement('span');
+            msg.style.flex = '1';
+            msg.textContent = '⚠ C build: OS entropy only. Streams are listed for parity but not used. Rebuild with the Rust implementation for traffic-derived DEKs.';
+            const closeBtn = document.createElement('button');
+            closeBtn.type = 'button';
+            closeBtn.textContent = '✕';
+            closeBtn.setAttribute('aria-label', 'Dismiss build banner');
+            closeBtn.style.cssText = [
+                'background:transparent',
+                'border:1px solid rgba(253,230,138,0.4)',
+                'color:#fde68a',
+                'border-radius:4px',
+                'padding:2px 8px',
+                'cursor:pointer',
+                'font-size:13px',
+                'line-height:1',
+            ].join(';');
+            closeBtn.addEventListener('click', () => {
+                try { localStorage.setItem(dismissKey, '1'); } catch {}
+                banner.remove();
+            });
+            banner.appendChild(msg);
+            banner.appendChild(closeBtn);
+            document.body.appendChild(banner);
+        } catch {}
+    }
+
+    // -----------------------------------------------------------------------
     // Init
     // -----------------------------------------------------------------------
     async function init() {
+        // Show build banner (if applicable) before rendering the app shell.
+        maybeRenderBuildBanner();
         // Check if already unlocked (e.g., page refresh)
         try {
             const status = await fetch(`${API}/auth/status`).then(r => r.json());

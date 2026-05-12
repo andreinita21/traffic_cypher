@@ -57,6 +57,11 @@ async fn serve_css() -> Response {
 
 pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
+        // Build descriptor — no auth (mirrors C build's /api/build/info).
+        // Frontends fetch this at init to decide whether to show the
+        // "OS entropy only" banner. The Rust build advertises traffic
+        // entropy = true because MultiStreamManager is wired here.
+        .route("/build/info", get(build_info))
         // Auth
         .route("/auth/unlock", post(unlock))
         .route("/auth/lock", post(lock))
@@ -233,6 +238,21 @@ async fn save_vault_with_state(state: &Arc<AppState>) -> Result<(), String> {
     let dek = dek_opt.ok_or("No DEK available — vault not unlocked")?;
     vault::save_vault(&v, &master, &dek, &entropy_src)
         .map_err(|e| format!("Save failed: {}", e))
+}
+
+// ---------------------------------------------------------------------------
+// Build descriptor handler (no auth)
+// ---------------------------------------------------------------------------
+
+async fn build_info() -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "build": "rust",
+            "traffic_entropy": true,
+        })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

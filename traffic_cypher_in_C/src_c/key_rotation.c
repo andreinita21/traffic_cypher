@@ -61,7 +61,11 @@ void *rotation_daemon(void *arg) {
         memcpy(state->latest_entropy, new_key, 32);
         state->key_epoch = epoch;
         state->pool_depth = entropy_pool_len(&pool);
-        state->has_traffic_entropy = 1;
+        /* NOTE: do NOT set state->has_traffic_entropy here. This daemon only
+         * mixes OS entropy via RAND_bytes; it never opens a stream or reads a
+         * frame. Setting the "traffic" flag would be a lie. Until the full
+         * MultiStreamManager C port lands (Week 4+ / #1a), the C build is
+         * OS-entropy only and the /api/build/info endpoint says so. */
         pthread_mutex_unlock(&state->lock);
     }
 

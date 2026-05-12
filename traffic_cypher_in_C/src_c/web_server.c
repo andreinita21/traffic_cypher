@@ -806,6 +806,10 @@ static void handle_add_stream(int fd, app_state_t *state, http_request_t *req) {
         return;
     }
 
+    /* We still persist the config so the user's stream list survives across
+     * restarts — Rust users on the same machine read the same file and will
+     * benefit from ingestion. But the C daemon itself does not open the
+     * stream, so we respond 501 to be honest about it. See /api/build/info. */
     pthread_mutex_lock(&state->lock);
     if (state->stream_config.stream_count < VAULT_MAX_STREAMS) {
         stream_entry_t *se = &state->stream_config.streams[state->stream_config.stream_count];
@@ -818,9 +822,9 @@ static void handle_add_stream(int fd, app_state_t *state, http_request_t *req) {
     }
     pthread_mutex_unlock(&state->lock);
 
-    char buf[256];
-    snprintf(buf, sizeof(buf), "{\"status\":\"connecting\",\"label\":\"%s\"}", label);
-    send_json(fd, 201, "Created", buf);
+    send_json(fd, 501, "Not Implemented",
+              "{\"error\":\"Stream ingestion not implemented in this build; "
+              "OS entropy only. See /api/build/info\"}");
     free(url); free(label);
 }
 
@@ -842,11 +846,17 @@ static void handle_remove_stream(int fd, app_state_t *state, int index) {
 
 static void handle_list_streams(int fd, app_state_t *state) {
     pthread_mutex_lock(&state->lock);
+    /* The C build does not implement stream ingestion yet. We still list the
+     * configured streams (so the UI shows what the user configured and so the
+     * config persists for parity with the Rust build), but every entry is
+     * Disabled and reports zero frames. See /api/build/info. */
     char buf[8192] = "[";
     for (int i = 0; i < state->stream_config.stream_count; i++) {
         char entry_buf[2048];
         snprintf(entry_buf, sizeof(entry_buf),
-                 "%s{\"url\":\"%s\",\"label\":\"%s\",\"status\":\"Active\",\"frames_captured\":0}",
+                 "%s{\"url\":\"%s\",\"label\":\"%s\",\"status\":\"Disabled\","
+                 "\"frames_captured\":0,"
+                 "\"note\":\"OS entropy only in C build; see /api/build/info\"}",
                  i > 0 ? "," : "",
                  state->stream_config.streams[i].url,
                  state->stream_config.streams[i].label);
@@ -855,6 +865,14 @@ static void handle_list_streams(int fd, app_state_t *state) {
     strcat(buf, "]");
     pthread_mutex_unlock(&state->lock);
     send_json(fd, 200, "OK", buf);
+}
+
+static void handle_build_info(int fd) {
+    /* Honest build descriptor. No auth required — the frontend needs this at
+     * page load to decide whether to render the OS-only banner. */
+    send_json(fd, 200, "OK",
+              "{\"build\":\"c\",\"traffic_entropy\":false,"
+              "\"note\":\"OS entropy only; see README\"}");
 }
 
 /* --- Request router --- */
@@ -903,6 +921,11 @@ static void handle_request(int fd, app_state_t *state, http_request_t *req) {
     }
     if (strcmp(req->path, "/api/auth/status") == 0 && strcmp(req->method, "GET") == 0) {
         handle_auth_status(fd, state);
+        return;
+    }
+    /* Build descriptor — no auth, mirrors Rust /api/build/info */
+    if (strcmp(req->path, "/api/build/info") == 0 && strcmp(req->method, "GET") == 0) {
+        handle_build_info(fd);
         return;
     }
 

@@ -26,6 +26,8 @@ TrafficCypher/
 
 Both implementations expose the same HTTP API and produce keys with the same construction, so they are directly comparable.
 
+> **Scope of the C implementation (current build).** The C **CLI binary** (`traffic-cypher`, `src_c/main.c`) wires traffic-frame entropy correctly. The C **password manager daemon** (`traffic-cypher-pm`) does *not* — it currently runs an OS-entropy-only rotation loop and does not open or read any stream. Streams added through its UI are persisted to config (so the Rust build on the same machine still benefits) but are reported as `Disabled` and `frames_captured: 0`, and `POST /api/streams` responds `501 Not Implemented`. Every build exposes a no-auth `GET /api/build/info` endpoint that reports `{"build":"c","traffic_entropy":false}` (C) or `{"build":"rust","traffic_entropy":true}` (Rust), and the shared frontend shows a top-of-screen banner whenever `traffic_entropy` is false. The full C `MultiStreamManager` port is tracked as remediation item #1a (Week 4+).
+
 ---
 
 ## Quick start
