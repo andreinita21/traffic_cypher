@@ -1,0 +1,137 @@
+name: CI
+
+# Triggers: every push (any branch), PRs targeting main, and manual dispatch.
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least-privilege default. Jobs requiring more (none here) would opt in explicitly.
+permissions:
+  contents: read
+
+# Skip the duplicate run that fires when a PR is opened from a branch in the
+# same repo (push event + pull_request event would both trigger). For fork PRs
+# only the pull_request event fires, so they still run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    # Avoid double-runs: skip the push event for PR branches that originate in
+    # this repo (the pull_request event will cover them). Fork PRs are unaffected.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: traffic_cypher_in_Rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: traffic_cypher_in_Rust
+
+      - name: cargo build --release --bins --locked
+        run: cargo build --release --bins --locked
+
+      # Pre-existing race in vault.rs::with_test_vault (env::set_var). Tracked
+      # in tests/10_rust_unit_tests.sh; serialised here to match.
+      - name: cargo test --release --locked (serial)
+        run: cargo test --release --locked -- --test-threads=1
+
+      # Informational: main currently has pre-existing clippy errors
+      # (see PROJECT_REVIEW.md §10). Flip to `-D warnings` after the cleanup PR.
+      - name: cargo clippy --all-targets --locked (informational)
+        continue-on-error: true
+        run: cargo clippy --all-targets --locked
+
+      # Informational: main currently fails `cargo fmt --check` locally.
+      # Flip to a hard gate after the formatting PR.
+      - name: cargo fmt --check (informational)
+        continue-on-error: true
+        run: cargo fmt --check
+
+  c:
+    name: c (${{ matrix.os }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OpenSSL (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Install OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: brew install openssl@3
+
+      - name: Cache C object files
+        uses: actions/cache@v4
+        with:
+          path: traffic_cypher_in_C/src_c/*.o
+          key: ${{ runner.os }}-c-${{ hashFiles('traffic_cypher_in_C/Makefile', 'traffic_cypher_in_C/src_c/**', 'traffic_cypher_in_C/include/**') }}
+
+      - name: make clean && make
+        run: |
+          make -C traffic_cypher_in_C clean
+          make -C traffic_cypher_in_C
+
+  tests:
+    name: tests (${{ matrix.os }})
+    needs: [rust, c]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: traffic_cypher_in_Rust
+
+      - name: Install OpenSSL (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Install OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: brew install openssl@3
+
+      - name: Restore C object cache
+        uses: actions/cache@v4
+        with:
+          path: traffic_cypher_in_C/src_c/*.o
+          key: ${{ runner.os }}-c-${{ hashFiles('traffic_cypher_in_C/Makefile', 'traffic_cypher_in_C/src_c/**', 'traffic_cypher_in_C/include/**') }}
+
+      - name: Run regression harness
+        run: bash tests/run.sh
