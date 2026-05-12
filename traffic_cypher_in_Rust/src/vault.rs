@@ -9,6 +9,7 @@ use sha2::Sha256;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
 // Data types (unchanged)
@@ -247,10 +248,11 @@ pub fn vault_path() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Derive a 256-bit Key Encryption Key (KEK) from master password + salt.
-fn derive_kek(master_password: &str, salt: &[u8]) -> [u8; 32] {
+/// Returns the KEK wrapped in `Zeroizing` so it is overwritten on drop.
+fn derive_kek(master_password: &str, salt: &[u8]) -> Zeroizing<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(Some(salt), master_password.as_bytes());
-    let mut kek = [0u8; 32];
-    hk.expand(b"traffic-cypher-kek-v2", &mut kek)
+    let mut kek = Zeroizing::new([0u8; 32]);
+    hk.expand(b"traffic-cypher-kek-v2", &mut *kek)
         .expect("HKDF expand failed");
     kek
 }
@@ -293,16 +295,25 @@ fn wrap_dek(kek: &[u8; 32], dek: &[u8; 32]) -> Result<(Vec<u8>, [u8; 12])> {
 }
 
 /// Unwrap (decrypt) a DEK with a KEK using AES-256-GCM.
-fn unwrap_dek(kek: &[u8; 32], wrapped_dek: &[u8], nonce_bytes: &[u8; 12]) -> Result<[u8; 32]> {
+/// Returns the DEK wrapped in `Zeroizing` so it is overwritten on drop.
+/// The intermediate `Vec<u8>` returned by AES-GCM is also wrapped so its
+/// backing heap allocation is zeroed before being freed.
+fn unwrap_dek(
+    kek: &[u8; 32],
+    wrapped_dek: &[u8],
+    nonce_bytes: &[u8; 12],
+) -> Result<Zeroizing<[u8; 32]>> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(kek));
     let nonce = Nonce::from_slice(nonce_bytes);
-    let dek_bytes = cipher
-        .decrypt(nonce, wrapped_dek)
-        .map_err(|_| anyhow!("Failed to unwrap DEK — wrong master password?"))?;
+    let dek_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
+        cipher
+            .decrypt(nonce, wrapped_dek)
+            .map_err(|_| anyhow!("Failed to unwrap DEK — wrong master password?"))?,
+    );
     if dek_bytes.len() != 32 {
         return Err(anyhow!("Unwrapped DEK has wrong length"));
     }
-    let mut dek = [0u8; 32];
+    let mut dek = Zeroizing::new([0u8; 32]);
     dek.copy_from_slice(&dek_bytes);
     Ok(dek)
 }
@@ -322,6 +333,8 @@ fn encrypt_vault_data(dek: &[u8; 32], vault: &Vault) -> Result<(Vec<u8>, [u8; 12
 }
 
 /// Decrypt vault data with a DEK using AES-256-GCM.
+/// The decrypted JSON bytes are held in a `Zeroizing<Vec<u8>>` so the
+/// heap allocation is overwritten before being freed.
 fn decrypt_vault_data(
     dek: &[u8; 32],
     ciphertext: &[u8],
@@ -329,10 +342,12 @@ fn decrypt_vault_data(
 ) -> Result<Vault> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek));
     let nonce = Nonce::from_slice(nonce_bytes);
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| anyhow!("Vault decryption failed — data may be corrupt"))?;
-    serde_json::from_slice(&plaintext).context("Failed to parse vault contents")
+    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
+        cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|_| anyhow!("Vault decryption failed — data may be corrupt"))?,
+    );
+    serde_json::from_slice(plaintext.as_slice()).context("Failed to parse vault contents")
 }
 
 // ---------------------------------------------------------------------------
@@ -340,9 +355,10 @@ fn decrypt_vault_data(
 // ---------------------------------------------------------------------------
 
 /// Result of loading the vault: contains the decrypted vault and the unwrapped DEK.
+/// The `dek` field is `Zeroizing` so its bytes are overwritten on drop.
 pub struct UnlockedVault {
     pub vault: Vault,
-    pub dek: [u8; 32],
+    pub dek: Zeroizing<[u8; 32]>,
     pub entropy_source: String,
 }
 
@@ -353,7 +369,7 @@ pub fn load_vault(master_password: &str) -> Result<UnlockedVault> {
     let path = vault_path();
     if !path.exists() {
         // First time: generate a DEK from OS entropy, return empty vault
-        let dek = generate_dek_from_os();
+        let dek = Zeroizing::new(generate_dek_from_os());
         return Ok(UnlockedVault {
             vault: Vault::default(),
             dek,
@@ -568,7 +584,7 @@ mod tests {
         let dek = generate_dek_from_os();
         let (wrapped, nonce) = wrap_dek(&kek, &dek).unwrap();
         let unwrapped = unwrap_dek(&kek, &wrapped, &nonce).unwrap();
-        assert_eq!(dek, unwrapped);
+        assert_eq!(dek, *unwrapped);
     }
 
     #[test]
@@ -630,7 +646,7 @@ mod tests {
             assert_eq!(unlocked.entropy_source, "os");
 
             // Verify DEK matches
-            assert_eq!(unlocked.dek, dek);
+            assert_eq!(*unlocked.dek, dek);
         });
     }
 
@@ -673,7 +689,7 @@ mod tests {
             let unlocked = load_vault(master_pw).unwrap();
             assert_eq!(unlocked.vault.entries.len(), 1);
             assert_eq!(unlocked.vault.entries[0].password, "original_password");
-            assert_eq!(unlocked.dek, dek2);
+            assert_eq!(*unlocked.dek, dek2);
             assert_eq!(unlocked.entropy_source, "traffic");
         });
     }

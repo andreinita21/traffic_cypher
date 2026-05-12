@@ -24,3 +24,4 @@ uuid = { version = "1", features = ["v4", "serde"] }
 totp-rs = { version = "5", features = ["gen_secret"] }
 rand = "0.8"
 libc = "0.2"
+zeroize = { version = "1", features = ["zeroize_derive"] }

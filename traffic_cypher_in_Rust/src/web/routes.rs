@@ -237,8 +237,12 @@ async fn save_vault_with_state(state: &Arc<AppState>) -> Result<(), String> {
     let dek_opt = state.current_dek.read().await;
     let entropy_src = state.entropy_source.read().await;
 
-    let dek = dek_opt.ok_or("No DEK available — vault not unlocked")?;
-    vault::save_vault(&v, &master, &dek, &entropy_src)
+    // `Zeroizing<[u8; 32]>` is not Copy — borrow via `as_ref()` so the secret
+    // stays owned by the lock guard and is not moved out.
+    let dek = dek_opt
+        .as_ref()
+        .ok_or("No DEK available — vault not unlocked")?;
+    vault::save_vault(&v, master.as_str(), dek, &entropy_src)
         .map_err(|e| format!("Save failed: {}", e))
 }
 
@@ -272,9 +276,11 @@ async fn unlock(
             let entropy_source = unlocked.entropy_source.clone();
             let token = Uuid::new_v4().to_string();
 
-            // Store session
+            // Store session. Wrap secrets in `Zeroizing` so their backing
+            // buffers are wiped when replaced or dropped.
             *state.session_token.write().await = Some(token.clone());
-            *state.master_password.write().await = req.master_password.clone();
+            *state.master_password.write().await =
+                zeroize::Zeroizing::new(req.master_password.clone());
             *state.vault.write().await = unlocked.vault;
             *state.is_unlocked.write().await = true;
             *state.current_dek.write().await = Some(unlocked.dek);
@@ -333,9 +339,10 @@ async fn lock(
         let _ = cancel.send(true);
     }
 
-    // Clear session and DEK from memory
+    // Clear session and DEK from memory. Assigning a fresh empty
+    // `Zeroizing<String>` triggers Drop on the old value, wiping the bytes.
     *state.session_token.write().await = None;
-    *state.master_password.write().await = String::new();
+    *state.master_password.write().await = zeroize::Zeroizing::new(String::new());
     *state.vault.write().await = vault::Vault::default();
     *state.is_unlocked.write().await = false;
     *state.current_dek.write().await = None;
@@ -377,7 +384,7 @@ async fn verify_password(
     }
 
     let master = state.master_password.read().await;
-    if *master == req.master_password {
+    if master.as_str() == req.master_password.as_str() {
         (StatusCode::OK, Json(serde_json::json!({"valid": true}))).into_response()
     } else {
         (StatusCode::OK, Json(serde_json::json!({"valid": false}))).into_response()
@@ -655,12 +662,13 @@ async fn rotate_key(
     // Re-encrypt vault with new DEK
     let v = state.vault.read().await;
     let master = state.master_password.read().await;
-    if let Err(e) = vault::rotate_dek(&v, &master, &new_dek, source) {
+    if let Err(e) = vault::rotate_dek(&v, master.as_str(), &new_dek, source) {
         return err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("Key rotation failed: {}", e));
     }
 
-    // Update in-memory DEK
-    *state.current_dek.write().await = Some(new_dek);
+    // Update in-memory DEK. Wrap in `Zeroizing` so the prior key bytes are
+    // overwritten when this slot is later cleared or replaced.
+    *state.current_dek.write().await = Some(zeroize::Zeroizing::new(new_dek));
     *state.entropy_source.write().await = source.to_string();
 
     (StatusCode::OK, Json(RotateKeyResponse {
