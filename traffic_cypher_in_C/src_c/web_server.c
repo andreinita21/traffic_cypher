@@ -1008,6 +1008,12 @@ int web_server_start(app_state_t *state, int port) {
             continue;
         }
 
+        struct timeval tv;
+        tv.tv_sec = 15;
+        tv.tv_usec = 0;
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
         http_request_t req;
         if (parse_request(client_fd, &req) == 0) {
             handle_request(client_fd, state, &req);
