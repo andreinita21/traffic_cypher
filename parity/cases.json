@@ -1,0 +1,86 @@
+{
+    "_comment": [
+        "Cross-implementation parity test cases for the Traffic Cypher PM HTTP API.",
+        "Each case replays the same request sequence against the C and Rust",
+        "password manager binaries and compares normalized responses.",
+        "",
+        "Schema (frozen — extend by adding cases, do not change keys):",
+        "  name              string            human label, used in test output",
+        "  requests          array<request>    HTTP requests replayed in order",
+        "  normalize_drop    array<string>     JSON keys whose values are dropped",
+        "                                      before comparison (timestamps,",
+        "                                      ids, nonces, etc.)",
+        "  expected_diff     bool (optional)   if true, mismatch is reported as",
+        "                                      KNOWN-DIVERGENT instead of FAIL",
+        "  reason            string (optional) why expected_diff is set",
+        "",
+        "Request shape:",
+        "  method            string            GET | POST | PUT | DELETE",
+        "  path              string            URL path, may contain ${var} refs",
+        "  body              any   (optional)  JSON request body",
+        "  expect_status     int   (optional)  override the default 2xx check",
+        "  save_token_from   string (optional) JSON key on the response to save",
+        "                                      as ${token} for later substitution",
+        "                                      (also adds Authorization: Bearer)",
+        "  save_id_from      string (optional) JSON key on the response to save",
+        "                                      as ${id} for later substitution"
+    ],
+    "cases": [
+        {
+            "name": "unlock_and_status",
+            "requests": [
+                {"method": "GET",  "path": "/api/auth/status"},
+                {"method": "POST", "path": "/api/auth/unlock",
+                 "body": {"master_password": "testpass"},
+                 "save_token_from": "token"},
+                {"method": "GET",  "path": "/api/auth/status"},
+                {"method": "POST", "path": "/api/auth/lock"},
+                {"method": "GET",  "path": "/api/auth/status"}
+            ],
+            "normalize_drop": [
+                "token", "session_token", "entry_count", "entropy_source"
+            ]
+        },
+        {
+            "name": "create_with_tags",
+            "requests": [
+                {"method": "POST", "path": "/api/auth/unlock",
+                 "body": {"master_password": "testpass"},
+                 "save_token_from": "token"},
+                {"method": "POST", "path": "/api/credentials",
+                 "body": {"label": "t", "password": "p", "tags": ["a", "b"]},
+                 "save_id_from": "id"},
+                {"method": "GET",  "path": "/api/credentials/${id}",
+                 "expect_status": 200},
+                {"method": "GET",  "path": "/api/credentials"}
+            ],
+            "normalize_drop": [
+                "id", "created_at", "updated_at", "token", "session_token",
+                "entry_count", "entropy_source", "password_history"
+            ]
+        },
+        {
+            "name": "streams_status",
+            "expected_diff": true,
+            "reason": "C build has no MultiStreamManager port; tracked as #1a in REMEDIATION_PLAN.md. Flip expected_diff to false once #1a lands.",
+            "requests": [
+                {"method": "POST", "path": "/api/auth/unlock",
+                 "body": {"master_password": "testpass"},
+                 "save_token_from": "token"},
+                {"method": "GET",  "path": "/api/streams"}
+            ],
+            "normalize_drop": [
+                "token", "session_token", "entry_count", "entropy_source"
+            ]
+        },
+        {
+            "name": "build_info",
+            "expected_diff": true,
+            "reason": "Rust returns traffic_entropy:true and build:rust; C returns traffic_entropy:false and build:c. Flip expected_diff to false once #1a (path-a) lands and the C build genuinely mixes traffic entropy.",
+            "requests": [
+                {"method": "GET", "path": "/api/build/info"}
+            ],
+            "normalize_drop": []
+        }
+    ]
+}
