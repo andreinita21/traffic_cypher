@@ -355,7 +355,7 @@
                     <div class="field-label">USERNAME</div>
                     <div class="field-value">
                         <span class="text">${esc(c.username)}</span>
-                        <button class="copy-btn" data-copy="${esc(c.username)}" data-label="Username">Copy</button>
+                        <button class="copy-btn" id="copy-username-btn" data-label="Username">Copy</button>
                     </div>
                 </div>` : ''}
 
@@ -385,7 +385,16 @@
         $('#toggle-pw').addEventListener('click', () => openDangerModeModal(c));
         $('#copy-pw').addEventListener('click', () => copyToClipboard(c.password, 'Password'));
 
-        // Copy buttons
+        // Copy buttons: bind the username copy handler via a closure rather than a
+        // data-copy="${esc(...)}" attribute. The setter path is structurally safe
+        // (no HTML parsing of the value) even if a future change regresses esc().
+        // See REMEDIATION_PLAN.md #5c.
+        const copyUsernameBtn = pane.querySelector('#copy-username-btn');
+        if (copyUsernameBtn && c.username) {
+            copyUsernameBtn.addEventListener('click', () => copyToClipboard(c.username, 'Username'));
+        }
+        // Any remaining static data-copy buttons (none currently, but keep
+        // the dispatcher in case other call sites resurface).
         pane.querySelectorAll('[data-copy]').forEach(btn => {
             btn.addEventListener('click', () => copyToClipboard(btn.dataset.copy, btn.dataset.label));
         });
@@ -472,19 +481,19 @@
                 <form id="cred-form">
                     <div class="form-group">
                         <label>Label *</label>
-                        <input type="text" id="f-label" value="${esc(existing?.label || '')}" placeholder="e.g. GitHub" required>
+                        <input type="text" id="f-label" placeholder="e.g. GitHub" required>
                     </div>
                     <div class="form-group">
                         <label>Website</label>
-                        <input type="text" id="f-website" value="${esc(existing?.website || '')}" placeholder="https://github.com">
+                        <input type="text" id="f-website" placeholder="https://github.com">
                     </div>
                     <div class="form-group">
                         <label>Username</label>
-                        <input type="text" id="f-username" value="${esc(existing?.username || '')}" placeholder="user@email.com">
+                        <input type="text" id="f-username" placeholder="user@email.com">
                     </div>
                     <div class="form-group">
                         <label>Password</label>
-                        <input type="text" id="f-password" value="${esc(existing?.password || '')}" placeholder="Enter or generate" style="font-family:monospace">
+                        <input type="text" id="f-password" placeholder="Enter or generate" style="font-family:monospace">
                     </div>
                     <div class="password-generator glass-sm" id="pw-gen-section">
                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
@@ -509,15 +518,15 @@
                     </div>
                     <div class="form-group">
                         <label>TOTP Secret (Base32)</label>
-                        <input type="text" id="f-totp" value="${esc(existing?.totp_secret || '')}" placeholder="e.g. JBSWY3DPEHPK3PXP">
+                        <input type="text" id="f-totp" placeholder="e.g. JBSWY3DPEHPK3PXP">
                     </div>
                     <div class="form-group">
                         <label>Tags (comma-separated)</label>
-                        <input type="text" id="f-tags" value="${esc((existing?.tags || []).join(', '))}" placeholder="work, social, finance">
+                        <input type="text" id="f-tags" placeholder="work, social, finance">
                     </div>
                     <div class="form-group">
                         <label>Notes</label>
-                        <textarea id="f-notes" rows="3" placeholder="Optional notes...">${esc(existing?.notes || '')}</textarea>
+                        <textarea id="f-notes" rows="3" placeholder="Optional notes..."></textarea>
                     </div>
                     <div class="form-actions">
                         <button type="button" class="btn btn-secondary" id="cancel-modal">Cancel</button>
@@ -528,6 +537,17 @@
         `;
 
         document.body.appendChild(overlay);
+
+        // Populate form fields via the DOM `.value` setter — does NOT parse HTML,
+        // so even an `esc()` regression cannot break out of the attribute. See
+        // REMEDIATION_PLAN.md #5c (Week 4+).
+        overlay.querySelector('#f-label').value    = existing?.label    || '';
+        overlay.querySelector('#f-website').value  = existing?.website  || '';
+        overlay.querySelector('#f-username').value = existing?.username || '';
+        overlay.querySelector('#f-password').value = existing?.password || '';
+        overlay.querySelector('#f-totp').value     = existing?.totp_secret || '';
+        overlay.querySelector('#f-tags').value     = (existing?.tags || []).join(', ');
+        overlay.querySelector('#f-notes').value    = existing?.notes    || '';
 
         // Close on overlay click
         overlay.addEventListener('click', (e) => {
@@ -1081,11 +1101,11 @@
                 <form id="edit-stream-form">
                     <div class="form-group">
                         <label>Label</label>
-                        <input type="text" id="es-label" value="${esc(stream.label)}" placeholder="Stream label">
+                        <input type="text" id="es-label" placeholder="Stream label">
                     </div>
                     <div class="form-group">
                         <label>URL</label>
-                        <input type="text" id="es-url" value="${esc(stream.url)}" placeholder="YouTube livestream URL">
+                        <input type="text" id="es-url" placeholder="YouTube livestream URL">
                     </div>
                     <div style="font-size:12px;color:var(--text-muted);margin-bottom:16px">
                         Status: <strong>${esc(stream.status)}</strong> &middot; ${stream.frames_captured} frames captured
@@ -1098,6 +1118,9 @@
             </div>
         `;
         document.body.appendChild(overlay);
+        // Stream fields via DOM `.value` setter (see REMEDIATION_PLAN.md #5c).
+        overlay.querySelector('#es-label').value = stream.label || '';
+        overlay.querySelector('#es-url').value   = stream.url   || '';
         overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
         overlay.querySelector('#es-cancel').addEventListener('click', () => overlay.remove());
         overlay.querySelector('#edit-stream-form').addEventListener('submit', async (e) => {
