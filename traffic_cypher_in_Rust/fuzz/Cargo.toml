@@ -1,0 +1,39 @@
+# Cargo-fuzz crate for traffic_cypher.
+#
+# Intentionally NOT part of the parent workspace — the parent has no
+# `[workspace]` declaration so this directory is invisible to `cargo build`
+# run from `traffic_cypher_in_Rust/`. Build the targets from inside this
+# directory with `cargo +nightly fuzz run <target>`.
+#
+# `cargo-fuzz` itself: `cargo install cargo-fuzz`.
+
+[package]
+name = "traffic_cypher-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.traffic_cypher]
+path = ".."
+
+# Each fuzz target is its own bin so they compile independently.
+
+[[bin]]
+name = "vault_version_probe"
+path = "fuzz_targets/vault_version_probe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vault_v3_envelope"
+path = "fuzz_targets/vault_v3_envelope.rs"
+test = false
+doc = false
+bench = false

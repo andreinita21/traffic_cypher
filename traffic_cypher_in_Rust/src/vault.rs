@@ -746,6 +746,49 @@ fn unix_now() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Fuzz API
+//
+// REMEDIATION_PLAN.md Week 4+ #10d called for `cargo fuzz` targets against
+// `serde_json::from_slice::<VaultFile>(data)`. The vault file structs are
+// private to this module, so we expose just enough surface for the fuzz
+// harness to exercise the deserialization codepaths without leaking the
+// shapes. The harness lives in `traffic_cypher_in_Rust/fuzz/` (cargo-fuzz);
+// CI is not wired (cargo-fuzz requires nightly Rust).
+// ---------------------------------------------------------------------------
+
+/// Fuzz harness entry point — version-probe path.
+///
+/// Mirrors the gateway in `load_vault` (`serde_json::from_str::<VaultFileVersion>`)
+/// without touching the filesystem. Panics escape as libFuzzer findings;
+/// structured Err returns are considered handled.
+#[doc(hidden)]
+pub fn fuzz_parse_vault_version(data: &[u8]) -> Option<u8> {
+    serde_json::from_slice::<VaultFileVersion>(data)
+        .ok()
+        .map(|v| v.version)
+}
+
+/// Fuzz harness entry point — full v3 envelope deserialization.
+///
+/// Mirrors `load_vault_v3`'s parsing step: parse the on-disk struct, then
+/// hex-decode the envelope fields. Does NOT attempt Argon2id derivation or
+/// AES-GCM decryption — those would dominate fuzz runtime and the
+/// interesting bugs here are in parsing.
+#[doc(hidden)]
+pub fn fuzz_parse_vault_v3_envelope(data: &[u8]) -> bool {
+    let Ok(vf) = serde_json::from_slice::<VaultFileV3>(data) else {
+        return false;
+    };
+    decode_envelope_fields(
+        &vf.wrapped_dek_nonce,
+        &vf.wrapped_dek,
+        &vf.vault_nonce,
+        &vf.vault_ciphertext,
+    )
+    .is_ok()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1051,5 +1094,28 @@ mod tests {
             assert!(err.contains("Unsupported vault version 99"),
                     "got: {}", err);
         });
+    }
+
+    /// Smoke-test the fuzz harness entry points so that nightly cargo-fuzz
+    /// targets in `fuzz/` can't silently rot (renames, signature changes,
+    /// accidentally feature-gated away). The harness exercises pure parsing
+    /// — no filesystem, no crypto — so it's cheap to run in regular tests.
+    #[test]
+    fn fuzz_helpers_basic_inputs() {
+        // Empty + obvious garbage must not panic.
+        assert_eq!(fuzz_parse_vault_version(b""), None);
+        assert_eq!(fuzz_parse_vault_version(b"not even json"), None);
+        assert!(!fuzz_parse_vault_v3_envelope(b""));
+        assert!(!fuzz_parse_vault_v3_envelope(b"\xff\xfe\x00"));
+
+        // Well-formed version probes.
+        assert_eq!(fuzz_parse_vault_version(br#"{"version":2}"#), Some(2));
+        assert_eq!(fuzz_parse_vault_version(br#"{"version":3}"#), Some(3));
+        // Non-numeric `version` is an error path, not a panic.
+        assert_eq!(fuzz_parse_vault_version(br#"{"version":"three"}"#), None);
+
+        // Well-formed v3 envelope (matches the seed corpus shape).
+        let seed = br#"{"version":3,"kdf":"argon2id","kdf_m_cost":65536,"kdf_t_cost":3,"kdf_p_cost":1,"kek_salt":"1111111111111111111111111111111111111111111111111111111111111111","wrapped_dek_nonce":"222222222222222222222222","wrapped_dek":"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","vault_nonce":"333333333333333333333333","vault_ciphertext":"deadbeef","entropy_source":"os","updated_at":1715520000}"#;
+        assert!(fuzz_parse_vault_v3_envelope(seed));
     }
 }

@@ -72,7 +72,7 @@ No system upgrades, no global package installs, no destructive commands run duri
 | More C compile-time hardening flags | done | this run — `-fstack-protector-strong -fPIE` always; Linux: `-pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack`; GCC: `-Wstringop-overflow=4` |
 | Move report binaries out of `main` | deferred | requires user policy decision (use Releases / Git LFS / branch) — out of scope for an unattended routine |
 | Week 4+ #5c DOM construction pass | done | this run — 9 attribute sinks replaced with `.value =` setters and a closure-bound copy handler |
-| Week 4+ #10d fuzzing targets | pending | this run (Rust `cargo-fuzz` stubs) |
+| Week 4+ #10d fuzzing targets | done (Rust scaffold) | this run — `traffic_cypher_in_Rust/fuzz/` with 2 cargo-fuzz targets + seed corpora + public `fuzz_parse_*` helpers; CI wiring deferred (needs nightly) |
 | Week 4+ #1a Full C MultiStreamManager port | deferred | plan calls this "~2 weeks of focused C work"; outside one-routine scope |
 
 ---
@@ -129,4 +129,37 @@ Text-content `${esc(...)}` interpolations (~12 sites, e.g. `<div class="name">${
 **Note on full DOM construction**
 The plan suggests "switch from innerHTML template-string assembly to explicit DOM construction." Full migration would replace the entire `overlay.innerHTML = \`...\`` blocks (~150 lines of templates) with `document.createElement` chains — a much larger structural change. The minimal-safe interpretation chosen here (set safe attributes via DOM setter, keep the structural template) closes the actual stored-XSS attack surface in the 9 attribute sites called out by the plan with ~25 LOC of diff and zero rendering risk. A full conversion can land as a separate UI refactor PR.
 
+### 2026-05-13 — Week 4+ batch 3: #10d Rust cargo-fuzz scaffolding
+
+Added a cargo-fuzz sub-crate at `traffic_cypher_in_Rust/fuzz/` covering the two Rust fuzz targets called out by REMEDIATION_PLAN.md:
+
+- `vault_version_probe` — fuzzes the `{"version":N}` peek the public `load_vault` does before committing to a V2/V3 struct shape.
+- `vault_v3_envelope` — fuzzes the full V3 struct deserialization plus hex decoding of the four envelope fields. Stops short of Argon2id derivation / AES-GCM so iterations stay sub-millisecond.
+
+**Files**
+- `traffic_cypher_in_Rust/src/vault.rs` — added two `#[doc(hidden)] pub fn fuzz_parse_*` helpers placed between regular code and the test module (clippy `items-after-test-module` was the reason for re-ordering during the build). Plus a smoke unit test `fuzz_helpers_basic_inputs` so the helpers stay alive in regular `cargo test`.
+- `traffic_cypher_in_Rust/fuzz/Cargo.toml` (new) — standalone sub-crate, NOT in the parent workspace (parent has no `[workspace]`). Two `[[bin]]` targets.
+- `traffic_cypher_in_Rust/fuzz/fuzz_targets/vault_version_probe.rs`, `vault_v3_envelope.rs` (new) — minimal `fuzz_target!` wrappers.
+- `traffic_cypher_in_Rust/fuzz/corpus/vault_version_probe/{v2,v3}.json`, `vault_v3_envelope/seed.json` (new) — seed inputs.
+- `traffic_cypher_in_Rust/fuzz/.gitignore`, `traffic_cypher_in_Rust/fuzz/README.md` (new).
+- `tests/26_fuzz_scaffolding.sh` (new) — pins scaffolding presence, target names, helper exports, corpus population, and isolation from the parent workspace.
+
+**Verification**
+- `cargo test --locked --lib fuzz` — `fuzz_helpers_basic_inputs` passes.
+- `cargo build --release --bins --locked`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked` — clean (`fuzz/` is not in the parent workspace so it doesn't participate).
+- `bash tests/run.sh` — 29/29 PASS (was 28; +1 new scaffolding test).
+
+**Risks / deferred**
+- `cargo +nightly fuzz run <target>` is not exercised here — requires nightly Rust + `cargo install cargo-fuzz`. Documented in `fuzz/README.md`.
+- CI wiring (60-second smoke per push, 5-minute nightly) deferred. Adds nightly toolchain + corpus-cache requirements; better as a follow-up PR.
+- The C fuzz targets (#10d C-side) are not in this batch — they need `clang -fsanitize=fuzzer,address` plumbing in the Makefile and a separate scaffolding pass.
+
 ---
+
+## Final state at end of run
+
+- Weeks 0–3: complete (verified earlier in this file).
+- Backlog (9 items): 8/9 done. The remaining one — moving report binaries out of `main` — is deferred as a policy decision out of scope for an unattended routine.
+- Week 4+: #5c DOM construction pass complete; #10d Rust half complete (C half deferred); #1a Full C MultiStreamManager port deferred (~2 weeks of focused work per the plan).
+- Regression harness: 26 → 29 tests, all green.
+- Three commits pushed this session: `8b0ea7b` (build hardening), `827394b` (#5c DOM), and the upcoming fuzz commit.
