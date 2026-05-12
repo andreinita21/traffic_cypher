@@ -13,12 +13,21 @@ ifeq ($(CC_IS_GCC),1)
   CFLAGS += -Wstringop-truncation
 endif
 
-# OpenSSL paths (macOS Homebrew)
+# Platform-specific knobs.
+#
+# On Linux/glibc, -std=c11 hides POSIX symbols (clock_gettime, fdopen, fileno,
+# kill, ...) and GNU extensions (strcasestr) behind feature-test macros.
+# -D_GNU_SOURCE exposes both groups. macOS' libc exposes everything by default,
+# and defining _POSIX_C_SOURCE there would *hide* strcasestr — so the macro is
+# Linux-only.
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
   OPENSSL_PREFIX ?= $(shell brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl)
   CFLAGS  += -I$(OPENSSL_PREFIX)/include
   LDFLAGS += -L$(OPENSSL_PREFIX)/lib -framework Security
+endif
+ifeq ($(UNAME_S),Linux)
+  CFLAGS += -D_GNU_SOURCE
 endif
 
 LDFLAGS += -lssl -lcrypto -lpthread -lm

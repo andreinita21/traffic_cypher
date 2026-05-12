@@ -45,8 +45,9 @@ fn run_bench(name: &'static str, warmup: usize, iters: usize, mut f: impl FnMut(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn get_rss_bytes() -> usize {
-    // macOS: use mach task_info
+    // macOS: use mach task_info.
     unsafe {
         let mut info: libc::mach_task_basic_info_data_t = std::mem::zeroed();
         let mut count = (std::mem::size_of::<libc::mach_task_basic_info_data_t>()
@@ -63,6 +64,24 @@ fn get_rss_bytes() -> usize {
             0
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn get_rss_bytes() -> usize {
+    // Linux: /proc/self/statm fields are page counts: size, resident, ...
+    let s = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    let resident_pages = s
+        .split_whitespace()
+        .nth(1)
+        .and_then(|x| x.parse::<usize>().ok())
+        .unwrap_or(0);
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    resident_pages * page_size
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn get_rss_bytes() -> usize {
+    0
 }
 
 const FRAME_W: u32 = 320;
