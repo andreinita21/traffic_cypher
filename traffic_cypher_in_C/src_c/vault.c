@@ -10,7 +10,27 @@
 #include <unistd.h>     /* fsync, unlink */
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
+#include <openssl/core_names.h>
+#include <openssl/params.h>
 #include <openssl/rand.h>
+#include <openssl/opensslv.h>
+#include <openssl/thread.h>
+
+/* Argon2id support requires OpenSSL 3.2 — EVP_KDF_fetch("ARGON2ID") is
+ * not present in 3.0/3.1. macOS Homebrew openssl@3 is well past this
+ * threshold; Linux distros that ship 3.0/3.1 need an upgraded openssl-dev
+ * package. A libargon2 fallback is intentionally NOT shipped — that's a
+ * separate (deferred) change. */
+#if OPENSSL_VERSION_NUMBER < 0x30200000L
+#error "Traffic Cypher (C) requires OpenSSL 3.2+ for Argon2id (EVP_KDF). Install/upgrade openssl3."
+#endif
+
+/* On-disk format constants for vault file v3. The Rust implementation
+ * persists exactly the same numbers — KAT in test_fixtures/argon2id_kek_kat.json
+ * is the cross-impl contract. */
+#define ARGON2ID_M_COST 65536u  /* 64 MiB */
+#define ARGON2ID_T_COST 3u
+#define ARGON2ID_P_COST 1u
 
 /* We use a minimal JSON approach: manually build/parse JSON strings.
    For a production system, use cJSON. This keeps the build dependency-free. */
@@ -457,11 +477,72 @@ static int hkdf_derive(const uint8_t *ikm, size_t ikm_len,
 
 /* --- Envelope encryption --- */
 
-static void derive_kek(const char *master_password, const uint8_t *salt, size_t salt_len, uint8_t kek[32]) {
+/* Legacy v2 KDF: HKDF-SHA256. No work factor; readable only because we still
+ * need to open existing v2 vaults so they can be auto-upgraded to v3. */
+static void derive_kek_hkdf(const char *master_password,
+                            const uint8_t *salt, size_t salt_len,
+                            uint8_t kek[32]) {
     hkdf_derive((const uint8_t *)master_password, strlen(master_password),
                 salt, salt_len,
                 (const uint8_t *)"traffic-cypher-kek-v2", 21,
                 kek, 32);
+}
+
+/* Current v3 KDF: Argon2id via OpenSSL 3.2+ EVP_KDF. Parameters are
+ * persisted in the vault file (kdf_m_cost / kdf_t_cost / kdf_p_cost) so a
+ * future parameter bump never bricks an existing file.
+ *
+ * Returns 0 on success, -1 on failure. On failure `kek` is left zeroed. */
+static int derive_kek_argon2id(const char *master_password,
+                               const uint8_t *salt, size_t salt_len,
+                               uint32_t m_cost, uint32_t t_cost, uint32_t p_cost,
+                               uint8_t kek[32]) {
+    memset(kek, 0, 32);
+
+    EVP_KDF *kdf = EVP_KDF_fetch(NULL, "ARGON2ID", NULL);
+    if (!kdf) return -1;
+    EVP_KDF_CTX *ctx = EVP_KDF_CTX_new(kdf);
+    EVP_KDF_free(kdf);
+    if (!ctx) return -1;
+
+    /* OpenSSL's Argon2 EVP_KDF expects:
+     *   - OSSL_KDF_PARAM_PASSWORD       : the password bytes
+     *   - OSSL_KDF_PARAM_SALT           : the salt bytes
+     *   - OSSL_KDF_PARAM_ITER           : t_cost (passes)
+     *   - OSSL_KDF_PARAM_THREADS        : p_cost (parallelism lanes)
+     *   - OSSL_KDF_PARAM_ARGON2_MEMCOST : m_cost in KiB
+     *
+     * KAT (`test_fixtures/argon2id_kek_kat.json`) was generated against the
+     * RustCrypto `argon2` crate v0.5 with Algorithm::Argon2id /
+     * Version::V0x13. OpenSSL defaults to v1.3 / argon2id, matching the
+     * Rust side byte-for-byte. */
+    OSSL_PARAM params[6];
+    size_t pwd_len = strlen(master_password);
+    int idx = 0;
+    params[idx++] = OSSL_PARAM_construct_octet_string(
+        OSSL_KDF_PARAM_PASSWORD, (void *)master_password, pwd_len);
+    params[idx++] = OSSL_PARAM_construct_octet_string(
+        OSSL_KDF_PARAM_SALT, (void *)salt, salt_len);
+    params[idx++] = OSSL_PARAM_construct_uint32(
+        OSSL_KDF_PARAM_ITER, &t_cost);
+    params[idx++] = OSSL_PARAM_construct_uint32(
+        OSSL_KDF_PARAM_THREADS, &p_cost);
+    params[idx++] = OSSL_PARAM_construct_uint32(
+        OSSL_KDF_PARAM_ARGON2_MEMCOST, &m_cost);
+    params[idx++] = OSSL_PARAM_construct_end();
+
+    /* OpenSSL refuses THREADS > the global max-threads cap. Raise it
+     * defensively — we only ever ask for 1 lane today, but the cap can be
+     * surprisingly low on minimal builds. Best-effort; failure is fine for
+     * p_cost == 1. */
+    (void)OSSL_set_max_threads(NULL, p_cost);
+
+    if (EVP_KDF_derive(ctx, kek, 32, params) <= 0) {
+        EVP_KDF_CTX_free(ctx);
+        return -1;
+    }
+    EVP_KDF_CTX_free(ctx);
+    return 0;
 }
 
 void generate_dek_from_traffic(const uint8_t *traffic_entropy, size_t len, uint8_t out[32]) {
@@ -572,17 +653,58 @@ int load_vault(const char *master_password, unlocked_vault_t *result) {
     contents[file_size] = '\0';
     fclose(fp);
 
-    /* Parse JSON fields */
+    /* Determine version. Anything that isn't 2 or 3 is a hard error —
+     * silently coercing future formats would corrupt vaults written by
+     * newer builds. */
+    int version = json_get_int(contents, "version");
+    if (version != 2 && version != 3) {
+        fprintf(stderr,
+                "load_vault: unsupported vault version %d (this build "
+                "understands v2 and v3)\n", version);
+        free(contents);
+        return -1;
+    }
+
+    /* Parse JSON fields shared between v2 and v3. */
     char *kek_salt_hex = json_get_string(contents, "kek_salt");
     char *wdn_hex = json_get_string(contents, "wrapped_dek_nonce");
     char *wd_hex = json_get_string(contents, "wrapped_dek");
     char *vn_hex = json_get_string(contents, "vault_nonce");
     char *vc_hex = json_get_string(contents, "vault_ciphertext");
     char *esrc = json_get_string(contents, "entropy_source");
+
+    /* v3-only fields. For v2 these are unused and remain at defaults. */
+    char *kdf_name = NULL;
+    uint32_t m_cost = ARGON2ID_M_COST, t_cost = ARGON2ID_T_COST, p_cost = ARGON2ID_P_COST;
+    if (version == 3) {
+        kdf_name = json_get_string(contents, "kdf");
+        m_cost = (uint32_t)json_get_uint64(contents, "kdf_m_cost");
+        t_cost = (uint32_t)json_get_uint64(contents, "kdf_t_cost");
+        p_cost = (uint32_t)json_get_uint64(contents, "kdf_p_cost");
+        if (!kdf_name || strcmp(kdf_name, "argon2id") != 0) {
+            fprintf(stderr,
+                    "load_vault: vault v3 declares unsupported KDF '%s' "
+                    "(expected 'argon2id')\n", kdf_name ? kdf_name : "(null)");
+            free(kek_salt_hex); free(wdn_hex); free(wd_hex);
+            free(vn_hex); free(vc_hex); free(esrc); free(kdf_name);
+            free(contents);
+            return -1;
+        }
+        if (m_cost == 0 || t_cost == 0 || p_cost == 0) {
+            fprintf(stderr,
+                    "load_vault: v3 file has zero/missing Argon2id params "
+                    "(m=%u t=%u p=%u)\n", m_cost, t_cost, p_cost);
+            free(kek_salt_hex); free(wdn_hex); free(wd_hex);
+            free(vn_hex); free(vc_hex); free(esrc); free(kdf_name);
+            free(contents);
+            return -1;
+        }
+    }
     free(contents);
 
     if (!kek_salt_hex || !wdn_hex || !wd_hex || !vn_hex || !vc_hex) {
-        free(kek_salt_hex); free(wdn_hex); free(wd_hex); free(vn_hex); free(vc_hex); free(esrc);
+        free(kek_salt_hex); free(wdn_hex); free(wd_hex);
+        free(vn_hex); free(vc_hex); free(esrc); free(kdf_name);
         return -1;
     }
 
@@ -610,13 +732,27 @@ int load_vault(const char *master_password, unlocked_vault_t *result) {
     free(vc_hex);
 
     if (ks_len < 0 || wdn_len != 12 || wd_len < 0 || vn_len != 12 || vc_len < 0) {
-        free(wrapped_dek); free(vault_ct); free(esrc);
+        free(wrapped_dek); free(vault_ct); free(esrc); free(kdf_name);
         return -1;
     }
 
-    /* Step 1: Derive KEK */
+    /* Step 1: Derive KEK. Version 2 → HKDF (microseconds); version 3 →
+     * Argon2id with the params we just parsed. */
     uint8_t kek[32];
-    derive_kek(master_password, kek_salt, (size_t)ks_len, kek);
+    if (version == 2) {
+        derive_kek_hkdf(master_password, kek_salt, (size_t)ks_len, kek);
+        fprintf(stderr,
+                "load_vault: loaded v2 vault — will auto-upgrade to v3 "
+                "(Argon2id) on next save\n");
+    } else {
+        if (derive_kek_argon2id(master_password, kek_salt, (size_t)ks_len,
+                                m_cost, t_cost, p_cost, kek) != 0) {
+            fprintf(stderr, "load_vault: Argon2id derivation failed\n");
+            free(wrapped_dek); free(vault_ct); free(esrc); free(kdf_name);
+            return -1;
+        }
+    }
+    free(kdf_name);
 
     /* Step 2: Unwrap DEK */
     uint8_t *dek_plain = NULL;
@@ -656,13 +792,20 @@ int load_vault(const char *master_password, unlocked_vault_t *result) {
 
 int save_vault(const vault_t *vault, const char *master_password,
                const uint8_t dek[32], const char *entropy_source) {
-    /* Generate fresh KEK salt */
+    /* Generate fresh KEK salt — random per save so a future password change
+     * can't accidentally produce a deterministic re-derivation collision. */
     uint8_t kek_salt[32];
     RAND_bytes(kek_salt, 32);
 
-    /* Derive KEK */
+    /* Derive KEK with Argon2id at the current parameters. Slow (~300 ms);
+     * the cost is what makes a stolen vault hard to brute-force offline. */
     uint8_t kek[32];
-    derive_kek(master_password, kek_salt, 32, kek);
+    if (derive_kek_argon2id(master_password, kek_salt, 32,
+                            ARGON2ID_M_COST, ARGON2ID_T_COST, ARGON2ID_P_COST,
+                            kek) != 0) {
+        fprintf(stderr, "save_vault: Argon2id derivation failed\n");
+        return -1;
+    }
 
     /* Wrap the DEK */
     uint8_t wrap_nonce[12];
@@ -706,13 +849,17 @@ int save_vault(const vault_t *vault, const char *master_password,
     char *vault_ct_hex = (char *)malloc(vault_ct_len * 2 + 1);
     hex_encode(vault_ct, vault_ct_len, vault_ct_hex);
 
-    /* Build output JSON */
-    size_t out_size = 512 + strlen(kek_salt_hex) + strlen(wrap_nonce_hex) +
+    /* Build output JSON. Always v3 — see REMEDIATION_PLAN.md #4. */
+    size_t out_size = 768 + strlen(kek_salt_hex) + strlen(wrap_nonce_hex) +
                       strlen(wrapped_dek_hex) + strlen(vault_nonce_hex) + strlen(vault_ct_hex);
     char *out_json = (char *)malloc(out_size);
     snprintf(out_json, out_size,
         "{\n"
-        "  \"version\": 2,\n"
+        "  \"version\": 3,\n"
+        "  \"kdf\": \"argon2id\",\n"
+        "  \"kdf_m_cost\": %u,\n"
+        "  \"kdf_t_cost\": %u,\n"
+        "  \"kdf_p_cost\": %u,\n"
         "  \"kek_salt\": \"%s\",\n"
         "  \"wrapped_dek_nonce\": \"%s\",\n"
         "  \"wrapped_dek\": \"%s\",\n"
@@ -721,6 +868,7 @@ int save_vault(const vault_t *vault, const char *master_password,
         "  \"entropy_source\": \"%s\",\n"
         "  \"updated_at\": %llu\n"
         "}",
+        ARGON2ID_M_COST, ARGON2ID_T_COST, ARGON2ID_P_COST,
         kek_salt_hex, wrap_nonce_hex, wrapped_dek_hex,
         vault_nonce_hex, vault_ct_hex, entropy_source,
         (unsigned long long)unix_now());

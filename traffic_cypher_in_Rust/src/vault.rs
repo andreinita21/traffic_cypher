@@ -3,13 +3,30 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
 };
 use anyhow::{anyhow, Context, Result};
+use argon2::{Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+// ---------------------------------------------------------------------------
+// Argon2id parameters for the *current* vault format (v3).
+//
+// OWASP 2024 second-tier defaults: 64 MiB memory, 3 iterations, 1 lane.
+// On a 2024 MacBook Pro this lands at ~250-400 ms per derivation — slow
+// enough to make offline brute-force of a stolen vault infeasible, fast
+// enough that an interactive unlock still feels responsive.
+//
+// These three values are persisted in the vault file (`kdf_m_cost` etc.),
+// so a future parameter bump never bricks an existing vault: on load we
+// always use the params the file itself records.
+// ---------------------------------------------------------------------------
+pub const ARGON2ID_M_COST: u32 = 65536; // 64 MiB
+pub const ARGON2ID_T_COST: u32 = 3;
+pub const ARGON2ID_P_COST: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Data types (unchanged)
@@ -138,7 +155,14 @@ impl Vault {
 }
 
 // ---------------------------------------------------------------------------
-// On-disk format v2: Envelope Encryption
+// On-disk formats
+//
+// v2 (legacy): KEK derived via HKDF-SHA256 from the master password. No work
+// factor — brute-forceable at HKDF speed. Still read for backward-compat;
+// every v2 file is silently upgraded to v3 on the next save.
+//
+// v3 (current): KEK derived via Argon2id with parameters persisted in the
+// file. Same envelope-encryption shape; only the KDF differs.
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize)]
@@ -158,6 +182,35 @@ struct VaultFileV2 {
     entropy_source: String,
     /// When this vault file was last written
     updated_at: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct VaultFileV3 {
+    version: u8,
+    /// KDF identifier. Always "argon2id" for v3 files.
+    kdf: String,
+    /// Argon2id memory cost in KiB (e.g. 65536 = 64 MiB).
+    kdf_m_cost: u32,
+    /// Argon2id time cost / passes.
+    kdf_t_cost: u32,
+    /// Argon2id parallelism (lanes).
+    kdf_p_cost: u32,
+    /// Salt fed to Argon2id (random 32 bytes per save).
+    kek_salt: String,
+    wrapped_dek_nonce: String,
+    wrapped_dek: String,
+    vault_nonce: String,
+    vault_ciphertext: String,
+    entropy_source: String,
+    updated_at: u64,
+}
+
+/// Minimal "what version is this?" probe before committing to a full
+/// V2 or V3 deserialization. Keeps the error path predictable on
+/// future bumps.
+#[derive(Deserialize)]
+struct VaultFileVersion {
+    version: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -247,14 +300,41 @@ pub fn vault_path() -> PathBuf {
 // Envelope encryption primitives
 // ---------------------------------------------------------------------------
 
-/// Derive a 256-bit Key Encryption Key (KEK) from master password + salt.
-/// Returns the KEK wrapped in `Zeroizing` so it is overwritten on drop.
-fn derive_kek(master_password: &str, salt: &[u8]) -> Zeroizing<[u8; 32]> {
+/// Derive a 256-bit Key Encryption Key (KEK) from master password + salt
+/// using the *legacy* HKDF-SHA256 construction (vault file v2).
+///
+/// HKDF has no work factor — an attacker with the vault file can iterate
+/// this function as fast as raw hashing. Kept only so we can still read
+/// existing v2 vaults; new saves go through `derive_kek_argon2id`.
+fn derive_kek_hkdf(master_password: &str, salt: &[u8]) -> Zeroizing<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(Some(salt), master_password.as_bytes());
     let mut kek = Zeroizing::new([0u8; 32]);
     hk.expand(b"traffic-cypher-kek-v2", &mut *kek)
         .expect("HKDF expand failed");
     kek
+}
+
+/// Derive a 256-bit Key Encryption Key (KEK) from master password + salt
+/// using Argon2id with the supplied work parameters (vault file v3).
+///
+/// Returns the KEK wrapped in `Zeroizing` so it is overwritten on drop.
+/// Errors only on parameter validation failure — runtime derivation cannot
+/// fail given a 32-byte output and a non-empty password.
+fn derive_kek_argon2id(
+    master_password: &str,
+    salt: &[u8],
+    m_cost: u32,
+    t_cost: u32,
+    p_cost: u32,
+) -> Result<Zeroizing<[u8; 32]>> {
+    let params = Params::new(m_cost, t_cost, p_cost, Some(32))
+        .map_err(|e| anyhow!("Invalid Argon2id parameters (m={}, t={}, p={}): {}",
+                             m_cost, t_cost, p_cost, e))?;
+    let a = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut kek = Zeroizing::new([0u8; 32]);
+    a.hash_password_into(master_password.as_bytes(), salt, &mut *kek)
+        .map_err(|e| anyhow!("Argon2id derivation failed: {}", e))?;
+    Ok(kek)
 }
 
 /// Generate a 256-bit Data Encryption Key (DEK) from traffic entropy.
@@ -355,16 +435,35 @@ fn decrypt_vault_data(
 // ---------------------------------------------------------------------------
 
 /// Result of loading the vault: contains the decrypted vault and the unwrapped DEK.
+///
 /// The `dek` field is `Zeroizing` so its bytes are overwritten on drop.
+///
+/// `needs_upgrade` is `true` when the file we just read was in the legacy v2
+/// (HKDF-derived KEK) format. Callers don't need to do anything special —
+/// the *next* `save_vault` automatically writes v3, transparently migrating
+/// the user to Argon2id. The flag is exposed so the unlock site can log
+/// the upgrade for the operator.
 pub struct UnlockedVault {
     pub vault: Vault,
     pub dek: Zeroizing<[u8; 32]>,
     pub entropy_source: String,
+    pub needs_upgrade: bool,
 }
 
 /// Load and decrypt the vault using only the master password.
-/// Returns the vault data plus the unwrapped DEK (needed for subsequent saves).
-/// If no vault file exists, creates a new vault with an OS-entropy DEK.
+///
+/// Returns the vault data plus the unwrapped DEK (needed for subsequent
+/// saves). If no vault file exists, creates a new vault with an
+/// OS-entropy DEK.
+///
+/// Branches on `version`:
+/// - `2` → legacy HKDF KEK derivation; `needs_upgrade` set so the next
+///   save bumps the file to v3.
+/// - `3` → Argon2id KEK derivation using the persisted params.
+/// - anything else → hard error.
+///
+/// Logs the time spent in KDF at `info` level so a ~300 ms unlock pause
+/// looks intentional in the operator's log, not like a hang.
 pub fn load_vault(master_password: &str) -> Result<UnlockedVault> {
     let path = vault_path();
     if !path.exists() {
@@ -374,48 +473,136 @@ pub fn load_vault(master_password: &str) -> Result<UnlockedVault> {
             vault: Vault::default(),
             dek,
             entropy_source: "os".to_string(),
+            needs_upgrade: false,
         });
     }
 
     let contents = std::fs::read_to_string(&path).context("Failed to read vault file")?;
-    let vf: VaultFileV2 = serde_json::from_str(&contents).context("Vault file is corrupt")?;
 
-    // Decode hex fields
+    // Peek at version before committing to a struct shape.
+    let probe: VaultFileVersion = serde_json::from_str(&contents)
+        .context("Vault file is corrupt (missing or invalid `version`)")?;
+
+    match probe.version {
+        2 => load_vault_v2(master_password, &contents),
+        3 => load_vault_v3(master_password, &contents),
+        other => Err(anyhow!(
+            "Unsupported vault version {} (this build understands v2 and v3)",
+            other
+        )),
+    }
+}
+
+fn load_vault_v2(master_password: &str, contents: &str) -> Result<UnlockedVault> {
+    let vf: VaultFileV2 =
+        serde_json::from_str(contents).context("Vault v2 file is corrupt")?;
+
     let kek_salt = hex::decode(&vf.kek_salt).context("Invalid kek_salt")?;
-    let wrapped_dek_nonce_bytes = hex::decode(&vf.wrapped_dek_nonce).context("Invalid wrapped_dek_nonce")?;
-    let wrapped_dek = hex::decode(&vf.wrapped_dek).context("Invalid wrapped_dek")?;
-    let vault_nonce_bytes = hex::decode(&vf.vault_nonce).context("Invalid vault_nonce")?;
-    let vault_ciphertext = hex::decode(&vf.vault_ciphertext).context("Invalid vault_ciphertext")?;
+    let (wdn, vn, wrapped_dek, vault_ciphertext) = decode_envelope_fields(
+        &vf.wrapped_dek_nonce,
+        &vf.wrapped_dek,
+        &vf.vault_nonce,
+        &vf.vault_ciphertext,
+    )?;
 
-    if wrapped_dek_nonce_bytes.len() != 12 {
-        return Err(anyhow!("wrapped_dek_nonce has wrong length"));
-    }
-    if vault_nonce_bytes.len() != 12 {
-        return Err(anyhow!("vault_nonce has wrong length"));
-    }
+    // Legacy HKDF KEK. Microseconds — no need to time-log it.
+    let kek = derive_kek_hkdf(master_password, &kek_salt);
+    tracing::info!(
+        "Loaded v2 vault — will auto-upgrade to v3 (Argon2id) on next save"
+    );
 
-    let mut wdn = [0u8; 12];
-    wdn.copy_from_slice(&wrapped_dek_nonce_bytes);
-    let mut vn = [0u8; 12];
-    vn.copy_from_slice(&vault_nonce_bytes);
-
-    // Step 1: Derive KEK from master password + stored salt
-    let kek = derive_kek(master_password, &kek_salt);
-
-    // Step 2: Unwrap (decrypt) the DEK
     let dek = unwrap_dek(&kek, &wrapped_dek, &wdn)?;
-
-    // Step 3: Decrypt the vault data with the DEK
     let vault = decrypt_vault_data(&dek, &vault_ciphertext, &vn)?;
 
     Ok(UnlockedVault {
         vault,
         dek,
         entropy_source: vf.entropy_source,
+        needs_upgrade: true,
     })
 }
 
+fn load_vault_v3(master_password: &str, contents: &str) -> Result<UnlockedVault> {
+    let vf: VaultFileV3 =
+        serde_json::from_str(contents).context("Vault v3 file is corrupt")?;
+
+    if vf.kdf != "argon2id" {
+        return Err(anyhow!(
+            "Vault v3 file declares unsupported KDF '{}' (expected 'argon2id')",
+            vf.kdf
+        ));
+    }
+
+    let kek_salt = hex::decode(&vf.kek_salt).context("Invalid kek_salt")?;
+    let (wdn, vn, wrapped_dek, vault_ciphertext) = decode_envelope_fields(
+        &vf.wrapped_dek_nonce,
+        &vf.wrapped_dek,
+        &vf.vault_nonce,
+        &vf.vault_ciphertext,
+    )?;
+
+    // Argon2id derivation: ~250-400 ms. Timed and logged so the pause
+    // visible to the user is also visible in the operator log.
+    let t0 = Instant::now();
+    let kek = derive_kek_argon2id(
+        master_password,
+        &kek_salt,
+        vf.kdf_m_cost,
+        vf.kdf_t_cost,
+        vf.kdf_p_cost,
+    )?;
+    tracing::info!(
+        "Deriving key... {} ms (Argon2id m={}KiB t={} p={})",
+        t0.elapsed().as_millis(),
+        vf.kdf_m_cost,
+        vf.kdf_t_cost,
+        vf.kdf_p_cost,
+    );
+
+    let dek = unwrap_dek(&kek, &wrapped_dek, &wdn)?;
+    let vault = decrypt_vault_data(&dek, &vault_ciphertext, &vn)?;
+
+    Ok(UnlockedVault {
+        vault,
+        dek,
+        entropy_source: vf.entropy_source,
+        needs_upgrade: false,
+    })
+}
+
+/// Shared hex-decoding + length-validation for the four envelope fields
+/// that are identical between v2 and v3.
+fn decode_envelope_fields(
+    wrapped_dek_nonce: &str,
+    wrapped_dek: &str,
+    vault_nonce: &str,
+    vault_ciphertext: &str,
+) -> Result<([u8; 12], [u8; 12], Vec<u8>, Vec<u8>)> {
+    let wdn_bytes = hex::decode(wrapped_dek_nonce).context("Invalid wrapped_dek_nonce")?;
+    let wrapped_dek = hex::decode(wrapped_dek).context("Invalid wrapped_dek")?;
+    let vn_bytes = hex::decode(vault_nonce).context("Invalid vault_nonce")?;
+    let vault_ciphertext = hex::decode(vault_ciphertext).context("Invalid vault_ciphertext")?;
+
+    if wdn_bytes.len() != 12 {
+        return Err(anyhow!("wrapped_dek_nonce has wrong length"));
+    }
+    if vn_bytes.len() != 12 {
+        return Err(anyhow!("vault_nonce has wrong length"));
+    }
+
+    let mut wdn = [0u8; 12];
+    wdn.copy_from_slice(&wdn_bytes);
+    let mut vn = [0u8; 12];
+    vn.copy_from_slice(&vn_bytes);
+    Ok((wdn, vn, wrapped_dek, vault_ciphertext))
+}
+
 /// Encrypt and save the vault to disk.
+///
+/// Always writes the current format (v3 / Argon2id). A v2 file is therefore
+/// silently upgraded the next time it is saved — no user prompt, no special
+/// migration step.
+///
 /// Uses the provided DEK for data encryption and wraps the DEK with a KEK
 /// derived from the master password.
 pub fn save_vault(
@@ -429,8 +616,23 @@ pub fn save_vault(
     getrandom::getrandom(&mut kek_salt)
         .map_err(|e| anyhow!("Failed to generate kek_salt: {}", e))?;
 
-    // Derive KEK
-    let kek = derive_kek(master_password, &kek_salt);
+    // Derive KEK via Argon2id (current params). Timed; logged so a slow save
+    // is visible in the log.
+    let t0 = Instant::now();
+    let kek = derive_kek_argon2id(
+        master_password,
+        &kek_salt,
+        ARGON2ID_M_COST,
+        ARGON2ID_T_COST,
+        ARGON2ID_P_COST,
+    )?;
+    tracing::info!(
+        "Deriving key (save)... {} ms (Argon2id m={}KiB t={} p={})",
+        t0.elapsed().as_millis(),
+        ARGON2ID_M_COST,
+        ARGON2ID_T_COST,
+        ARGON2ID_P_COST,
+    );
 
     // Wrap the DEK
     let (wrapped_dek, wrapped_dek_nonce) = wrap_dek(&kek, dek)?;
@@ -438,8 +640,12 @@ pub fn save_vault(
     // Encrypt the vault data
     let (vault_ciphertext, vault_nonce) = encrypt_vault_data(dek, vault)?;
 
-    let vf = VaultFileV2 {
-        version: 2,
+    let vf = VaultFileV3 {
+        version: 3,
+        kdf: "argon2id".to_string(),
+        kdf_m_cost: ARGON2ID_M_COST,
+        kdf_t_cost: ARGON2ID_T_COST,
+        kdf_p_cost: ARGON2ID_P_COST,
         kek_salt: hex::encode(kek_salt),
         wrapped_dek_nonce: hex::encode(wrapped_dek_nonce),
         wrapped_dek: hex::encode(wrapped_dek),
@@ -545,42 +751,105 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn test_vault_path() -> PathBuf {
-        PathBuf::from("/tmp/test_traffic_cypher_vault.json")
-    }
-
-    /// Helper: override vault path for tests
-    fn with_test_vault<F: FnOnce()>(f: F) {
-        let path = test_vault_path();
+    /// Helper: override vault path for tests with a unique-per-test path
+    /// so tests can run concurrently (cargo test runs threads by default).
+    /// Note: TRAFFIC_CYPHER_VAULT_PATH is a process-global env var, so this
+    /// helper still requires `--test-threads=1` for full isolation. Using a
+    /// unique path per call additionally protects against stale files from
+    /// previous runs.
+    fn with_test_vault<F: FnOnce()>(tag: &str, f: F) {
+        let path = std::env::temp_dir()
+            .join(format!("test_traffic_cypher_vault_{}_{}.json",
+                          tag, std::process::id()));
         // Clean up before
         let _ = fs::remove_file(&path);
-        // Override vault path for this test
         std::env::set_var("TRAFFIC_CYPHER_VAULT_PATH", path.to_str().unwrap());
         f();
-        // Clean up after
         let _ = fs::remove_file(&path);
         std::env::remove_var("TRAFFIC_CYPHER_VAULT_PATH");
+    }
+
+    /// Convenience: deterministic Argon2id KEK with the current production
+    /// params. Used by several wrap/unwrap tests below — keeps the test
+    /// surface focused without re-typing the params each time.
+    fn test_kek(password: &str, salt: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+        derive_kek_argon2id(
+            password,
+            salt,
+            ARGON2ID_M_COST,
+            ARGON2ID_T_COST,
+            ARGON2ID_P_COST,
+        )
+        .expect("argon2id derive")
     }
 
     #[test]
     fn test_kek_derivation_deterministic() {
         let salt = [42u8; 32];
-        let kek1 = derive_kek("mypassword", &salt);
-        let kek2 = derive_kek("mypassword", &salt);
+        let kek1 = derive_kek_hkdf("mypassword", &salt);
+        let kek2 = derive_kek_hkdf("mypassword", &salt);
         assert_eq!(kek1, kek2);
     }
 
     #[test]
     fn test_kek_different_passwords() {
         let salt = [42u8; 32];
-        let kek1 = derive_kek("password1", &salt);
-        let kek2 = derive_kek("password2", &salt);
+        let kek1 = derive_kek_hkdf("password1", &salt);
+        let kek2 = derive_kek_hkdf("password2", &salt);
         assert_ne!(kek1, kek2);
+    }
+
+    /// Argon2id KEK is deterministic given the same (password, salt, params)
+    /// — this is what makes envelope decryption work.
+    #[test]
+    fn test_argon2id_kek_deterministic() {
+        let salt = [7u8; 32];
+        let kek1 = test_kek("mypassword", &salt);
+        let kek2 = test_kek("mypassword", &salt);
+        assert_eq!(*kek1, *kek2);
+    }
+
+    /// Argon2id is parameter-sensitive. Different t_cost MUST produce a
+    /// different KEK, otherwise persisting the params is pointless.
+    #[test]
+    fn test_argon2id_kek_params_matter() {
+        let salt = [7u8; 32];
+        let kek_t3 = derive_kek_argon2id("pw", &salt, 65536, 3, 1).unwrap();
+        let kek_t4 = derive_kek_argon2id("pw", &salt, 65536, 4, 1).unwrap();
+        assert_ne!(*kek_t3, *kek_t4);
+    }
+
+    /// Cross-impl KAT. The expected output was pinned once with the
+    /// RustCrypto `argon2 = 0.5` crate (see `examples/argon2_kat.rs`).
+    /// Both Rust and C builds MUST produce this exact KEK from the inputs
+    /// in `test_fixtures/argon2id_kek_kat.json` — drift between the two
+    /// implementations is a cross-impl crypto regression.
+    #[test]
+    fn test_argon2id_kek_kat() {
+        // include_str! pins the fixture into the test binary so test runs
+        // don't depend on the harness's working directory.
+        const FIXTURE: &str =
+            include_str!("../../test_fixtures/argon2id_kek_kat.json");
+        let v: serde_json::Value =
+            serde_json::from_str(FIXTURE).expect("parse KAT fixture");
+
+        let password = v["password"].as_str().unwrap();
+        let salt = hex::decode(v["salt_hex"].as_str().unwrap()).unwrap();
+        let m_cost = v["m_cost"].as_u64().unwrap() as u32;
+        let t_cost = v["t_cost"].as_u64().unwrap() as u32;
+        let p_cost = v["p_cost"].as_u64().unwrap() as u32;
+        let expected_hex = v["expected_kek_hex"].as_str().unwrap();
+
+        let kek = derive_kek_argon2id(password, &salt, m_cost, t_cost, p_cost)
+            .expect("derive");
+        assert_eq!(hex::encode(&*kek), expected_hex,
+            "Argon2id KEK output diverged from pinned KAT — check the argon2 \
+             crate version, Algorithm/Version flags, and parameter wiring.");
     }
 
     #[test]
     fn test_dek_wrap_unwrap() {
-        let kek = derive_kek("testpass", &[1u8; 32]);
+        let kek = test_kek("testpass", &[1u8; 32]);
         let dek = generate_dek_from_os();
         let (wrapped, nonce) = wrap_dek(&kek, &dek).unwrap();
         let unwrapped = unwrap_dek(&kek, &wrapped, &nonce).unwrap();
@@ -589,8 +858,8 @@ mod tests {
 
     #[test]
     fn test_dek_unwrap_wrong_password() {
-        let kek_right = derive_kek("rightpass", &[1u8; 32]);
-        let kek_wrong = derive_kek("wrongpass", &[1u8; 32]);
+        let kek_right = test_kek("rightpass", &[1u8; 32]);
+        let kek_wrong = test_kek("wrongpass", &[1u8; 32]);
         let dek = generate_dek_from_os();
         let (wrapped, nonce) = wrap_dek(&kek_right, &dek).unwrap();
         let result = unwrap_dek(&kek_wrong, &wrapped, &nonce);
@@ -620,7 +889,7 @@ mod tests {
 
     #[test]
     fn test_full_save_load_cycle() {
-        with_test_vault(|| {
+        with_test_vault("save_load", || {
             let master_pw = "my_master_password";
             let dek = generate_dek_from_os();
 
@@ -652,7 +921,7 @@ mod tests {
 
     #[test]
     fn test_wrong_password_load_fails() {
-        with_test_vault(|| {
+        with_test_vault("wrong_pw", || {
             let dek = generate_dek_from_os();
             let vault = Vault::default();
 
@@ -665,7 +934,7 @@ mod tests {
 
     #[test]
     fn test_dek_rotation() {
-        with_test_vault(|| {
+        with_test_vault("rotate", || {
             let master_pw = "rotation_test";
             let dek1 = generate_dek_from_os();
 
@@ -704,5 +973,80 @@ mod tests {
         // But both should be 32 bytes
         assert_eq!(dek1.len(), 32);
         assert_eq!(dek2.len(), 32);
+    }
+
+    /// save_vault always writes the current format (v3 + argon2id + persisted
+    /// params). If this asserts fails the schema has silently regressed.
+    #[test]
+    fn test_save_writes_v3() {
+        with_test_vault("save_v3", || {
+            let dek = generate_dek_from_os();
+            save_vault(&Vault::default(), "pw", &dek, "os").unwrap();
+            let contents = std::fs::read_to_string(vault_path()).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&contents).unwrap();
+            assert_eq!(v["version"], 3);
+            assert_eq!(v["kdf"], "argon2id");
+            assert_eq!(v["kdf_m_cost"], 65536);
+            assert_eq!(v["kdf_t_cost"], 3);
+            assert_eq!(v["kdf_p_cost"], 1);
+        });
+    }
+
+    /// v2 -> v3 auto-upgrade. Loading the bundled v2 fixture must succeed,
+    /// surface `needs_upgrade=true`, and saving once must rewrite the file
+    /// as v3 with the same plaintext recoverable.
+    #[test]
+    fn test_v2_to_v3_auto_upgrade() {
+        with_test_vault("v2_upgrade", || {
+            // Drop the bundled v2 fixture in place.
+            const V2_FIXTURE: &str =
+                include_str!("../../test_fixtures/sample_vault_v2.json");
+            std::fs::write(vault_path(), V2_FIXTURE).unwrap();
+
+            // 1. Load with the right password — works through the v2 path.
+            let unlocked = load_vault("upgrade-fixture-pw")
+                .expect("load v2 fixture");
+            assert!(unlocked.needs_upgrade, "v2 file must flag needs_upgrade");
+            assert_eq!(unlocked.vault.entries.len(), 1);
+            assert_eq!(unlocked.vault.entries[0].label, "v2-upgrade-test");
+            assert_eq!(unlocked.vault.entries[0].password,
+                       "v2-secret-do-not-lose");
+
+            // 2. Save: writes v3.
+            save_vault(&unlocked.vault, "upgrade-fixture-pw",
+                       &unlocked.dek, &unlocked.entropy_source).unwrap();
+
+            let after = std::fs::read_to_string(vault_path()).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&after).unwrap();
+            assert_eq!(v["version"], 3, "save must upgrade v2 -> v3");
+            assert_eq!(v["kdf"], "argon2id");
+
+            // 3. Reload (via v3 path) — content preserved.
+            let reloaded = load_vault("upgrade-fixture-pw")
+                .expect("reload after upgrade");
+            assert!(!reloaded.needs_upgrade);
+            assert_eq!(reloaded.vault.entries.len(), 1);
+            assert_eq!(reloaded.vault.entries[0].password,
+                       "v2-secret-do-not-lose");
+        });
+    }
+
+    /// Unsupported `version` must be a hard error — neither a panic nor
+    /// silent dispatch to v2/v3.
+    #[test]
+    fn test_unknown_version_rejected() {
+        with_test_vault("bad_version", || {
+            // Minimal file with a future version. Other fields are absent;
+            // the version-probe step fails first, so they don't need to be
+            // valid.
+            std::fs::write(vault_path(),
+                r#"{"version": 99, "kek_salt": "00"}"#).unwrap();
+            let err = match load_vault("anything") {
+                Ok(_) => panic!("expected load_vault to fail on version=99"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("Unsupported vault version 99"),
+                    "got: {}", err);
+        });
     }
 }

@@ -1,0 +1,10 @@
+{
+  "_comment": "Argon2id KEK derivation Known-Answer Test. Pinned with the RustCrypto argon2 crate v0.5 (Algorithm::Argon2id, Version::V0x13). Both Rust and C implementations of Traffic Cypher MUST produce expected_kek_hex from the inputs below — divergence is a cross-impl crypto regression.",
+  "password": "x",
+  "salt_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+  "m_cost": 65536,
+  "t_cost": 3,
+  "p_cost": 1,
+  "out_len": 32,
+  "expected_kek_hex": "49952394ba3ff2336d47ced59fa93c842d1a8f808177c736cc86c328f3bc513a"
+}

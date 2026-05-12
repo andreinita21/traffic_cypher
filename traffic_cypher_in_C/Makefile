@@ -1,5 +1,9 @@
 # Traffic Cypher — C rebuild
-# Requires: OpenSSL (brew install openssl on macOS)
+# Requires: OpenSSL 3.2+ (Argon2id via EVP_KDF_fetch("ARGON2ID")). Older
+# OpenSSL (3.0/3.1) cannot supply Argon2id and will fail the
+# OPENSSL_VERSION_NUMBER check at the top of src_c/vault.c. macOS Homebrew
+# `openssl@3` is 3.3+ and works out of the box. On Linux, ensure
+# `pkg-config --modversion openssl` reports at least 3.2.0.
 
 CC      = cc
 CFLAGS  = -Wall -Wextra -O2 -std=c11 -I include \

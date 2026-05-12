@@ -25,6 +25,7 @@ totp-rs = { version = "5", features = ["gen_secret"] }
 rand = "0.8"
 libc = "0.2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
+argon2 = "0.5"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
