@@ -142,6 +142,7 @@ async fn main() -> Result<()> {
 
     // Cleanup
     let _ = ffmpeg_child.kill().await;
+    let _ = ffmpeg_child.wait().await;
     info!("Goodbye! Generated keys from {} frames.", previous_key.map_or(0, |_| pool.len()));
 
     Ok(())

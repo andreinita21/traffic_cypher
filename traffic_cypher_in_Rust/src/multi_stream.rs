@@ -35,6 +35,7 @@ struct StreamHandle {
     status: StreamState,
     frames_captured: u64,
     cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    child: Option<tokio::process::Child>,
 }
 
 impl MultiStreamManager {
@@ -70,6 +71,7 @@ impl MultiStreamManager {
             status: StreamState::Connecting,
             frames_captured: 0,
             cancel_tx: None,
+            child: None,
         });
 
         // 1. Resolve the YouTube URL into a direct stream URL
@@ -86,7 +88,7 @@ impl MultiStreamManager {
         let (capture_tx, mut capture_rx) = mpsc::channel::<Frame>(64);
 
         // 3. Start ffmpeg frame capture
-        let _child = match frame_sampler::start_frame_capture(&resolved_url, capture_tx).await {
+        let child = match frame_sampler::start_frame_capture(&resolved_url, capture_tx).await {
             Ok(child) => child,
             Err(e) => {
                 error!("Failed to start frame capture for '{}': {}", label, e);
@@ -94,6 +96,7 @@ impl MultiStreamManager {
                 return Err(e).context(format!("Failed to start capture for '{}'", label));
             }
         };
+        self.streams[index].child = Some(child);
 
         // 4. Create a cancellation channel for this stream
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
@@ -142,8 +145,9 @@ impl MultiStreamManager {
     }
 
     /// Stop and remove a stream by index. Sends a cancel signal to the
-    /// forwarding task, then removes the entry from the vec entirely.
-    pub fn remove_stream(&mut self, index: usize) -> Result<()> {
+    /// forwarding task, kills the ffmpeg child process, then removes the
+    /// entry from the vec entirely.
+    pub async fn remove_stream(&mut self, index: usize) -> Result<()> {
         if index >= self.streams.len() {
             bail!("Stream index {} out of range (have {})", index, self.streams.len());
         }
@@ -154,6 +158,13 @@ impl MultiStreamManager {
         // Send cancel signal; if the receiver is already gone that is fine
         if let Some(cancel_tx) = handle.cancel_tx.take() {
             let _ = cancel_tx.send(());
+        }
+
+        // Kill and reap the ffmpeg child process explicitly so we do not
+        // leave orphaned processes behind.
+        if let Some(mut child) = handle.child.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
         }
 
         self.streams.remove(index);

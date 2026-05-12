@@ -37,6 +37,7 @@ pub async fn start_frame_capture(
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .context("Failed to spawn ffmpeg. Is it installed?")?;
 

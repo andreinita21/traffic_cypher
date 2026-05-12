@@ -318,6 +318,12 @@ async fn lock(
     *state.is_unlocked.write().await = false;
     *state.current_dek.write().await = None;
 
+    // Drain all streams to ensure ffmpeg children are killed on lock.
+    let mut mgr = state.stream_manager.lock().await;
+    while mgr.stream_count() > 0 {
+        let _ = mgr.remove_stream(0).await;
+    }
+
     (StatusCode::OK, Json(serde_json::json!({"status": "locked"}))).into_response()
 }
 
@@ -706,7 +712,7 @@ async fn remove_stream(
     }
 
     let mut mgr = state.stream_manager.lock().await;
-    match mgr.remove_stream(index) {
+    match mgr.remove_stream(index).await {
         Ok(()) => {
             // Update config
             let mut config = vault::load_stream_config();
