@@ -42,6 +42,15 @@ typedef struct {
 
     /* Stream config */
     stream_config_t stream_config;
+
+    /* Rate limit for /api/auth/unlock (REMEDIATION_PLAN.md §8). Process-
+     * lifetime only — restart clears, single-user localhost service so no
+     * per-IP table needed. Sliding window of 5 failure timestamps; when all
+     * 5 fall within 60 s the lockout below is armed for 30 s (override at
+     * startup via env var TC_UNLOCK_LOCKOUT_S, used by the test suite). */
+    uint64_t unlock_failures[5];        /* unix-seconds, 0 = empty slot */
+    int      unlock_failure_count;      /* slots populated, capped at 5 */
+    uint64_t unlock_lockout_until;      /* unix-seconds; 0 = no lockout */
 } app_state_t;
 
 /* Initialize app state */

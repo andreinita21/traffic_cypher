@@ -25,6 +25,13 @@ pub struct AppState {
     pub current_dek: Arc<RwLock<Option<Zeroizing<[u8; 32]>>>>,
     /// Where the current DEK's entropy came from ("traffic" or "os")
     pub entropy_source: Arc<RwLock<String>>,
+    /// Sliding-window timestamps of the last 5 failed `/api/auth/unlock`
+    /// attempts. When all 5 fall within 60 s, the next attempt triggers a
+    /// 30 s lockout. Process-lifetime only — restart clears it.
+    pub unlock_failure_times: Arc<RwLock<[Option<Instant>; 5]>>,
+    /// If `Some(t)`, all unlock attempts return 429 until `Instant::now() >= t`.
+    /// Set when the 5-in-60s threshold trips; cleared on success or expiry.
+    pub unlock_lockout_until: Arc<RwLock<Option<Instant>>>,
 }
 
 impl AppState {
@@ -41,6 +48,8 @@ impl AppState {
             rotation_cancel: Arc::new(RwLock::new(None)),
             current_dek: Arc::new(RwLock::new(None)),
             entropy_source: Arc::new(RwLock::new("os".to_string())),
+            unlock_failure_times: Arc::new(RwLock::new([None; 5])),
+            unlock_lockout_until: Arc::new(RwLock::new(None)),
         }
     }
 

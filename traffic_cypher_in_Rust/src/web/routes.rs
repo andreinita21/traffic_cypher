@@ -8,6 +8,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use super::auth::validate_session;
@@ -265,10 +266,98 @@ async fn build_info() -> Response {
 // Auth handlers
 // ---------------------------------------------------------------------------
 
+// Rate-limit constants for /api/auth/unlock.
+//
+// Threat model: localhost-only listener, single user. After 5 failed unlocks
+// within `UNLOCK_WINDOW`, lock out *all* unlock attempts for `unlock_lockout_secs()`
+// — see REMEDIATION_PLAN.md §8. Lockout duration is overridable via the
+// `TC_UNLOCK_LOCKOUT_S` env var (default 30 s) so the test suite can drive
+// this without sleeping 31 s of wall time.
+const UNLOCK_WINDOW: Duration = Duration::from_secs(60);
+const UNLOCK_FAIL_LIMIT: usize = 5;
+
+fn unlock_lockout_secs() -> u64 {
+    std::env::var("TC_UNLOCK_LOCKOUT_S")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(30)
+}
+
+/// Returns `Some(seconds_remaining)` if a lockout is currently active.
+/// On expiry, clears BOTH the lockout AND the failure ring — punishment
+/// served, fresh window. Otherwise a single post-cooldown wrong attempt
+/// would re-arm the lockout because the stale timestamps still sit within
+/// the 60 s window.
+async fn check_unlock_lockout(state: &Arc<AppState>) -> Option<u64> {
+    let now = Instant::now();
+    let mut guard = state.unlock_lockout_until.write().await;
+    if let Some(until) = *guard {
+        if now < until {
+            let secs = until.duration_since(now).as_secs().max(1);
+            return Some(secs);
+        }
+        *guard = None;
+        drop(guard);
+        *state.unlock_failure_times.write().await = [None; 5];
+    }
+    None
+}
+
+/// Record a failed unlock. If the ring buffer now holds 5 timestamps all
+/// within `UNLOCK_WINDOW` of `now`, arm a lockout.
+async fn record_unlock_failure(state: &Arc<AppState>) {
+    let now = Instant::now();
+    let mut times = state.unlock_failure_times.write().await;
+
+    // Overwrite the oldest slot (smallest Instant; empty slots count as oldest).
+    let mut oldest_idx = 0usize;
+    for i in 1..UNLOCK_FAIL_LIMIT {
+        match (times[oldest_idx], times[i]) {
+            (None, _) => break,
+            (_, None) => { oldest_idx = i; break; }
+            (Some(a), Some(b)) => if b < a { oldest_idx = i; }
+        }
+    }
+    times[oldest_idx] = Some(now);
+
+    // If all 5 slots are populated and all within the 60 s window, lock out.
+    if times.iter().all(|t| matches!(t, Some(t0) if now.duration_since(*t0) <= UNLOCK_WINDOW)) {
+        *state.unlock_lockout_until.write().await =
+            Some(now + Duration::from_secs(unlock_lockout_secs()));
+    }
+}
+
+async fn reset_unlock_rate_state(state: &Arc<AppState>) {
+    *state.unlock_failure_times.write().await = [None; 5];
+    *state.unlock_lockout_until.write().await = None;
+}
+
+fn rate_limited_response(retry_after_secs: u64) -> Response {
+    let body = Json(ErrorResponse {
+        error: format!(
+            "Too many failed unlock attempts; retry after {} s",
+            retry_after_secs
+        ),
+    });
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [("retry-after", retry_after_secs.to_string())],
+        body,
+    )
+        .into_response()
+}
+
 async fn unlock(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UnlockRequest>,
 ) -> Response {
+    // Rate-limit gate. During lockout, *all* unlock attempts (right or wrong)
+    // return 429 — we don't even call load_vault.
+    if let Some(secs) = check_unlock_lockout(&state).await {
+        return rate_limited_response(secs);
+    }
+
     // Try to load vault with master password only (envelope encryption)
     match vault::load_vault(&req.master_password) {
         Ok(unlocked) => {
@@ -286,6 +375,8 @@ async fn unlock(
             *state.current_dek.write().await = Some(unlocked.dek);
             *state.entropy_source.write().await = entropy_source.clone();
             state.touch_activity().await;
+            // Successful unlock resets the rate-limit window.
+            reset_unlock_rate_state(&state).await;
 
             // Load stream config and start streams
             let config = vault::load_stream_config();
@@ -321,6 +412,9 @@ async fn unlock(
             (StatusCode::OK, Json(UnlockResponse { token, entry_count, entropy_source })).into_response()
         }
         Err(e) => {
+            // Record failure; if 5-in-60s tripped, the NEXT attempt is the
+            // one that gets 429 (per spec: "5 failures → next attempt locks").
+            record_unlock_failure(&state).await;
             err_json(StatusCode::UNAUTHORIZED, &format!("Failed to unlock: {}", e))
         }
     }

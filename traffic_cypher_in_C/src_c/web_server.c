@@ -391,6 +391,33 @@ static void send_unauthorized(int fd) {
     send_error(fd, 401, "Unauthorized", "Not authenticated");
 }
 
+/* Send a 429 Too Many Requests with a Retry-After header. The base
+ * send_response builds headers from a static format string and has no slot
+ * for one-off headers, so we inline the response here for the rate-limit
+ * path. Body is the same {"error":"..."} envelope clients already parse. */
+static void send_rate_limited(int fd, uint64_t retry_after_secs) {
+    char body[256];
+    int body_len = snprintf(body, sizeof(body),
+        "{\"error\":\"Too many failed unlock attempts; retry after %llu s\"}",
+        (unsigned long long)retry_after_secs);
+
+    char header[1024];
+    int header_len = snprintf(header, sizeof(header),
+        "HTTP/1.1 429 Too Many Requests\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Retry-After: %llu\r\n"
+        "Access-Control-Allow-Origin: http://127.0.0.1:9876\r\n"
+        "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        body_len, (unsigned long long)retry_after_secs);
+
+    write(fd, header, (size_t)header_len);
+    write(fd, body, (size_t)body_len);
+}
+
 /* --- Minimal JSON field extraction from request body --- */
 
 static char *json_body_get_string(const char *body, const char *key) {
@@ -499,6 +526,70 @@ static int save_vault_with_state(app_state_t *state) {
 
 /* --- Route handlers --- */
 
+/* Rate-limit window/lockout for /api/auth/unlock — see REMEDIATION_PLAN.md §8.
+ * Lockout is overridable at startup via TC_UNLOCK_LOCKOUT_S (default 30 s) so
+ * the test suite can drive this without sleeping a full 31 s. */
+#define UNLOCK_WINDOW_SECS 60
+#define UNLOCK_FAIL_LIMIT  5
+
+static uint64_t unlock_lockout_secs(void) {
+    const char *env = getenv("TC_UNLOCK_LOCKOUT_S");
+    if (env && *env) {
+        long v = strtol(env, NULL, 10);
+        if (v > 0 && v < 86400) return (uint64_t)v;
+    }
+    return 30;
+}
+
+/* Returns seconds-remaining if a lockout is active right now, else 0.
+ * On expiry, clears BOTH the lockout AND the failure ring — punishment
+ * served, fresh window. Otherwise a single post-cooldown wrong attempt
+ * would re-arm the lockout because the stale timestamps still sit within
+ * the 60 s window. Caller must hold state->lock. */
+static uint64_t unlock_lockout_remaining_locked(app_state_t *state, uint64_t now) {
+    if (state->unlock_lockout_until == 0) return 0;
+    if (now < state->unlock_lockout_until) {
+        return state->unlock_lockout_until - now;
+    }
+    state->unlock_lockout_until = 0;
+    for (int i = 0; i < UNLOCK_FAIL_LIMIT; i++) state->unlock_failures[i] = 0;
+    state->unlock_failure_count = 0;
+    return 0;
+}
+
+/* Record a failed unlock at `now`. If the 5-slot ring is full and all entries
+ * lie within UNLOCK_WINDOW_SECS of `now`, arm the lockout. Caller holds lock. */
+static void record_unlock_failure_locked(app_state_t *state, uint64_t now) {
+    /* Overwrite the oldest slot (smallest timestamp; 0 counts as oldest). */
+    int oldest = 0;
+    for (int i = 1; i < UNLOCK_FAIL_LIMIT; i++) {
+        if (state->unlock_failures[i] < state->unlock_failures[oldest]) {
+            oldest = i;
+        }
+    }
+    state->unlock_failures[oldest] = now;
+    if (state->unlock_failure_count < UNLOCK_FAIL_LIMIT) {
+        state->unlock_failure_count++;
+    }
+
+    if (state->unlock_failure_count >= UNLOCK_FAIL_LIMIT) {
+        int all_in_window = 1;
+        for (int i = 0; i < UNLOCK_FAIL_LIMIT; i++) {
+            uint64_t t = state->unlock_failures[i];
+            if (t == 0 || (now - t) > UNLOCK_WINDOW_SECS) { all_in_window = 0; break; }
+        }
+        if (all_in_window) {
+            state->unlock_lockout_until = now + unlock_lockout_secs();
+        }
+    }
+}
+
+static void reset_unlock_rate_state_locked(app_state_t *state) {
+    for (int i = 0; i < UNLOCK_FAIL_LIMIT; i++) state->unlock_failures[i] = 0;
+    state->unlock_failure_count = 0;
+    state->unlock_lockout_until = 0;
+}
+
 static void handle_unlock(int fd, app_state_t *state, http_request_t *req) {
     char *master_pw = json_body_get_string(req->body, "master_password");
     if (!master_pw) {
@@ -506,14 +597,32 @@ static void handle_unlock(int fd, app_state_t *state, http_request_t *req) {
         return;
     }
 
+    /* Rate-limit gate — during lockout, every unlock attempt (right or wrong)
+     * returns 429 without touching load_vault. */
+    pthread_mutex_lock(&state->lock);
+    uint64_t now = (uint64_t)time(NULL);
+    uint64_t remaining = unlock_lockout_remaining_locked(state, now);
+    pthread_mutex_unlock(&state->lock);
+    if (remaining > 0) {
+        send_rate_limited(fd, remaining);
+        free(master_pw);
+        return;
+    }
+
     unlocked_vault_t unlocked;
     if (load_vault(master_pw, &unlocked) != 0) {
+        pthread_mutex_lock(&state->lock);
+        record_unlock_failure_locked(state, (uint64_t)time(NULL));
+        pthread_mutex_unlock(&state->lock);
         send_error(fd, 401, "Unauthorized", "Failed to unlock vault — wrong master password?");
         free(master_pw);
         return;
     }
 
     pthread_mutex_lock(&state->lock);
+
+    /* Successful unlock — reset rate-limit window. */
+    reset_unlock_rate_state_locked(state);
 
     /* Store session */
     uuid_v4(state->session_token);
