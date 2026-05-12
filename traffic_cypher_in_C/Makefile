@@ -2,7 +2,16 @@
 # Requires: OpenSSL (brew install openssl on macOS)
 
 CC      = cc
-CFLAGS  = -Wall -Wextra -O2 -std=c11 -I include
+CFLAGS  = -Wall -Wextra -O2 -std=c11 -I include \
+          -D_FORTIFY_SOURCE=2 -Wformat-security
+
+# -Wstringop-truncation is GCC-only (clang on macOS doesn't recognise it and
+# emits an "unknown warning option" warning, which would otherwise clutter
+# every build). Enable it only when the compiler is GCC.
+CC_IS_GCC := $(shell $(CC) --version 2>/dev/null | head -n 1 | grep -ci '^gcc' || true)
+ifeq ($(CC_IS_GCC),1)
+  CFLAGS += -Wstringop-truncation
+endif
 
 # OpenSSL paths (macOS Homebrew)
 UNAME_S := $(shell uname -s)

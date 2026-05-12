@@ -1,5 +1,6 @@
 #include "vault.h"
 #include "hex_utils.h"
+#include "str_buf.h"
 #include "uuid_gen.h"
 
 #include <stdio.h>
@@ -175,94 +176,82 @@ int vault_delete_by_id(vault_t *v, const char *id) {
 
 /* --- JSON serialization (minimal, hand-written) --- */
 
-static void json_escape_str(const char *in, char *out, size_t out_max) {
-    size_t j = 0;
-    for (size_t i = 0; in[i] && j < out_max - 2; i++) {
-        switch (in[i]) {
-            case '"':  if (j + 2 < out_max) { out[j++] = '\\'; out[j++] = '"'; } break;
-            case '\\': if (j + 2 < out_max) { out[j++] = '\\'; out[j++] = '\\'; } break;
-            case '\n': if (j + 2 < out_max) { out[j++] = '\\'; out[j++] = 'n'; } break;
-            case '\r': if (j + 2 < out_max) { out[j++] = '\\'; out[j++] = 'r'; } break;
-            case '\t': if (j + 2 < out_max) { out[j++] = '\\'; out[j++] = 't'; } break;
-            default:   out[j++] = in[i]; break;
-        }
-    }
-    out[j] = '\0';
+/* Append a JSON string literal: opening quote, escaped body, closing quote. */
+static void sb_append_jstr(str_buf *sb, const char *raw) {
+    sb_append(sb, "\"");
+    sb_append_json_escaped(sb, raw ? raw : "");
+    sb_append(sb, "\"");
 }
 
-/* Serialize a vault_entry to JSON. Returns heap-allocated string. */
-char *vault_entry_to_json(const vault_entry_t *e) {
-    char *buf = (char *)malloc(16384);
-    char esc_label[VAULT_LABEL_MAX * 2], esc_website[VAULT_FIELD_MAX * 2];
-    char esc_username[VAULT_FIELD_MAX * 2], esc_password[VAULT_PASSWORD_MAX * 2];
-    char esc_totp[VAULT_FIELD_MAX * 2], esc_notes[VAULT_FIELD_MAX * 2];
+/* Append a JSON value for a possibly-empty field: "..." when non-empty, else
+ * the bare keyword null. Matches the pre-migration emit semantics where empty
+ * website/username/totp_secret/notes serialize as null. */
+static void sb_append_jstr_or_null(str_buf *sb, const char *raw) {
+    if (raw && raw[0]) {
+        sb_append_jstr(sb, raw);
+    } else {
+        sb_append(sb, "null");
+    }
+}
 
-    json_escape_str(e->label, esc_label, sizeof(esc_label));
-    json_escape_str(e->website, esc_website, sizeof(esc_website));
-    json_escape_str(e->username, esc_username, sizeof(esc_username));
-    json_escape_str(e->password, esc_password, sizeof(esc_password));
-    json_escape_str(e->totp_secret, esc_totp, sizeof(esc_totp));
-    json_escape_str(e->notes, esc_notes, sizeof(esc_notes));
+/* Append a full vault_entry JSON object to `sb`. Public callers wrap this via
+ * vault_entry_to_json (heap string) or use it directly to avoid the N+1 large
+ * allocations during list/array serialization. */
+static void vault_entry_append_json(const vault_entry_t *e, str_buf *sb) {
+    sb_append(sb, "{\"id\":\"");
+    sb_append(sb, e->id);
+    sb_append(sb, "\",\"label\":");
+    sb_append_jstr(sb, e->label);
+    sb_append(sb, ",\"website\":");
+    sb_append_jstr_or_null(sb, e->website);
+    sb_append(sb, ",\"username\":");
+    sb_append_jstr_or_null(sb, e->username);
+    sb_append(sb, ",\"password\":");
+    sb_append_jstr(sb, e->password);
+    sb_append(sb, ",\"totp_secret\":");
+    sb_append_jstr_or_null(sb, e->totp_secret);
+    sb_append(sb, ",\"notes\":");
+    sb_append_jstr_or_null(sb, e->notes);
 
-    /* Build tags array */
-    char tags_buf[4096] = "[";
+    sb_append(sb, ",\"tags\":[");
     for (int i = 0; i < e->tag_count; i++) {
-        char esc_tag[VAULT_LABEL_MAX * 2];
-        json_escape_str(e->tags[i], esc_tag, sizeof(esc_tag));
-        if (i > 0) strcat(tags_buf, ",");
-        strcat(tags_buf, "\"");
-        strcat(tags_buf, esc_tag);
-        strcat(tags_buf, "\"");
+        if (i > 0) sb_append(sb, ",");
+        sb_append_jstr(sb, e->tags[i]);
     }
-    strcat(tags_buf, "]");
-
-    /* Build history array */
-    char hist_buf[8192] = "[";
+    sb_append(sb, "],\"password_history\":[");
     for (int i = 0; i < e->history_count; i++) {
-        char esc_pw[VAULT_PASSWORD_MAX * 2];
-        json_escape_str(e->history[i].password, esc_pw, sizeof(esc_pw));
-        char entry_buf[1024];
-        snprintf(entry_buf, sizeof(entry_buf),
-                 "%s{\"password\":\"%s\",\"changed_at\":%llu}",
-                 i > 0 ? "," : "", esc_pw,
-                 (unsigned long long)e->history[i].changed_at);
-        strcat(hist_buf, entry_buf);
+        if (i > 0) sb_append(sb, ",");
+        sb_append(sb, "{\"password\":");
+        sb_append_jstr(sb, e->history[i].password);
+        sb_appendf(sb, ",\"changed_at\":%llu}",
+                   (unsigned long long)e->history[i].changed_at);
     }
-    strcat(hist_buf, "]");
-
-    snprintf(buf, 16384,
-        "{\"id\":\"%s\",\"label\":\"%s\",\"website\":%s%s%s,"
-        "\"username\":%s%s%s,\"password\":\"%s\","
-        "\"totp_secret\":%s%s%s,\"notes\":%s%s%s,"
-        "\"tags\":%s,\"password_history\":%s,"
-        "\"created_at\":%llu,\"updated_at\":%llu}",
-        e->id, esc_label,
-        e->website[0] ? "\"" : "null", e->website[0] ? esc_website : "", e->website[0] ? "\"" : "",
-        e->username[0] ? "\"" : "null", e->username[0] ? esc_username : "", e->username[0] ? "\"" : "",
-        esc_password,
-        e->totp_secret[0] ? "\"" : "null", e->totp_secret[0] ? esc_totp : "", e->totp_secret[0] ? "\"" : "",
-        e->notes[0] ? "\"" : "null", e->notes[0] ? esc_notes : "", e->notes[0] ? "\"" : "",
-        tags_buf, hist_buf,
-        (unsigned long long)e->created_at, (unsigned long long)e->updated_at);
-
-    return buf;
+    sb_appendf(sb, "],\"created_at\":%llu,\"updated_at\":%llu}",
+               (unsigned long long)e->created_at,
+               (unsigned long long)e->updated_at);
 }
 
-/* Serialize full vault to JSON */
-char *vault_to_json(const vault_t *v) {
-    /* Estimate size */
-    size_t est = 32 + v->entry_count * 16384;
-    char *buf = (char *)malloc(est);
-    strcpy(buf, "{\"entries\":[");
+/* Serialize a vault_entry to JSON. Returns heap-allocated string (or NULL on
+ * OOM). Caller free()s. */
+char *vault_entry_to_json(const vault_entry_t *e) {
+    str_buf sb;
+    sb_init(&sb, 1024);
+    vault_entry_append_json(e, &sb);
+    return sb_release(&sb, NULL);
+}
 
+/* Serialize full vault to JSON. Returns heap-allocated string (or NULL on
+ * OOM). Caller free()s. */
+char *vault_to_json(const vault_t *v) {
+    str_buf sb;
+    sb_init(&sb, 4096);
+    sb_append(&sb, "{\"entries\":[");
     for (int i = 0; i < v->entry_count; i++) {
-        if (i > 0) strcat(buf, ",");
-        char *entry_json = vault_entry_to_json(&v->entries[i]);
-        strcat(buf, entry_json);
-        free(entry_json);
+        if (i > 0) sb_append(&sb, ",");
+        vault_entry_append_json(&v->entries[i], &sb);
     }
-    strcat(buf, "]}");
-    return buf;
+    sb_append(&sb, "]}");
+    return sb_release(&sb, NULL);
 }
 
 /* --- Minimal JSON parsing helpers --- */
@@ -684,6 +673,10 @@ int save_vault(const vault_t *vault, const char *master_password,
 
     /* Serialize vault to JSON */
     char *vault_json = vault_to_json(vault);
+    if (!vault_json) {
+        free(wrapped_dek);
+        return -1;
+    }
     size_t vj_len = strlen(vault_json);
 
     /* Encrypt vault data */
@@ -845,32 +838,28 @@ int load_stream_config(stream_config_t *config) {
 }
 
 int save_stream_config(const stream_config_t *config) {
-    size_t buf_size = 4096 + config->stream_count * 2048;
-    char *buf = (char *)malloc(buf_size);
+    str_buf sb;
+    sb_init(&sb, 1024);
 
-    strcpy(buf, "{\n  \"streams\": [\n");
+    sb_append(&sb, "{\n  \"streams\": [\n");
     for (int i = 0; i < config->stream_count; i++) {
-        char esc_url[VAULT_FIELD_MAX * 2], esc_label[VAULT_LABEL_MAX * 2];
-        json_escape_str(config->streams[i].url, esc_url, sizeof(esc_url));
-        json_escape_str(config->streams[i].label, esc_label, sizeof(esc_label));
-
-        char entry_buf[4096];
-        snprintf(entry_buf, sizeof(entry_buf),
-                 "    {\"url\": \"%s\", \"label\": \"%s\", \"enabled\": %s}%s\n",
-                 esc_url, esc_label,
-                 config->streams[i].enabled ? "true" : "false",
-                 (i < config->stream_count - 1) ? "," : "");
-        strcat(buf, entry_buf);
+        sb_append(&sb, "    {\"url\": \"");
+        sb_append_json_escaped(&sb, config->streams[i].url);
+        sb_append(&sb, "\", \"label\": \"");
+        sb_append_json_escaped(&sb, config->streams[i].label);
+        sb_append(&sb, "\", \"enabled\": ");
+        sb_append(&sb, config->streams[i].enabled ? "true" : "false");
+        sb_append(&sb, "}");
+        if (i < config->stream_count - 1) sb_append(&sb, ",");
+        sb_append(&sb, "\n");
     }
+    sb_append(&sb, "  ],\n  \"default_stream\": \"");
+    sb_append_json_escaped(&sb, config->default_stream);
+    sb_appendf(&sb, "\",\n  \"settings\": {\"auto_lock_minutes\": %llu}\n}",
+               (unsigned long long)config->settings.auto_lock_minutes);
 
-    char settings_buf[256];
-    snprintf(settings_buf, sizeof(settings_buf),
-             "  ],\n  \"default_stream\": \"%s\",\n"
-             "  \"settings\": {\"auto_lock_minutes\": %llu}\n}",
-             config->default_stream,
-             (unsigned long long)config->settings.auto_lock_minutes);
-    strcat(buf, settings_buf);
-
+    char *buf = sb_release(&sb, NULL);
+    if (!buf) return -1;
     int write_rc = atomic_write_file(stream_config_path(), buf);
     free(buf);
     return write_rc;

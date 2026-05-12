@@ -33,6 +33,16 @@ int    sb_appendf(str_buf *sb, const char *fmt, ...)
    \t and \uXXXX for bytes < 0x20. */
 int    sb_append_json_escaped(str_buf *sb, const char *raw);
 
+/* Ensure capacity for at least `need_total` bytes (including any NUL). Used by
+ * callers that want to read directly into the buffer (e.g. recv into the tail)
+ * and then commit with sb_advance(). Returns 0 on ok, -1 on OOM. */
+int    sb_reserve(str_buf *sb, size_t need_total);
+
+/* Commit `n` bytes that the caller wrote directly to sb->data + sb->len. The
+ * caller must have called sb_reserve(sb, sb->len + n + 1) first. NUL-terminates
+ * the new tail. No-op when sb->err is set. */
+void   sb_advance(str_buf *sb, size_t n);
+
 /* Release ownership of the heap buffer. *out_len = sb->len. Caller frees().
    Resets sb to a fresh state. Returns NULL on error (sb->err set). */
 char  *sb_release(str_buf *sb, size_t *out_len);

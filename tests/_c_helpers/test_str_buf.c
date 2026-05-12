@@ -89,5 +89,27 @@ int main(void)
         assert(sb_append(&sb, "xyz") == 0 && strcmp(sb.data, "xyz") == 0);
         sb_free(&sb);
     }
+
+    /* 8. sb_reserve + sb_advance: caller writes directly into the buffer tail
+     * and commits the byte count. Mirrors the request-body streaming path in
+     * web_server.c::parse_request. */
+    {
+        str_buf sb; sb_init(&sb, 0);
+        assert(sb_reserve(&sb, 16) == 0);
+        assert(sb.cap >= 16 && sb.len == 0);
+        memcpy(sb.data + sb.len, "hello", 5);
+        sb_advance(&sb, 5);
+        assert(sb.len == 5 && sb.data[5] == '\0' && strcmp(sb.data, "hello") == 0);
+        memcpy(sb.data + sb.len, " world", 6);
+        sb_advance(&sb, 6);
+        assert(sb.len == 11 && strcmp(sb.data, "hello world") == 0);
+        sb_free(&sb);
+
+        /* sb_advance under sticky err is a no-op. */
+        str_buf bad; sb_init(&bad, 0);
+        bad.err = 1;
+        sb_advance(&bad, 10); /* must not crash */
+        sb_free(&bad);
+    }
     return 0;
 }

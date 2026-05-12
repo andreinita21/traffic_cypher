@@ -1,6 +1,7 @@
 #include "web_server.h"
 #include "vault.h"
 #include "hex_utils.h"
+#include "str_buf.h"
 #include "uuid_gen.h"
 #include "password_gen.h"
 #include "totp.h"
@@ -43,6 +44,11 @@ typedef struct {
     pthread_cond_t  not_empty;
     pthread_cond_t  not_full;
 } fdq_t;
+
+/* Cap request bodies at 8 MiB. The C PM is a localhost-only service for a
+ * single user, so this is generous; the cap exists to prevent an unauthenticated
+ * caller from flooding the heap by lying about Content-Length. */
+#define MAX_BODY_BYTES (8 * 1024 * 1024)
 
 /* Embedded frontend files */
 extern const char _binary_frontend_index_html_start[];
@@ -209,7 +215,7 @@ typedef struct {
     char content_type[128];
     char *body;
     size_t body_len;
-    int content_length;
+    long long content_length;
 } http_request_t;
 
 typedef struct {
@@ -220,14 +226,26 @@ typedef struct {
     size_t body_len;
 } http_response_t;
 
+/* Read headers + body from `fd` into req.
+ *
+ * Returns:
+ *    0  ok
+ *   -1  read failed / client disconnected before any bytes
+ *   -2  Content-Length declared > MAX_BODY_BYTES (caller should send 413)
+ *
+ * Strategy: keep a 64 KiB scratch buffer for headers (and any prefix of body
+ * that already arrived). After we know Content-Length, if the body fits in
+ * scratch we copy it out; otherwise we malloc(content_length + 1) and stream
+ * the remainder directly into that.
+ */
 static int parse_request(int fd, http_request_t *req) {
     memset(req, 0, sizeof(*req));
 
-    /* Read the full request (headers + body) */
     char buf[65536];
     size_t total_read = 0;
     size_t header_end = 0;
     int found_header_end = 0;
+    int have_cl = 0;
 
     while (total_read < sizeof(buf) - 1) {
         ssize_t n = read(fd, buf + total_read, sizeof(buf) - 1 - total_read);
@@ -235,27 +253,40 @@ static int parse_request(int fd, http_request_t *req) {
         total_read += (size_t)n;
         buf[total_read] = '\0';
 
-        /* Check for end of headers */
         if (!found_header_end) {
             char *hend = strstr(buf, "\r\n\r\n");
             if (hend) {
                 header_end = (size_t)(hend - buf) + 4;
                 found_header_end = 1;
 
-                /* Check Content-Length */
+                /* Parse Content-Length with strtoll so we can distinguish
+                 * absent / negative / huge from a real length. */
                 char *cl = strcasestr(buf, "Content-Length:");
                 if (cl) {
-                    req->content_length = atoi(cl + 15);
-                    /* Check if we have the full body */
+                    char *endp = NULL;
+                    errno = 0;
+                    long long v = strtoll(cl + 15, &endp, 10);
+                    if (errno != 0 || endp == cl + 15 || v < 0) {
+                        /* Unparseable or negative — treat as no body. */
+                        req->content_length = 0;
+                    } else {
+                        req->content_length = v;
+                        have_cl = 1;
+                    }
+                    /* Reject oversize early; don't try to stream-read it. */
+                    if (req->content_length > MAX_BODY_BYTES) {
+                        return -2;
+                    }
+                    /* If the body already fits in scratch, we're done. */
                     size_t body_read = total_read - header_end;
-                    if ((int)body_read >= req->content_length) break;
+                    if ((long long)body_read >= req->content_length) break;
                 } else {
                     break; /* No body expected */
                 }
             }
         } else {
             size_t body_read = total_read - header_end;
-            if ((int)body_read >= req->content_length) break;
+            if ((long long)body_read >= req->content_length) break;
         }
     }
 
@@ -264,7 +295,7 @@ static int parse_request(int fd, http_request_t *req) {
     /* Parse request line */
     sscanf(buf, "%15s %2047s", req->method, req->path);
 
-    /* Extract headers */
+    /* Extract Authorization header */
     char *auth = strcasestr(buf, "Authorization:");
     if (auth) {
         auth += 14;
@@ -280,13 +311,42 @@ static int parse_request(int fd, http_request_t *req) {
 
     /* Extract body */
     if (found_header_end && req->content_length > 0) {
-        size_t body_available = total_read - header_end;
-        size_t body_len = (body_available < (size_t)req->content_length)
-                          ? body_available : (size_t)req->content_length;
-        req->body = (char *)malloc(body_len + 1);
-        memcpy(req->body, buf + header_end, body_len);
-        req->body[body_len] = '\0';
-        req->body_len = body_len;
+        size_t body_available = (total_read > header_end) ? (total_read - header_end) : 0;
+        size_t need = (size_t)req->content_length;
+
+        if (need <= body_available) {
+            /* Body fully in scratch already. */
+            req->body = (char *)malloc(need + 1);
+            if (!req->body) return -1;
+            memcpy(req->body, buf + header_end, need);
+            req->body[need] = '\0';
+            req->body_len = need;
+        } else if (have_cl) {
+            /* Body partially read: stream the remainder directly into a
+             * sized heap buffer using sb_reserve + sb_advance, so we never
+             * walk into the 64 KiB scratch overflow path. */
+            str_buf sb;
+            sb_init(&sb, 0);
+            if (sb_reserve(&sb, need + 1) != 0) {
+                sb_free(&sb);
+                return -1;
+            }
+            /* Copy what we already have. */
+            memcpy(sb.data, buf + header_end, body_available);
+            sb_advance(&sb, body_available);
+
+            while (sb.len < need) {
+                size_t want = need - sb.len;
+                ssize_t n = read(fd, sb.data + sb.len, want);
+                if (n <= 0) break; /* truncated — return what we got */
+                sb_advance(&sb, (size_t)n);
+            }
+            size_t body_len = 0;
+            char *body = sb_release(&sb, &body_len);
+            if (!body) return -1;
+            req->body = body;
+            req->body_len = body_len;
+        }
     }
 
     return 0;
@@ -559,39 +619,45 @@ static void handle_list_credentials(int fd, app_state_t *state, http_request_t *
         }
     }
 
-    /* Build JSON array */
-    size_t buf_size = 64 + state->vault.entry_count * 16384;
-    char *buf = (char *)malloc(buf_size);
-    strcpy(buf, "[");
+    /* Build JSON array using a growing buffer — no per-entry escape limits and
+     * no fixed total cap. */
+    str_buf sb;
+    sb_init(&sb, 4096);
+    sb_append(&sb, "[");
     int first = 1;
 
     for (int i = 0; i < state->vault.entry_count; i++) {
         const vault_entry_t *e = &state->vault.entries[i];
 
-        /* Simple search filter */
         if (q_param && q_param[0]) {
             char q_lower[256];
             strncpy(q_lower, q_param, sizeof(q_lower) - 1);
+            q_lower[sizeof(q_lower) - 1] = '\0';
             for (char *p = q_lower; *p; p++) *p = (char)tolower((unsigned char)*p);
 
             char label_lower[VAULT_LABEL_MAX];
             strncpy(label_lower, e->label, sizeof(label_lower) - 1);
+            label_lower[sizeof(label_lower) - 1] = '\0';
             for (char *p = label_lower; *p; p++) *p = (char)tolower((unsigned char)*p);
 
             if (!strstr(label_lower, q_lower)) continue;
         }
 
-        if (!first) strcat(buf, ",");
+        if (!first) sb_append(&sb, ",");
         char *ej = vault_entry_to_json(e);
-        strcat(buf, ej);
-        free(ej);
+        if (ej) { sb_append(&sb, ej); free(ej); }
         first = 0;
     }
-    strcat(buf, "]");
+    sb_append(&sb, "]");
 
     pthread_mutex_unlock(&state->lock);
     free(q_param);
 
+    char *buf = sb_release(&sb, NULL);
+    if (!buf) {
+        send_error(fd, 500, "Internal Server Error", "list serialization failed");
+        return;
+    }
     send_json(fd, 200, "OK", buf);
     free(buf);
 }
@@ -877,25 +943,31 @@ static void handle_entropy_snapshot(int fd, app_state_t *state) {
 static void handle_get_settings(int fd, app_state_t *state) {
     pthread_mutex_lock(&state->lock);
 
-    char buf[4096];
-    snprintf(buf, sizeof(buf),
-        "{\"auto_lock_minutes\":%llu,\"streams\":[",
-        (unsigned long long)state->auto_lock_minutes);
-
+    str_buf sb;
+    sb_init(&sb, 256);
+    sb_appendf(&sb, "{\"auto_lock_minutes\":%llu,\"streams\":[",
+               (unsigned long long)state->auto_lock_minutes);
     for (int i = 0; i < state->stream_config.stream_count; i++) {
-        char entry_buf[2048];
-        snprintf(entry_buf, sizeof(entry_buf),
-                 "%s{\"url\":\"%s\",\"label\":\"%s\",\"enabled\":%s}",
-                 i > 0 ? "," : "",
-                 state->stream_config.streams[i].url,
-                 state->stream_config.streams[i].label,
-                 state->stream_config.streams[i].enabled ? "true" : "false");
-        strcat(buf, entry_buf);
+        if (i > 0) sb_append(&sb, ",");
+        sb_append(&sb, "{\"url\":\"");
+        sb_append_json_escaped(&sb, state->stream_config.streams[i].url);
+        sb_append(&sb, "\",\"label\":\"");
+        sb_append_json_escaped(&sb, state->stream_config.streams[i].label);
+        sb_append(&sb, "\",\"enabled\":");
+        sb_append(&sb, state->stream_config.streams[i].enabled ? "true" : "false");
+        sb_append(&sb, "}");
     }
-    strcat(buf, "]}");
+    sb_append(&sb, "]}");
 
     pthread_mutex_unlock(&state->lock);
+
+    char *buf = sb_release(&sb, NULL);
+    if (!buf) {
+        send_error(fd, 500, "Internal Server Error", "settings serialization failed");
+        return;
+    }
     send_json(fd, 200, "OK", buf);
+    free(buf);
 }
 
 static void handle_update_settings(int fd, app_state_t *state, http_request_t *req) {
@@ -965,21 +1037,30 @@ static void handle_list_streams(int fd, app_state_t *state) {
      * configured streams (so the UI shows what the user configured and so the
      * config persists for parity with the Rust build), but every entry is
      * Disabled and reports zero frames. See /api/build/info. */
-    char buf[8192] = "[";
+    str_buf sb;
+    sb_init(&sb, 512);
+    sb_append(&sb, "[");
     for (int i = 0; i < state->stream_config.stream_count; i++) {
-        char entry_buf[2048];
-        snprintf(entry_buf, sizeof(entry_buf),
-                 "%s{\"url\":\"%s\",\"label\":\"%s\",\"status\":\"Disabled\","
-                 "\"frames_captured\":0,"
-                 "\"note\":\"OS entropy only in C build; see /api/build/info\"}",
-                 i > 0 ? "," : "",
-                 state->stream_config.streams[i].url,
-                 state->stream_config.streams[i].label);
-        strcat(buf, entry_buf);
+        if (i > 0) sb_append(&sb, ",");
+        sb_append(&sb, "{\"url\":\"");
+        sb_append_json_escaped(&sb, state->stream_config.streams[i].url);
+        sb_append(&sb, "\",\"label\":\"");
+        sb_append_json_escaped(&sb, state->stream_config.streams[i].label);
+        sb_append(&sb,
+            "\",\"status\":\"Disabled\","
+            "\"frames_captured\":0,"
+            "\"note\":\"OS entropy only in C build; see /api/build/info\"}");
     }
-    strcat(buf, "]");
+    sb_append(&sb, "]");
     pthread_mutex_unlock(&state->lock);
+
+    char *buf = sb_release(&sb, NULL);
+    if (!buf) {
+        send_error(fd, 500, "Internal Server Error", "stream list serialization failed");
+        return;
+    }
     send_json(fd, 200, "OK", buf);
+    free(buf);
 }
 
 static void handle_build_info(int fd) {
@@ -1199,8 +1280,21 @@ static void *worker_main(void *arg) {
         setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
         http_request_t req;
-        if (parse_request(client_fd, &req) == 0) {
+        int pr = parse_request(client_fd, &req);
+        if (pr == 0) {
             handle_request(client_fd, state, &req);
+        } else if (pr == -2) {
+            /* Body exceeded MAX_BODY_BYTES — canned 413 and close. We
+             * intentionally do not stream-read the body. */
+            static const char payload_too_large[] =
+                "HTTP/1.1 413 Payload Too Large\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: 35\r\n"
+                "Access-Control-Allow-Origin: http://127.0.0.1:9876\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"error\":\"Request body too large\"}\n";
+            (void)!write(client_fd, payload_too_large, sizeof(payload_too_large) - 1);
         }
         free(req.body);
         close(client_fd);

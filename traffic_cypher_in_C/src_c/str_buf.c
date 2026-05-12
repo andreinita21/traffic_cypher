@@ -18,7 +18,7 @@
 
 /* Ensure sb->cap is at least `need_total` bytes (len + new + NUL is the
  * caller's responsibility). Returns 0 on ok, -1 on error (sets sb->err). */
-static int sb_reserve(str_buf *sb, size_t need_total)
+int sb_reserve(str_buf *sb, size_t need_total)
 {
     if (sb->err) {
         return -1;
@@ -63,6 +63,20 @@ void sb_init(str_buf *sb, size_t initial_cap)
     if (initial_cap > 0) {
         (void)sb_reserve(sb, initial_cap);
     }
+}
+
+void sb_advance(str_buf *sb, size_t n)
+{
+    if (sb->err || n == 0) {
+        return;
+    }
+    /* Caller is responsible for having reserved len + n + 1; if not, mark err. */
+    if (sb->cap < sb->len + n + 1) {
+        sb->err = 1;
+        return;
+    }
+    sb->len += n;
+    sb->data[sb->len] = '\0';
 }
 
 int sb_append_n(str_buf *sb, const char *s, size_t n)
