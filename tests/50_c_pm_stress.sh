@@ -73,18 +73,25 @@ pass "unlocked vault"
 NOTES_PAYLOAD=$(python3 -c 'print("n" * 1024)')
 
 for i in $(seq 1 20); do
+    # Build JSON via a heredoc (avoids bash-3.2 nested-quote bugs on macOS;
+    # plain `python3 -c "..."` with embedded "$i" was unreliable under
+    # /bin/bash 3.2.57 that GitHub Actions macOS runners use by default).
+    BODY=$(I=$i NOTES="$NOTES_PAYLOAD" python3 <<'PYEOF'
+import json, os
+i = int(os.environ["I"])
+print(json.dumps({
+    "label": f"stress-cred-{i}",
+    "website": f"example{i}.com",
+    "username": f"user{i}",
+    "password": f"initial-p{i}",
+    "notes": os.environ["NOTES"],
+    "tags": ["stress", f"batch-{i}"],
+}))
+PYEOF
+)
     CREATE_RESP=$(curl -s -m 10 -X POST "http://127.0.0.1:$PORT/api/credentials" \
         -H "$AUTH" -H 'Content-Type: application/json' \
-        -d "$(python3 -c "
-import json, sys
-print(json.dumps({
-    'label': 'stress-cred-' + str($i),
-    'website': 'example' + str($i) + '.com',
-    'username': 'user' + str($i),
-    'password': 'initial-p$i',
-    'notes': '$NOTES_PAYLOAD',
-    'tags': ['stress', 'batch-' + str($i)],
-}))")")
+        -d "$BODY")
     ID=$(printf '%s' "$CREATE_RESP" \
          | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])') \
         || fail "create $i failed: $CREATE_RESP"
