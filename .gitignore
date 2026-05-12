@@ -40,6 +40,10 @@ benchmark/*.bench.o
 traffic_cypher_in_C/src_c/*.o
 traffic_cypher_in_C/src_c/*.bench.o
 
+# Build-time copy of canonical frontend (see Makefile `frontend` target).
+# Source of truth lives at repo-root frontend/.
+traffic_cypher_in_C/frontend/
+
 # Bundled tool binaries (download separately)
 traffic_cypher_in_Rust/yt-dlp
 traffic_cypher_in_Rust/yt-dlp.exe

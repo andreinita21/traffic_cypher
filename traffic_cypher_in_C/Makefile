@@ -34,9 +34,16 @@ SOURCES = $(SRC_DIR)/str_buf.c \
 OBJECTS = $(SOURCES:.c=.o)
 
 # Targets
-.PHONY: all clean
+.PHONY: all clean frontend
 
-all: traffic-cypher traffic-cypher-pm
+all: traffic-cypher traffic-cypher-pm frontend
+
+# Frontend lives canonically at repo root (../frontend/). The C web server
+# reads frontend/index.html etc. at runtime relative to its CWD, so we mirror
+# the tree into ./frontend/ at build time. See REMEDIATION_PLAN.md #5b.
+frontend:
+	rm -rf ./frontend
+	cp -R ../frontend ./frontend
 
 traffic-cypher: $(OBJECTS) $(SRC_DIR)/main.o
 	$(CC) -o $@ $^ $(LDFLAGS)
@@ -49,3 +56,4 @@ $(SRC_DIR)/%.o: $(SRC_DIR)/%.c
 
 clean:
 	rm -f $(SRC_DIR)/*.o traffic-cypher traffic-cypher-pm
+	rm -rf ./frontend

@@ -18,9 +18,11 @@ use crate::{vault, totp, password_gen, key_rotation, multi_stream};
 // Static file serving (embedded frontend)
 // ---------------------------------------------------------------------------
 
-const INDEX_HTML: &str = include_str!("../frontend/index.html");
-const APP_JS: &str = include_str!("../frontend/app.js");
-const STYLE_CSS: &str = include_str!("../frontend/style.css");
+// Frontend is single-source-of-truth at repo root `frontend/`.
+// Path is relative to this .rs file: web/ → src/ → traffic_cypher_in_Rust/ → repo root.
+const INDEX_HTML: &str = include_str!("../../../frontend/index.html");
+const APP_JS: &str = include_str!("../../../frontend/app.js");
+const STYLE_CSS: &str = include_str!("../../../frontend/style.css");
 
 pub fn static_routes() -> Router<Arc<AppState>> {
     Router::new()
