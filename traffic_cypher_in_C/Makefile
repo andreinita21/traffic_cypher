@@ -24,6 +24,10 @@ endif
 # -D_GNU_SOURCE exposes both groups. macOS' libc exposes everything by default,
 # and defining _POSIX_C_SOURCE there would *hide* strcasestr — so the macro is
 # Linux-only.
+#
+# OPENSSL_PREFIX honored on both OSes. Required on Linux when the distro ships
+# OpenSSL < 3.2 (Ubuntu 24.04 has 3.0); CI builds OpenSSL 3.3 to /usr/local/openssl-3.3
+# and sets OPENSSL_PREFIX accordingly.
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
   OPENSSL_PREFIX ?= $(shell brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl)
@@ -32,6 +36,10 @@ ifeq ($(UNAME_S),Darwin)
 endif
 ifeq ($(UNAME_S),Linux)
   CFLAGS += -D_GNU_SOURCE
+  ifdef OPENSSL_PREFIX
+    CFLAGS  += -I$(OPENSSL_PREFIX)/include
+    LDFLAGS += -L$(OPENSSL_PREFIX)/lib64 -L$(OPENSSL_PREFIX)/lib -Wl,-rpath,$(OPENSSL_PREFIX)/lib64 -Wl,-rpath,$(OPENSSL_PREFIX)/lib
+  endif
 endif
 
 LDFLAGS += -lssl -lcrypto -lpthread -lm

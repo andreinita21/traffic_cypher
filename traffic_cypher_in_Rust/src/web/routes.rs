@@ -520,7 +520,7 @@ async fn list_credentials(
 
     // Sort by label
     let mut entries: Vec<vault::VaultEntry> = entries.into_iter().cloned().collect();
-    entries.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    entries.sort_by_key(|e| e.label.to_lowercase());
 
     (StatusCode::OK, Json(entries)).into_response()
 }

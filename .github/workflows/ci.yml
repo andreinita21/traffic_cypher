@@ -77,9 +77,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install OpenSSL (Ubuntu)
+      # Ubuntu 24.04 ships OpenSSL 3.0; Argon2id via EVP_KDF_fetch needs
+      # 3.2+. Build 3.3 from source once and cache it.
+      - name: Cache OpenSSL 3.3 (Ubuntu)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/openssl-3.3
+          key: ${{ runner.os }}-openssl-3.3.2-v1
+      - name: Build OpenSSL 3.3 (Ubuntu, cache miss)
+        if: runner.os == 'Linux' && steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          cd /tmp
+          curl -fsSL https://www.openssl.org/source/openssl-3.3.2.tar.gz -o openssl.tgz
+          tar -xzf openssl.tgz
+          cd openssl-3.3.2
+          ./Configure --prefix=/usr/local/openssl-3.3 --libdir=lib64 \
+            no-tests no-docs no-apps linux-x86_64
+          make -j"$(nproc)" build_libs
+          sudo make install_dev install_runtime_libs
+      - name: Export OPENSSL_PREFIX (Ubuntu)
+        if: runner.os == 'Linux'
+        run: echo "OPENSSL_PREFIX=/usr/local/openssl-3.3" >> "$GITHUB_ENV"
 
       - name: Install OpenSSL (macOS)
         if: runner.os == 'macOS'
@@ -118,9 +138,29 @@ jobs:
         with:
           workspaces: traffic_cypher_in_Rust
 
-      - name: Install OpenSSL (Ubuntu)
+      # Ubuntu 24.04 ships OpenSSL 3.0; Argon2id via EVP_KDF_fetch needs
+      # 3.2+. Build 3.3 from source once and cache it.
+      - name: Cache OpenSSL 3.3 (Ubuntu)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/openssl-3.3
+          key: ${{ runner.os }}-openssl-3.3.2-v1
+      - name: Build OpenSSL 3.3 (Ubuntu, cache miss)
+        if: runner.os == 'Linux' && steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          cd /tmp
+          curl -fsSL https://www.openssl.org/source/openssl-3.3.2.tar.gz -o openssl.tgz
+          tar -xzf openssl.tgz
+          cd openssl-3.3.2
+          ./Configure --prefix=/usr/local/openssl-3.3 --libdir=lib64 \
+            no-tests no-docs no-apps linux-x86_64
+          make -j"$(nproc)" build_libs
+          sudo make install_dev install_runtime_libs
+      - name: Export OPENSSL_PREFIX (Ubuntu)
+        if: runner.os == 'Linux'
+        run: echo "OPENSSL_PREFIX=/usr/local/openssl-3.3" >> "$GITHUB_ENV"
 
       - name: Install OpenSSL (macOS)
         if: runner.os == 'macOS'

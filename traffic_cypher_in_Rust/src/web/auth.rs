@@ -18,19 +18,16 @@ pub async fn validate_session(headers: &HeaderMap, state: &Arc<AppState>) -> boo
     };
 
     let session = state.session_token.read().await;
-    match &*session {
-        Some(stored) => {
-            if stored == &token {
-                // Check auto-lock
-                if state.check_auto_lock().await {
-                    return false;
-                }
-                state.touch_activity().await;
-                true
-            } else {
-                false
-            }
-        }
-        None => false,
+    let Some(stored) = session.as_deref() else {
+        return false;
+    };
+    if stored != token {
+        return false;
     }
+    // Check auto-lock (drops the read guard implicitly when we leave scope).
+    if state.check_auto_lock().await {
+        return false;
+    }
+    state.touch_activity().await;
+    true
 }

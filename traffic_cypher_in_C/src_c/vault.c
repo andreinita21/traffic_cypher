@@ -8,22 +8,26 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>     /* fsync, unlink */
+#include <openssl/opensslv.h>
+
+/* Argon2id support requires OpenSSL 3.2 — EVP_KDF_fetch("ARGON2ID") is
+ * not present in 3.0/3.1. macOS Homebrew openssl@3 is well past this
+ * threshold; Linux distros that ship 3.0/3.1 need an upgraded openssl-dev
+ * package (CI builds 3.3 from source — see .github/workflows/ci.yml).
+ * The check sits above the OpenSSL includes that require 3.2 (e.g.
+ * <openssl/thread.h>) so the error reaches the user before a header-not-found.
+ * A libargon2 fallback is intentionally NOT shipped — that's a separate
+ * (deferred) change. */
+#if OPENSSL_VERSION_NUMBER < 0x30200000L
+#error "Traffic Cypher (C) requires OpenSSL 3.2+ for Argon2id (EVP_KDF). Install/upgrade openssl3."
+#endif
+
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <openssl/core_names.h>
 #include <openssl/params.h>
 #include <openssl/rand.h>
-#include <openssl/opensslv.h>
-#include <openssl/thread.h>
-
-/* Argon2id support requires OpenSSL 3.2 — EVP_KDF_fetch("ARGON2ID") is
- * not present in 3.0/3.1. macOS Homebrew openssl@3 is well past this
- * threshold; Linux distros that ship 3.0/3.1 need an upgraded openssl-dev
- * package. A libargon2 fallback is intentionally NOT shipped — that's a
- * separate (deferred) change. */
-#if OPENSSL_VERSION_NUMBER < 0x30200000L
-#error "Traffic Cypher (C) requires OpenSSL 3.2+ for Argon2id (EVP_KDF). Install/upgrade openssl3."
-#endif
+#include <openssl/thread.h>     /* OSSL_set_max_threads (3.2+) */
 
 /* On-disk format constants for vault file v3. The Rust implementation
  * persists exactly the same numbers — KAT in test_fixtures/argon2id_kek_kat.json
