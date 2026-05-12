@@ -2,6 +2,8 @@
 name = "traffic_cypher"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.82"
+publish = false
 description = "Traffic-entropy password manager with rotating encryption keys"
 
 [dependencies]
@@ -31,3 +33,13 @@ argon2 = "0.5"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+
+# Release profile: trade ~30s extra build time for smaller, faster binaries.
+# `lto = "thin"` chosen over "fat" — ~95% of the size/perf win at ~20% of the
+# cost. `strip = "symbols"` removes debug symbols (release builds keep
+# panic-free traces via the `panic = "abort"` toggle when desired; leaving
+# the default unwind so backtraces still print).
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,8 @@
+# Pin local development to the stable channel with the components CI uses.
+# The minimum supported version (MSRV) is declared in Cargo.toml `rust-version`.
+# Contributors with `rustup` installed get rustfmt + clippy automatically so
+# `cargo fmt --check` and `cargo clippy` Just Work.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
