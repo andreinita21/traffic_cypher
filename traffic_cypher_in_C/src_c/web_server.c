@@ -14,9 +14,35 @@
 #include <ctype.h>
 #include <errno.h>
 #include <signal.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+/* --- HTTP worker pool (see #7b) ---
+ *
+ * A fixed pool of POOL_WORKERS threads consumes accepted client fds from a
+ * bounded circular queue.  The accept loop is single-threaded and pushes
+ * onto the queue; if the queue is full the accept loop responds with a
+ * canned 503 + close instead of blocking (blocking would re-introduce the
+ * single-threaded DoS that this pool is meant to remove).
+ *
+ * Worker count of 4 is enough to absorb the typical localhost UI workload
+ * without producing surprise concurrency between long-running handlers
+ * (vault save, KDF, etc).  Queue cap of 32 matches the listen backlog.
+ */
+#define POOL_WORKERS 4
+#define QUEUE_CAP    32
+
+typedef struct {
+    int             fds[QUEUE_CAP];
+    size_t          head;
+    size_t          tail;
+    size_t          size;
+    pthread_mutex_t mutex;
+    pthread_cond_t  not_empty;
+    pthread_cond_t  not_full;
+} fdq_t;
 
 /* Embedded frontend files */
 extern const char _binary_frontend_index_html_start[];
@@ -33,6 +59,78 @@ static char *frontend_js = NULL;
 static size_t frontend_js_len = 0;
 static char *frontend_css = NULL;
 static size_t frontend_css_len = 0;
+
+/* --- Pool / shutdown file-scope state (see worker pool block above) --- */
+static volatile sig_atomic_t server_running = 1;
+static int                   server_fd_global = -1;
+static fdq_t                 g_queue;
+static pthread_t             g_workers[POOL_WORKERS];
+static int                   g_workers_started = 0;
+static app_state_t          *g_state = NULL;
+
+static void fdq_init(fdq_t *q) {
+    q->head = q->tail = q->size = 0;
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+    pthread_cond_init(&q->not_full, NULL);
+}
+
+/* Try to push fd onto the queue without blocking. Returns 0 on success,
+ * -1 if the queue is full. */
+static int fdq_try_push(fdq_t *q, int fd) {
+    pthread_mutex_lock(&q->mutex);
+    if (q->size >= QUEUE_CAP) {
+        pthread_mutex_unlock(&q->mutex);
+        return -1;
+    }
+    q->fds[q->tail] = fd;
+    q->tail = (q->tail + 1) % QUEUE_CAP;
+    q->size++;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mutex);
+    return 0;
+}
+
+/* Pop fd; blocks until one is available or server_running becomes 0.
+ * Returns -1 if shutting down with empty queue. */
+static int fdq_pop(fdq_t *q) {
+    pthread_mutex_lock(&q->mutex);
+    while (q->size == 0 && server_running) {
+        pthread_cond_wait(&q->not_empty, &q->mutex);
+    }
+    if (q->size == 0) {
+        pthread_mutex_unlock(&q->mutex);
+        return -1;
+    }
+    int fd = q->fds[q->head];
+    q->head = (q->head + 1) % QUEUE_CAP;
+    q->size--;
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->mutex);
+    return fd;
+}
+
+/* --- Constant-time string compare for session tokens (see #7b) ---
+ *
+ * `strcmp` short-circuits on the first mismatching byte, leaking a
+ * comparison-time timing signal.  With the worker pool, an attacker can run
+ * many concurrent unlock attempts and measure response timing to brute-force
+ * a session token byte-by-byte.  Always compare every byte up to a fixed
+ * cap (session_token is 64 bytes per web_server.h).
+ *
+ * Both inputs are NUL-terminated and the volatile accumulator prevents the
+ * compiler from re-introducing the early exit. */
+static int ct_eq(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    size_t la = strnlen(a, 64);
+    size_t lb = strnlen(b, 64);
+    if (la != lb) return 0;
+    volatile unsigned char acc = 0;
+    for (size_t i = 0; i < la; i++) {
+        acc |= (unsigned char)a[i] ^ (unsigned char)b[i];
+    }
+    return acc == 0;
+}
 
 static void load_frontend_file(const char *path, char **out, size_t *out_len) {
     FILE *fp = fopen(path, "r");
@@ -64,14 +162,22 @@ int app_state_check_auto_lock(app_state_t *state) {
     return elapsed > state->auto_lock_minutes * 60;
 }
 
-int validate_session(app_state_t *state, const char *auth_header) {
+/* Caller must hold state->lock. With the worker pool added in #7b, multiple
+ * threads can race to read/write has_session, session_token, last_activity,
+ * is_unlocked and has_dek. Every other handler already takes state->lock —
+ * making this lock-required at the only call site (handle_request) keeps the
+ * diff small and the contract explicit.
+ *
+ * The token compare uses ct_eq() to remove the timing side-channel that
+ * becomes exploitable once concurrent requests are possible. */
+int validate_session_locked(app_state_t *state, const char *auth_header) {
     if (!auth_header || !state->has_session) return 0;
 
     /* Expect "Bearer <token>" */
     if (strncmp(auth_header, "Bearer ", 7) != 0) return 0;
     const char *token = auth_header + 7;
 
-    if (strcmp(token, state->session_token) != 0) return 0;
+    if (!ct_eq(token, state->session_token)) return 0;
 
     /* Check auto-lock */
     if (app_state_check_auto_lock(state)) {
@@ -83,6 +189,15 @@ int validate_session(app_state_t *state, const char *auth_header) {
 
     app_state_touch(state);
     return 1;
+}
+
+/* Public entry point kept for ABI compatibility. Acquires state->lock itself.
+ * Callers that already hold state->lock MUST use validate_session_locked. */
+int validate_session(app_state_t *state, const char *auth_header) {
+    pthread_mutex_lock(&state->lock);
+    int valid = validate_session_locked(state, auth_header);
+    pthread_mutex_unlock(&state->lock);
+    return valid;
 }
 
 /* --- Minimal HTTP request parsing --- */
@@ -932,7 +1047,7 @@ static void handle_request(int fd, app_state_t *state, http_request_t *req) {
     /* All other API routes need auth */
     if (strncmp(req->path, "/api/", 5) == 0) {
         pthread_mutex_lock(&state->lock);
-        int valid = validate_session(state, req->auth_header);
+        int valid = validate_session_locked(state, req->auth_header);
         pthread_mutex_unlock(&state->lock);
 
         if (!valid) {
@@ -1056,6 +1171,52 @@ static void handle_request(int fd, app_state_t *state, http_request_t *req) {
     send_error(fd, 404, "Not Found", "Route not found");
 }
 
+/* --- Worker pool + graceful shutdown (see #7b) --- */
+
+/* Canned 503 used when the queue is full. accept thread writes this and
+ * closes the fd; workers don't see overflowed requests. */
+static const char k_busy_response[] =
+    "HTTP/1.1 503 Service Unavailable\r\n"
+    "Content-Type: application/json\r\n"
+    "Content-Length: 27\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "{\"error\":\"server busy\"}\n";
+
+static void *worker_main(void *arg) {
+    app_state_t *state = (app_state_t *)arg;
+    while (1) {
+        int client_fd = fdq_pop(&g_queue);
+        if (client_fd < 0) break;  /* shutdown */
+
+        /* Apply per-connection r/w timeouts inside the worker. With the
+         * pool, multiple workers each apply their own timeouts; the old
+         * single-threaded accept-then-handle path is gone. */
+        struct timeval tv;
+        tv.tv_sec = 15;
+        tv.tv_usec = 0;
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        http_request_t req;
+        if (parse_request(client_fd, &req) == 0) {
+            handle_request(client_fd, state, &req);
+        }
+        free(req.body);
+        close(client_fd);
+    }
+    return NULL;
+}
+
+static void shutdown_signal_handler(int sig) {
+    (void)sig;
+    server_running = 0;
+    if (server_fd_global >= 0) {
+        /* Wake the accept() loop. shutdown() is async-signal-safe. */
+        shutdown(server_fd_global, SHUT_RDWR);
+    }
+}
+
 /* --- Main server loop --- */
 
 int web_server_start(app_state_t *state, int port) {
@@ -1069,6 +1230,17 @@ int web_server_start(app_state_t *state, int port) {
     }
 
     signal(SIGPIPE, SIG_IGN);
+
+    /* Install SIGINT / SIGTERM handlers so graceful shutdown wakes accept()
+     * and joins workers before returning. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = shutdown_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  /* deliberately *not* SA_RESTART — we want accept() to
+                       * return with EINTR when the signal arrives. */
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
@@ -1097,33 +1269,103 @@ int web_server_start(app_state_t *state, int port) {
         return -1;
     }
 
-    fprintf(stderr, "[INFO] Listening on http://127.0.0.1:%d\n", port);
+    server_fd_global = server_fd;
+    g_state = state;
 
-    while (1) {
+    /* Spawn worker pool BEFORE the accept loop.
+     *
+     * macOS pthreads default to 512 KB. handle_request inlines several
+     * handlers and parse_request carries a 64 KB read buffer plus
+     * vault_entry_t (~14 KB) and similar stack-allocated structs in the
+     * credential handlers; the worker's worst-case frame size after
+     * inlining can run several MB. Reserve 8 MB to match the main-thread
+     * default and to give headroom for future handler growth. */
+    fdq_init(&g_queue);
+    pthread_attr_t worker_attr;
+    pthread_attr_init(&worker_attr);
+    pthread_attr_setstacksize(&worker_attr, 8 * 1024 * 1024);
+    for (int i = 0; i < POOL_WORKERS; i++) {
+        if (pthread_create(&g_workers[i], &worker_attr, worker_main, state) != 0) {
+            perror("pthread_create worker");
+            /* Best-effort: tear down whatever started. */
+            server_running = 0;
+            pthread_cond_broadcast(&g_queue.not_empty);
+            for (int j = 0; j < i; j++) pthread_join(g_workers[j], NULL);
+            pthread_attr_destroy(&worker_attr);
+            close(server_fd);
+            return -1;
+        }
+    }
+    pthread_attr_destroy(&worker_attr);
+    g_workers_started = 1;
+
+    fprintf(stderr, "[INFO] Listening on http://127.0.0.1:%d (workers=%d, queue=%d)\n",
+            port, POOL_WORKERS, QUEUE_CAP);
+
+    while (server_running) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
+            if (!server_running) break;
             if (errno == EINTR) continue;
             perror("accept");
             continue;
         }
 
-        struct timeval tv;
-        tv.tv_sec = 15;
-        tv.tv_usec = 0;
-        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-        http_request_t req;
-        if (parse_request(client_fd, &req) == 0) {
-            handle_request(client_fd, state, &req);
+        if (!server_running) {
+            close(client_fd);
+            break;
         }
-        free(req.body);
-        close(client_fd);
+
+        /* Hand off to a worker via the bounded queue. If full, do NOT block
+         * (which would reproduce the original DoS); send a canned 503 and
+         * close inline. The accept loop stays responsive. */
+        if (fdq_try_push(&g_queue, client_fd) != 0) {
+            (void)write(client_fd, k_busy_response, sizeof(k_busy_response) - 1);
+            close(client_fd);
+        }
     }
 
+    /* --- Graceful shutdown --- */
+    fprintf(stderr, "[INFO] Shutting down: draining workers...\n");
+
+    /* Stop accepting new connections. */
     close(server_fd);
+    server_fd_global = -1;
+
+    /* Wake any idle workers so they observe server_running == 0. */
+    pthread_mutex_lock(&g_queue.mutex);
+    pthread_cond_broadcast(&g_queue.not_empty);
+    pthread_mutex_unlock(&g_queue.mutex);
+
+    if (g_workers_started) {
+        for (int i = 0; i < POOL_WORKERS; i++) {
+            pthread_join(g_workers[i], NULL);
+        }
+        g_workers_started = 0;
+    }
+
+    /* Drain any fds left in the queue (workers may have exited before they
+     * drained — rare, but cheap to handle). */
+    pthread_mutex_lock(&g_queue.mutex);
+    while (g_queue.size > 0) {
+        int fd = g_queue.fds[g_queue.head];
+        g_queue.head = (g_queue.head + 1) % QUEUE_CAP;
+        g_queue.size--;
+        close(fd);
+    }
+    pthread_mutex_unlock(&g_queue.mutex);
+
+    /* Now stop the rotation daemon, if it's running. */
+    pthread_mutex_lock(&state->lock);
+    int rotation_was_running = state->rotation_running;
+    state->rotation_stop = 1;
+    pthread_mutex_unlock(&state->lock);
+    if (rotation_was_running) {
+        pthread_join(state->rotation_thread, NULL);
+    }
+
     free(frontend_index);
     free(frontend_js);
     free(frontend_css);
