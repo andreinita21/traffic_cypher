@@ -238,6 +238,58 @@ static char *json_body_get_string(const char *body, const char *key) {
     return result;
 }
 
+/*
+ * Parse a JSON string array under `key` into `out`, returning the count parsed.
+ *
+ *   missing key      → 0
+ *   null             → 0
+ *   too many tags    → -1 (caller should respond 400)
+ *   malformed        → stop at the malformed element, return what was parsed
+ *
+ * Tag values are truncated at VAULT_LABEL_MAX - 1 chars (consistent with the
+ * strncpy idiom used for every other field). Handles backslash-escape
+ * continuation (\\") inside string values the same way json_body_get_string
+ * does — a quote preceded by an unescaped backslash does not terminate.
+ */
+static int json_body_get_string_array(const char *body, const char *key,
+                                      char out[][VAULT_LABEL_MAX],
+                                      int max_entries) {
+    if (!body) return 0;
+    char search[256];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    const char *pos = strstr(body, search);
+    if (!pos) return 0;
+    pos += strlen(search);
+    while (*pos == ' ' || *pos == '\t') pos++;
+    if (*pos == 'n' && strncmp(pos, "null", 4) == 0) return 0;
+    if (*pos != '[') return 0;
+    pos++;
+
+    int count = 0;
+    while (*pos) {
+        while (*pos == ' ' || *pos == '\t' || *pos == ',' || *pos == '\n' || *pos == '\r') pos++;
+        if (*pos == ']') return count;
+        if (*pos != '"') {
+            /* Malformed element — stop parsing here. */
+            return count;
+        }
+        pos++;
+        const char *end = pos;
+        while (*end && !(*end == '"' && *(end - 1) != '\\')) end++;
+        if (!*end) return count;
+
+        if (count >= max_entries) return -1;
+
+        size_t len = (size_t)(end - pos);
+        if (len > VAULT_LABEL_MAX - 1) len = VAULT_LABEL_MAX - 1;
+        memcpy(out[count], pos, len);
+        out[count][len] = '\0';
+        count++;
+        pos = end + 1;
+    }
+    return count;
+}
+
 static int json_body_get_int(const char *body, const char *key, int default_val) {
     if (!body) return default_val;
     char search[256];
@@ -473,6 +525,17 @@ static void handle_create_credential(int fd, app_state_t *state, http_request_t 
     vault_entry_new(&entry, label, website, username,
                     password ? password : "", totp_secret, notes);
 
+    /* Parse optional tags array.  vault_add_or_update copies entry by value,
+     * so tags must be populated before the call. */
+    int nt = json_body_get_string_array(req->body, "tags", entry.tags, VAULT_MAX_TAGS);
+    if (nt < 0) {
+        free(label); free(website); free(username);
+        free(password); free(totp_secret); free(notes);
+        send_error(fd, 400, "Bad Request", "Too many tags (max 16)");
+        return;
+    }
+    entry.tag_count = nt;
+
     pthread_mutex_lock(&state->lock);
     vault_add_or_update(&state->vault, &entry);
     save_vault_with_state(state);
@@ -527,6 +590,21 @@ static void handle_update_credential(int fd, app_state_t *state, const char *id,
     }
     if ((val = json_body_get_string(req->body, "notes"))) {
         strncpy(e->notes, val, VAULT_FIELD_MAX - 1); free(val);
+    }
+
+    /* Tags use PATCH semantic: key absent → keep existing; key present (even
+     * as []) → replace.  Matches the Rust handler's Option<Vec<String>>. */
+    if (strstr(req->body, "\"tags\":")) {
+        char new_tags[VAULT_MAX_TAGS][VAULT_LABEL_MAX];
+        int nt = json_body_get_string_array(req->body, "tags", new_tags, VAULT_MAX_TAGS);
+        if (nt < 0) {
+            pthread_mutex_unlock(&state->lock);
+            send_error(fd, 400, "Bad Request", "Too many tags (max 16)");
+            return;
+        }
+        memset(e->tags, 0, sizeof(e->tags));
+        memcpy(e->tags, new_tags, sizeof(new_tags));
+        e->tag_count = nt;
     }
 
     e->updated_at = unix_now();
