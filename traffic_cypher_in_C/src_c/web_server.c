@@ -183,9 +183,9 @@ static void send_response(int fd, http_response_t *resp) {
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Origin: http://127.0.0.1:9876\r\n"
         "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: Authorization, Content-Type\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n"
         "Connection: close\r\n"
         "\r\n",
         resp->status, resp->status_text, resp->content_type, resp->body_len);
