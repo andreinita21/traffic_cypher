@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>     /* fsync, unlink */
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <openssl/rand.h>
@@ -36,6 +37,52 @@ const char *stream_config_path(void) {
     if (!home) home = ".";
     snprintf(path, sizeof(path), "%s/.traffic_cypher_streams.json", home);
     return path;
+}
+
+/* Atomically write `data` to `final_path` using the tmp+fsync+rename pattern.
+ *
+ * Writes to a sibling "<final_path>.tmp" first, fflush+fsync so the bytes hit
+ * the disk, then rename(2) over the target. rename is atomic on POSIX, so a
+ * crash or power loss leaves either the old file intact or the new file fully
+ * written — never a half-written target.
+ *
+ * On any failure the tmp file is unlinked so we don't leave orphans behind.
+ * Returns 0 on success, -1 on any failure.
+ */
+static int atomic_write_file(const char *final_path, const char *data) {
+    char tmp_path[1024];
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", final_path) >= (int)sizeof(tmp_path)) {
+        return -1;
+    }
+
+    FILE *fp = fopen(tmp_path, "w");
+    if (!fp) {
+        return -1;
+    }
+    if (fputs(data, fp) == EOF) {
+        fclose(fp);
+        unlink(tmp_path);
+        return -1;
+    }
+    if (fflush(fp) != 0) {
+        fclose(fp);
+        unlink(tmp_path);
+        return -1;
+    }
+    if (fsync(fileno(fp)) != 0) {
+        fclose(fp);
+        unlink(tmp_path);
+        return -1;
+    }
+    if (fclose(fp) != 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+    if (rename(tmp_path, final_path) != 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+    return 0;
 }
 
 /* --- Vault operations --- */
@@ -685,22 +732,14 @@ int save_vault(const vault_t *vault, const char *master_password,
         vault_nonce_hex, vault_ct_hex, entropy_source,
         (unsigned long long)unix_now());
 
-    /* Write to file */
-    FILE *fp = fopen(vault_path(), "w");
-    if (!fp) {
-        free(out_json); free(kek_salt_hex); free(wrap_nonce_hex);
-        free(wrapped_dek_hex); free(vault_nonce_hex); free(vault_ct_hex);
-        free(wrapped_dek); free(vault_ct);
-        return -1;
-    }
-    fputs(out_json, fp);
-    fclose(fp);
+    /* Write to file atomically: tmp + fsync + rename. */
+    int write_rc = atomic_write_file(vault_path(), out_json);
 
     free(out_json); free(kek_salt_hex); free(wrap_nonce_hex);
     free(wrapped_dek_hex); free(vault_nonce_hex); free(vault_ct_hex);
     free(wrapped_dek); free(vault_ct);
 
-    return 0;
+    return write_rc;
 }
 
 int rotate_dek(const vault_t *vault, const char *master_password,
@@ -832,10 +871,7 @@ int save_stream_config(const stream_config_t *config) {
              (unsigned long long)config->settings.auto_lock_minutes);
     strcat(buf, settings_buf);
 
-    FILE *fp = fopen(stream_config_path(), "w");
-    if (!fp) { free(buf); return -1; }
-    fputs(buf, fp);
-    fclose(fp);
+    int write_rc = atomic_write_file(stream_config_path(), buf);
     free(buf);
-    return 0;
+    return write_rc;
 }

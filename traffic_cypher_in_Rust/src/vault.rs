@@ -225,7 +225,8 @@ pub fn load_stream_config() -> StreamConfig {
 pub fn save_stream_config(config: &StreamConfig) -> Result<()> {
     let contents =
         serde_json::to_string_pretty(config).context("Failed to serialize stream config")?;
-    std::fs::write(stream_config_path(), contents).context("Failed to write stream config")?;
+    atomic_write(&stream_config_path(), contents.as_bytes())
+        .context("Failed to write stream config")?;
     Ok(())
 }
 
@@ -433,7 +434,50 @@ pub fn save_vault(
     };
 
     let contents = serde_json::to_string_pretty(&vf).context("Failed to serialize vault file")?;
-    std::fs::write(vault_path(), contents).context("Failed to write vault file")?;
+    atomic_write(&vault_path(), contents.as_bytes()).context("Failed to write vault file")?;
+    Ok(())
+}
+
+/// Atomically write `contents` to `path` using the tmp+fsync+rename pattern.
+///
+/// Process: write a sibling `<path>.tmp`, fsync the file (so contents hit the
+/// platter, not just the page cache), then `rename` over the target.
+/// `rename` is atomic on POSIX. On modern Windows (10+) `std::fs::rename`
+/// also atomically replaces an existing destination, so no platform fork is
+/// needed here.
+///
+/// If any step fails the tmp file is cleaned up on a best-effort basis so we
+/// don't leave orphans behind.
+fn atomic_write(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+    let tmp = {
+        let mut t = path.as_os_str().to_owned();
+        t.push(".tmp");
+        std::path::PathBuf::from(t)
+    };
+
+    let write_and_sync = || -> Result<()> {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("Failed to create tmp file {}", tmp.display()))?;
+        std::io::Write::write_all(&mut f, contents)
+            .with_context(|| format!("Failed to write tmp file {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("Failed to fsync tmp file {}", tmp.display()))?;
+        Ok(())
+    };
+
+    if let Err(e) = write_and_sync() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::from(e).context(format!(
+            "Failed to rename {} -> {}",
+            tmp.display(),
+            path.display()
+        )));
+    }
     Ok(())
 }
 
