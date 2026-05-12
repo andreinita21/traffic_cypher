@@ -38,6 +38,12 @@ struct StreamHandle {
     child: Option<tokio::process::Child>,
 }
 
+impl Default for MultiStreamManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MultiStreamManager {
     /// Create a new MultiStreamManager with an empty stream list and a shared
     /// frame channel.
@@ -212,17 +218,12 @@ impl MultiStreamManager {
         // Drain all pending frames from the channel (non-blocking)
         let mut by_stream: HashMap<usize, Vec<Frame>> = HashMap::new();
 
-        loop {
-            match self.frame_rx.try_recv() {
-                Ok((stream_index, frame)) => {
-                    // Update frames_captured counter
-                    if stream_index < self.streams.len() {
-                        self.streams[stream_index].frames_captured += 1;
-                    }
-                    by_stream.entry(stream_index).or_default().push(frame);
-                }
-                Err(_) => break,
+        while let Ok((stream_index, frame)) = self.frame_rx.try_recv() {
+            // Update frames_captured counter
+            if stream_index < self.streams.len() {
+                self.streams[stream_index].frames_captured += 1;
             }
+            by_stream.entry(stream_index).or_default().push(frame);
         }
 
         if by_stream.is_empty() {

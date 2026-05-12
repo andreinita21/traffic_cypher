@@ -27,6 +27,12 @@ pub struct KeyRotationState {
     pub has_traffic_entropy: Arc<RwLock<bool>>,
 }
 
+impl Default for KeyRotationState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KeyRotationState {
     pub fn new() -> Self {
         Self {

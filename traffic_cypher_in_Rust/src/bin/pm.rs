@@ -1,7 +1,7 @@
-/// Traffic Cypher Password Manager — Web UI
-///
-/// Starts an axum web server on 127.0.0.1:9876 serving the password manager
-/// dashboard with liquid glass UI.
+//! Traffic Cypher Password Manager — Web UI
+//!
+//! Starts an axum web server on 127.0.0.1:9876 serving the password manager
+//! dashboard with liquid glass UI.
 
 use anyhow::Result;
 use std::sync::Arc;

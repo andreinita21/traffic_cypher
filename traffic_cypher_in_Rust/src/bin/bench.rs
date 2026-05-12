@@ -45,7 +45,11 @@ fn run_bench(name: &'static str, warmup: usize, iters: usize, mut f: impl FnMut(
     }
 }
 
+// reason: libc::mach_task_self_ was deprecated in favour of the `mach2` crate,
+// but adding a new dependency is out of scope. Suppress on macOS only — the
+// other platform branches don't use the deprecated symbol.
 #[cfg(target_os = "macos")]
+#[allow(deprecated)]
 fn get_rss_bytes() -> usize {
     // macOS: use mach task_info.
     unsafe {
@@ -331,11 +335,7 @@ fn main() {
     );
     println!(
         "  \"memory_delta_bytes\": {},",
-        if rss_end > rss_start {
-            rss_end - rss_start
-        } else {
-            0
-        }
+        rss_end.saturating_sub(rss_start)
     );
     println!("  \"benchmarks\": [");
 

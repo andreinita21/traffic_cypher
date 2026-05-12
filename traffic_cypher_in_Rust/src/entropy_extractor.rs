@@ -54,7 +54,6 @@ pub fn extract_entropy(
         let delta_hash = sha256(&delta);
         entropy_bytes.extend_from_slice(&delta_hash);
 
-        let pixel_count = min_len / 3; // RGB
         Some(EntropyMetrics {
             changed_pixel_ratio: changed_pixels as f64 / min_len as f64,
             mean_pixel_delta: total_delta as f64 / min_len as f64,

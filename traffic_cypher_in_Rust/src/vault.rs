@@ -144,10 +144,10 @@ impl Vault {
                 e.label.to_lowercase().contains(&q)
                     || e.username
                         .as_deref()
-                        .map_or(false, |u| u.to_lowercase().contains(&q))
+                        .is_some_and(|u| u.to_lowercase().contains(&q))
                     || e.website
                         .as_deref()
-                        .map_or(false, |w| w.to_lowercase().contains(&q))
+                        .is_some_and(|w| w.to_lowercase().contains(&q))
                     || e.tags.iter().any(|t| t.to_lowercase().contains(&q))
             })
             .collect()

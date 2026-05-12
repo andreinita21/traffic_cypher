@@ -21,8 +21,8 @@ pub fn mix_entropy(pool_digest: &[u8; 32]) -> [u8; 32] {
     // Concatenate and hash
     let mut hasher = Sha256::new();
     hasher.update(pool_digest);
-    hasher.update(&os_entropy);
-    hasher.update(&timestamp);
+    hasher.update(os_entropy);
+    hasher.update(timestamp);
 
     hasher.finalize().into()
 }

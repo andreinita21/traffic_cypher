@@ -8,8 +8,8 @@ pub async fn validate_session(headers: &HeaderMap, state: &Arc<AppState>) -> boo
     let token = match headers.get("authorization") {
         Some(val) => {
             let val_str = val.to_str().unwrap_or("");
-            if val_str.starts_with("Bearer ") {
-                val_str[7..].to_string()
+            if let Some(stripped) = val_str.strip_prefix("Bearer ") {
+                stripped.to_string()
             } else {
                 return false;
             }

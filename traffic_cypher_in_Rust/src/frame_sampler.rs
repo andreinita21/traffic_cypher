@@ -65,7 +65,7 @@ async fn read_ppm_stream(
 
     loop {
         // Read PPM header byte by byte
-        let (width, height, header_len) = match read_ppm_header(&mut reader, &mut buf).await {
+        let (width, height, _header_len) = match read_ppm_header(&mut reader, &mut buf).await {
             Ok(v) => v,
             Err(e) => {
                 debug!("PPM header read ended: {}", e);
@@ -140,7 +140,7 @@ async fn read_ppm_header(
         bail!("Invalid PPM header: {:?}", header);
     }
 
-    let dims: Vec<&str> = lines[1].trim().split_whitespace().collect();
+    let dims: Vec<&str> = lines[1].split_whitespace().collect();
     if dims.len() < 2 {
         bail!("Invalid PPM dimensions: {}", lines[1]);
     }

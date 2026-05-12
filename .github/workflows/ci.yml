@@ -54,11 +54,10 @@ jobs:
       - name: cargo test --release --locked (serial)
         run: cargo test --release --locked -- --test-threads=1
 
-      # Informational: main currently has pre-existing clippy errors
-      # (see PROJECT_REVIEW.md §10). Flip to `-D warnings` after the cleanup PR.
-      - name: cargo clippy --all-targets --locked (informational)
-        continue-on-error: true
-        run: cargo clippy --all-targets --locked
+      # Hard gate: the pre-existing clippy lints (see PROJECT_REVIEW.md §10)
+      # were cleaned up; `-D warnings` keeps regressions out of `main`.
+      - name: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       # Informational: main currently fails `cargo fmt --check` locally.
       # Flip to a hard gate after the formatting PR.

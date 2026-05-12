@@ -40,6 +40,9 @@ impl EntropyPool {
     }
 
     /// Whether the pool is empty.
+    // reason: paired with `len()` per Rust API guidelines / clippy::len_without_is_empty;
+    // no current caller, but removing it would itself be a lint violation.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }

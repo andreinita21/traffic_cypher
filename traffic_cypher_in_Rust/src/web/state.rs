@@ -34,6 +34,12 @@ pub struct AppState {
     pub unlock_lockout_until: Arc<RwLock<Option<Instant>>>,
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppState {
     pub fn new() -> Self {
         Self {
