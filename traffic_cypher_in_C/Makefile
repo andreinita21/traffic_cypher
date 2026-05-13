@@ -24,16 +24,17 @@ ifeq ($(CC_IS_GCC),1)
   CFLAGS += -Wstringop-truncation -Wstringop-overflow=4
 endif
 
-# Opt-in: route stream handlers through the multi_stream manager and flip
-# /api/build/info to traffic_entropy:true. Default off — keeps the #1b "honest
-# relabel" semantics for production builds until the port is exercised end to
-# end. REMEDIATION_PLAN.md:349.
+# Traffic entropy is the default since NEXT_STEPS.md Phase C (2026-05-13):
+# stream handlers route through the multi_stream manager and
+# /api/build/info reports traffic_entropy:true. This is the production
+# behaviour the project's thesis depends on.
 #
-#   make ENABLE_TRAFFIC_ENTROPY=1
-#
-# Once the C side has soaked under real streams and the parity harness is
-# updated, this becomes the default and #1b reverts.
-ifeq ($(ENABLE_TRAFFIC_ENTROPY),1)
+# Opt out with `make ENABLE_TRAFFIC_ENTROPY=0` to get the legacy
+# OS-entropy-only daemon (handle_add_stream returns 501, build_info
+# reports traffic_entropy:false). Retained for one release cycle so
+# operators can roll back if the flag-on path hits a field issue.
+# Tracked under `tests/33_os_only_build.sh`.
+ifneq ($(ENABLE_TRAFFIC_ENTROPY),0)
   CFLAGS += -DENABLE_TRAFFIC_ENTROPY
 endif
 

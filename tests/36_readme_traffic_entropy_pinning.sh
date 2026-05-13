@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # 36 — README pinning for the ENABLE_TRAFFIC_ENTROPY build flag.
 #
-# After #1a stages 1-3 (2026-05-13), the C build is no longer monolithically
-# "OS entropy only" — it has two build variants, with the default off until
-# the parity harness exercises the flag-on build. The README must describe
-# both variants accurately. This regression test prevents anyone from
-# silently reverting to an unqualified claim that the C build has no stream
-# ingestion or unconditionally returns traffic_entropy:false.
+# Post-flip (NEXT_STEPS.md Phase C, 2026-05-13): traffic entropy is the
+# DEFAULT. `make ENABLE_TRAFFIC_ENTROPY=0` is the opt-out for the legacy
+# OS-only path. The README must describe both variants accurately and not
+# silently revert to an unqualified claim that the default C build is
+# OS-entropy-only.
 set -euo pipefail
 source "$(dirname "$0")/lib/common.sh"
 
@@ -18,26 +17,28 @@ grep -q 'ENABLE_TRAFFIC_ENTROPY' "$README" \
     || fail "README.md does not mention ENABLE_TRAFFIC_ENTROPY — the C build-time toggle is undocumented"
 pass "README.md documents the ENABLE_TRAFFIC_ENTROPY flag"
 
-# 2. The parity-table cell (or an equivalent qualifier) must be present so a
-#    reader can tell "default build: No" from "flag-on build: Yes" without
-#    reading the source.
-grep -q 'default build: No' "$README" \
-    || fail "README.md missing 'default build: No' parity qualifier for traffic entropy"
-pass "README.md preserves the 'default build: No' parity qualifier"
+# 2. The post-flip parity-table cell must say the default is Yes, and the
+#    opt-out path must reference ENABLE_TRAFFIC_ENTROPY=0.
+grep -q 'Yes (default since' "$README" \
+    || grep -q 'default build: Yes' "$README" \
+    || fail "README.md missing post-flip 'default build: Yes' / 'Yes (default since …)' parity qualifier"
+pass "README.md reflects the post-flip default (traffic entropy on)"
 
-# 3. Refuse any new *unqualified* claim that the C build lacks stream
-#    ingestion. Specifically: if the phrase "no stream ingestion" appears,
-#    "default build" must appear within ~5 lines so the claim is conditional.
+grep -q 'ENABLE_TRAFFIC_ENTROPY=0' "$README" \
+    || fail "README.md must document the ENABLE_TRAFFIC_ENTROPY=0 opt-out"
+pass "README.md documents the ENABLE_TRAFFIC_ENTROPY=0 opt-out"
+
+# 3. Refuse any new *unqualified* claim that the default C build lacks stream
+#    ingestion or is OS-only. The phrases below MUST appear next to an
+#    "opt-out" / "ENABLE_TRAFFIC_ENTROPY=0" qualifier within ~5 lines.
 if grep -n -i 'no stream ingestion\|OS-entropy-only\|OS entropy only' "$README" >/dev/null 2>&1; then
-    # For every line containing one of those phrases, check that "default build"
-    # or "ENABLE_TRAFFIC_ENTROPY" appears within +/- 5 lines as a qualifier.
     while IFS=: read -r lineno _; do
         start=$((lineno > 5 ? lineno - 5 : 1))
         end=$((lineno + 5))
         if ! sed -n "${start},${end}p" "$README" \
-                | grep -q -E 'default build|ENABLE_TRAFFIC_ENTROPY|two build variants|Build variants|build variants'; then
+                | grep -q -E 'opt-out|ENABLE_TRAFFIC_ENTROPY=0|Opt-out|two build variants|Build variants|build variants'; then
             sed -n "${start},${end}p" "$README" >&2
-            fail "README.md line $lineno asserts no-stream-ingestion / OS-only without a default-build qualifier nearby"
+            fail "README.md line $lineno asserts no-stream-ingestion / OS-only without an opt-out qualifier nearby"
         fi
     done < <(grep -n -i 'no stream ingestion\|OS-entropy-only\|OS entropy only' "$README")
 fi

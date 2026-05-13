@@ -28,12 +28,12 @@ TrafficCypher/
 
 Both implementations expose the same HTTP API and produce keys with the same construction, so they are directly comparable.
 
-> **Scope of the C implementation.** The C **CLI binary** (`traffic-cypher`, `src_c/main.c`) wires traffic-frame entropy correctly. The C **password manager daemon** (`traffic-cypher-pm`) has two build variants:
+> **Scope of the C implementation.** The C **CLI binary** (`traffic-cypher`, `src_c/main.c`) and **password manager daemon** (`traffic-cypher-pm`) both wire traffic-frame entropy. The daemon has two build variants:
 >
-> - **Default build (`make`)** — runs an OS-entropy-only rotation loop and does not open or read any stream. Streams added through its UI are persisted to config (so the Rust build on the same machine still benefits) but are reported as `Disabled` and `frames_captured: 0`, and `POST /api/streams` responds `501 Not Implemented`. `GET /api/build/info` reports `{"build":"c","traffic_entropy":false}` and the shared frontend shows a top-of-screen banner.
-> - **`make ENABLE_TRAFFIC_ENTROPY=1`** — compiles the full C `MultiStreamManager` port (remediation #1a, stages 1–3 landed 2026-05-13; see `REMEDIATION_PROGRESS.md`). `POST /api/streams` resolves the URL via `yt-dlp`, spawns ffmpeg, and feeds frames into the rotation daemon's entropy pool. `GET /api/build/info` flips to `{"build":"c","traffic_entropy":true}`. The Rust build always reports `{"build":"rust","traffic_entropy":true}`.
+> - **Default build (`make`)** — full C `MultiStreamManager`. `POST /api/streams` resolves the URL via `yt-dlp`, spawns `ffmpeg`, and feeds frames into the rotation daemon's entropy pool. A second entropy source — the phone-camera path — is exposed at `GET /phone.html` + `POST /api/streams/phone[/{N}/frame]`. `GET /api/build/info` reports `{"build":"c","traffic_entropy":true}` and matches Rust on every parity anchor case.
+> - **`make ENABLE_TRAFFIC_ENTROPY=0`** — legacy OS-entropy-only opt-out. The rotation loop never opens or reads a stream. `POST /api/streams` responds `501 Not Implemented`; the phone routes are not registered; `GET /api/build/info` reports `{"build":"c","traffic_entropy":false}` and the shared frontend shows a top-of-screen OS-only banner. Retained for one release cycle for rollback; will be removed in a future commit.
 >
-> The default is **off** until the parity harness exercises the flag-on build (per `REMEDIATION_PLAN.md` #1a). Local regression coverage for the flag-on path lives in `tests/33_traffic_entropy_build.sh`.
+> The flag-on path is what `REMEDIATION_PLAN.md #1a` calls out as the project's correctness target. Local regression coverage for the opt-out path lives in `tests/33_os_only_build.sh`. The full lifecycle of #1a — stages 1 through C (the default-flip) — is logged in `REMEDIATION_PROGRESS.md`.
 
 ---
 
@@ -102,14 +102,14 @@ Builds via `make`. No package manager — dependencies (`OpenSSL`, `pthread`, `l
 
 #### Build variants
 
-The C tree exposes a build-time toggle for the password-manager traffic-entropy pipeline:
+The C tree exposes a build-time toggle for the password-manager traffic-entropy pipeline. Since the 2026-05-13 default-flip (NEXT_STEPS.md Phase C), traffic entropy is on by default:
 
 | Variant | Command | Traffic entropy in PM mode | `traffic-cypher-pm` behaviour |
 |---|---|---|---|
-| Default | `make` | default build: No | OS-entropy-only rotation; `POST /api/streams` returns `501`; `/api/build/info` reports `traffic_entropy:false`. |
-| Opt-in | `make ENABLE_TRAFFIC_ENTROPY=1` | `ENABLE_TRAFFIC_ENTROPY=1`: Yes | Full C `MultiStreamManager` port; `POST /api/streams` resolves and ingests; `/api/build/info` reports `traffic_entropy:true`. |
+| **Default** | `make` | Yes (default since 2026-05-13) | Full `MultiStreamManager`. `POST /api/streams` resolves and ingests YouTube via `yt-dlp` + `ffmpeg`; `POST /api/streams/phone` registers a phone camera; `GET /phone.html` serves the phone capture page; `/api/build/info` reports `traffic_entropy:true`. |
+| Opt-out | `make ENABLE_TRAFFIC_ENTROPY=0` | No | Legacy OS-entropy-only daemon. `POST /api/streams` returns `501`; phone routes unregistered; `/api/build/info` reports `traffic_entropy:false` + OS-only `note`. Retained for one release cycle for rollback. |
 
-The default is **off** until the parity harness exercises the flag-on build (per `REMEDIATION_PLAN.md` #1a). The flag-on path is exercised locally by `tests/33_traffic_entropy_build.sh`. Stages 1–3 of #1a landed 2026-05-13; the path-(a) full port is now reachable via the build flag. See `REMEDIATION_PROGRESS.md` for the 2026-05-13 stage entries.
+CI exercises both variants on every push: the `c` and `tests` jobs cover the default (flag-on); the `c-os-only` job covers the opt-out. Local regression coverage for the opt-out path lives in `tests/33_os_only_build.sh`. The full lifecycle of #1a — stages 1 through C (the default-flip) — is logged in `REMEDIATION_PROGRESS.md`.
 
 ### `traffic_cypher_in_Rust/`
 

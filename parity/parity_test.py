@@ -13,19 +13,20 @@ time, socket. Runnable as:
     python3 parity/parity_test.py --max-cases 4
     python3 parity/parity_test.py --case create_with_tags
     python3 parity/parity_test.py --verbose
-    BUILD_VARIANT=traffic_entropy python3 parity/parity_test.py
+    BUILD_VARIANT=os_only python3 parity/parity_test.py
 
 The BUILD_VARIANT env var (or --variant CLI flag) selects which C build
 to exercise:
     default          — use the canonical traffic_cypher_in_C/traffic-cypher-pm
-                       binary (whatever the default Makefile invocation
-                       produced). Per-case `expected_diff` is read from
-                       the "default" key (if the value is an object) or
-                       used as-is (if it is a scalar bool).
-    traffic_entropy  — rsync the C tree into a tmpdir, build with
-                       `make ENABLE_TRAFFIC_ENTROPY=1`, and point the
-                       harness at that binary. Per-case `expected_diff`
-                       is read from the "traffic_entropy" key.
+                       binary (post-flip: full traffic-entropy build).
+                       Per-case `expected_diff` is read from the "default"
+                       key (if the value is an object) or used as-is
+                       (if it is a scalar bool).
+    os_only          — rsync the C tree into a tmpdir, build with
+                       `make ENABLE_TRAFFIC_ENTROPY=0`, and point the
+                       harness at the legacy OS-only opt-out binary.
+                       Per-case `expected_diff` is read from the
+                       "os_only" key.
 
 Exits 0 if every case either matched exactly or is flagged
 `expected_diff: true` (for the active variant). Exits 1 on any
@@ -58,11 +59,12 @@ C_PM_DEFAULT_PATH = REPO_ROOT / "traffic_cypher_in_C" / "traffic-cypher-pm"
 RUST_PM_PATH = REPO_ROOT / "traffic_cypher_in_Rust" / "target" / "release" / "pm"
 
 # BUILD_VARIANT axis: selects which C binary to run and which per-case
-# expected_diff to apply. "default" keeps the original behaviour (the
-# already-built default C binary). "traffic_entropy" rebuilds the C tree
-# with ENABLE_TRAFFIC_ENTROPY=1 into a tmpdir (so the default binary other
-# tests depend on is not clobbered) and points the harness at that binary.
-KNOWN_VARIANTS = ("default", "traffic_entropy")
+# expected_diff to apply. "default" uses the on-disk binary (post-flip:
+# the full traffic-entropy build). "os_only" rebuilds the C tree with
+# ENABLE_TRAFFIC_ENTROPY=0 into a tmpdir (so the default binary other
+# tests depend on is not clobbered) and points the harness at the
+# legacy OS-entropy-only opt-out binary.
+KNOWN_VARIANTS = ("default", "os_only")
 BUILD_VARIANT = os.environ.get("BUILD_VARIANT", "default") or "default"
 
 PM_PORT = 9876
@@ -256,21 +258,21 @@ def resolve_expected_diff(case: dict, variant: str) -> bool:
     return False
 
 
-def build_c_with_traffic_entropy() -> Path:
-    """Build the C tree with ENABLE_TRAFFIC_ENTROPY=1 into a tmpdir.
+def build_c_with_os_only() -> Path:
+    """Build the C tree with ENABLE_TRAFFIC_ENTROPY=0 into a tmpdir.
 
-    Mirrors the layout used by tests/33_traffic_entropy_build.sh:
+    Mirrors the layout used by tests/33_os_only_build.sh:
       - copy (or rsync) the C source tree into <work>/C/
       - symlink the canonical frontend next to it so the Makefile's
         `frontend` phony (`cp -R ../frontend ./frontend`) resolves
-      - invoke `make ENABLE_TRAFFIC_ENTROPY=1`
+      - invoke `make ENABLE_TRAFFIC_ENTROPY=0`
 
     Returns the absolute path to the produced traffic-cypher-pm binary.
     The caller is responsible for keeping the tmpdir alive for the
     duration of the run (we do NOT auto-clean here — the tmpdir gets
     swept on interpreter exit via the module-level `_BUILD_TMP` register).
     """
-    work = Path(tempfile.mkdtemp(prefix="parity_te_build_"))
+    work = Path(tempfile.mkdtemp(prefix="parity_oo_build_"))
     _BUILD_TMPDIRS.append(work)
 
     c_src = REPO_ROOT / "traffic_cypher_in_C"
@@ -328,17 +330,17 @@ def build_c_with_traffic_entropy() -> Path:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             env["OPENSSL_PREFIX"] = "/usr/local/opt/openssl"
 
-    info(f"[BUILD_VARIANT=traffic_entropy] make ENABLE_TRAFFIC_ENTROPY=1 in {c_dst}")
+    info(f"[BUILD_VARIANT=os_only] make ENABLE_TRAFFIC_ENTROPY=0 in {c_dst}")
     log = work / "build.log"
     with open(log, "wb") as logfile:
         rc = subprocess.run(
-            ["make", "ENABLE_TRAFFIC_ENTROPY=1"],
+            ["make", "ENABLE_TRAFFIC_ENTROPY=0"],
             cwd=str(c_dst), env=env, stdout=logfile, stderr=subprocess.STDOUT,
         ).returncode
     if rc != 0:
         sys.stderr.write(log.read_text(errors="replace"))
         raise RuntimeError(
-            f"build with ENABLE_TRAFFIC_ENTROPY=1 failed (see {log})"
+            f"build with ENABLE_TRAFFIC_ENTROPY=0 failed (see {log})"
         )
 
     bin_path = c_dst / "traffic-cypher-pm"
@@ -346,11 +348,11 @@ def build_c_with_traffic_entropy() -> Path:
         raise RuntimeError(
             f"build produced no executable at {bin_path}"
         )
-    info(f"[BUILD_VARIANT=traffic_entropy] built {bin_path}")
+    info(f"[BUILD_VARIANT=os_only] built {bin_path}")
     return bin_path
 
 
-# Tmpdirs created by build_c_with_traffic_entropy(); cleaned on exit.
+# Tmpdirs created by build_c_with_os_only(); cleaned on exit.
 _BUILD_TMPDIRS: list[Path] = []
 
 
@@ -612,11 +614,12 @@ def main() -> int:
     ap.add_argument(
         "--variant", default=BUILD_VARIANT,
         help=(
-            "BUILD_VARIANT axis: 'default' (run the prebuilt C binary) or "
-            "'traffic_entropy' (rebuild C with ENABLE_TRAFFIC_ENTROPY=1 "
-            "into a tmpdir and run that). Also reads the BUILD_VARIANT env "
-            "var; CLI flag wins. Per-case `expected_diff` is resolved "
-            "against this variant."
+            "BUILD_VARIANT axis: 'default' (run the prebuilt C binary — "
+            "post-flip this is the full traffic-entropy build) or "
+            "'os_only' (rebuild C with ENABLE_TRAFFIC_ENTROPY=0 into a "
+            "tmpdir and run that legacy OS-entropy-only binary). Also reads "
+            "the BUILD_VARIANT env var; CLI flag wins. Per-case "
+            "`expected_diff` is resolved against this variant."
         ),
     )
     args = ap.parse_args()
@@ -657,16 +660,16 @@ def main() -> int:
 
     # Resolve the C binary for this variant. `default` reuses the
     # pre-built canonical binary that other tests depend on. Any other
-    # variant (currently just `traffic_entropy`) rebuilds into a tmpdir
+    # variant (currently just `os_only`) rebuilds into a tmpdir
     # so we never clobber the canonical artefact.
     if variant == "default":
         c_pm_path = C_PM_DEFAULT_PATH
-    elif variant == "traffic_entropy":
+    elif variant == "os_only":
         if not RUST_PM_PATH.exists():
             err(f"Rust binary not built: {RUST_PM_PATH}")
             return 1
         try:
-            c_pm_path = build_c_with_traffic_entropy()
+            c_pm_path = build_c_with_os_only()
         except Exception as e:
             err(f"variant build failed: {e}")
             return 1

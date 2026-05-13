@@ -4,6 +4,44 @@ This file tracks step-by-step status of the items defined in `REMEDIATION_PLAN.m
 
 ---
 
+### 2026-05-13 — Phase C (NEXT_STEPS.md): `ENABLE_TRAFFIC_ENTROPY` default-flip
+
+The headline change: `make` (no flag) now produces the full traffic-entropy build. `make ENABLE_TRAFFIC_ENTROPY=0` is the legacy OS-only opt-out, retained for one release cycle. With this commit the project's stated thesis ("entropy-driven password manager via live video streams") is the C build's default behaviour for the first time. The original `#1b` "honest relabel" — which was the placeholder for this — is now genuinely resolved without qualification.
+
+**Wire-up**
+
+- `traffic_cypher_in_C/Makefile` — gate inverted: `ifeq ($(ENABLE_TRAFFIC_ENTROPY),1)` → `ifneq ($(ENABLE_TRAFFIC_ENTROPY),0)`. Default builds emit `-DENABLE_TRAFFIC_ENTROPY`; explicit `make ENABLE_TRAFFIC_ENTROPY=0` is the opt-out. Comment block rewritten to document the new semantics.
+- `tests/31_c_no_entropy_lie.sh` — rewritten. The old invariant ("C build returns traffic_entropy:false") inverts; the new invariant pins runtime honesty: build_info advertises the *capability* (`traffic_entropy:true`) while the runtime `has_traffic_entropy` flag stays `false` until frames have actually flowed through the pool. Renamed in spirit (file name kept for git-blame continuity); doc comment rewritten.
+- `tests/33_traffic_entropy_build.sh` → `tests/33_os_only_build.sh` (renamed via `git mv` to preserve history). Body inverts: builds `ENABLE_TRAFFIC_ENTROPY=0` out-of-tree, asserts the binary carries `traffic_entropy:false`, runs the PM, confirms `POST /api/streams` returns 501 (legacy) and `POST /api/streams/phone` is unreachable (401 without Bearer, 404 with valid Bearer — proves the route isn't actually registered).
+- `parity/cases.json`:
+  - `streams_status.expected_diff` flips from `{default: true, traffic_entropy: false}` → `{default: false, os_only: true}`.
+  - `build_info.expected_diff` same flip.
+  - `phone_register_and_status.variants` flips from `["traffic_entropy"]` → `["default"]` — the phone endpoint is now the default's territory.
+- `parity/parity_test.py`:
+  - `KNOWN_VARIANTS` changes from `("default", "traffic_entropy")` → `("default", "os_only")`.
+  - `build_c_with_traffic_entropy()` renamed to `build_c_with_os_only()`; underlying make invocation flips from `ENABLE_TRAFFIC_ENTROPY=1` → `ENABLE_TRAFFIC_ENTROPY=0`. Tmpdir prefix renamed `parity_te_build_` → `parity_oo_build_`.
+  - All doc/log strings updated.
+- `.github/workflows/ci.yml` — `c-traffic-entropy` job renamed to `c-os-only`. Job body simplified: drops the Rust toolchain + yt-dlp/ffmpeg installs + parity-variant step (no longer needed — the regular `c` and `tests` jobs cover the new default). New body: `make ENABLE_TRAFFIC_ENTROPY=0` + binary-literal check + `tests/33_os_only_build.sh`. timeout-minutes back to 8 (from 12).
+- `README.md` — "Scope of the C implementation" callout rewritten to lead with the post-flip default. Parity-table cell flipped: `default build: Yes (default since 2026-05-13)`; `Opt-out` row references `ENABLE_TRAFFIC_ENTROPY=0`.
+- `tests/36_readme_traffic_entropy_pinning.sh` — assertions flipped: asserts the README's post-flip default-Yes cell, asserts the opt-out flag is documented, and the "no unqualified OS-only claim" check now looks for `opt-out` / `ENABLE_TRAFFIC_ENTROPY=0` as the required qualifier (was: `default build` / `ENABLE_TRAFFIC_ENTROPY`).
+
+**Verification**
+
+- `make -C traffic_cypher_in_C clean && make` — produces the flag-on binary; `strings traffic-cypher-pm | grep traffic_entropy` shows only `:true`.
+- `make -C traffic_cypher_in_C clean && make ENABLE_TRAFFIC_ENTROPY=0` — produces the opt-out binary; `strings` shows only `:false`.
+- `bash tests/run.sh` — **37 PASS + 1 SKIP** in 87 s (test count unchanged; renames + assertion flips preserve coverage). The previously-failing tests/33 now passes under its new role.
+- `bash tests/60_parity_smoke.sh` (default) — **5/5 PASS, 0 KNOWN-DIVERGENT, 0 FAIL**. Post-flip default agrees with Rust on every case including the phone endpoint.
+- `BUILD_VARIANT=os_only bash tests/60_parity_smoke.sh` — **3 PASS + 1 KNOWN-DIVERGENT (build_info, as expected)**. The opt-out diverges on build_info; phone_register case is variant-filtered out.
+- `cargo build --release --bins --locked` / `cargo clippy --all-targets --locked -- -D warnings` — clean (no Rust changes).
+
+**Risks**
+
+- Operators on the field with the old default (OS-only) will see behaviour change after upgrading: `/api/streams` no longer silently returns 501. If they had a workflow relying on that 501 they need to switch to `ENABLE_TRAFFIC_ENTROPY=0`. Documented in README's Build-variants table.
+- `tests/31` now passes only when the rotation daemon's first 3 seconds happen to not coincide with frames flowing. Since no streams are added in the test, this is bulletproof — but if a future test setup ever pre-loads streams, the assertion would need to be rewritten as "either no flag transition or, if transitioned, matches actual frame flow."
+- The opt-out CI job is intentionally minimal (no parity, no e2e). The parity-variant exercises that were on `c-traffic-entropy` are now redundant with the default `c` + `tests` jobs.
+
+---
+
 ### 2026-05-13 — Phase B.3 (NEXT_STEPS.md): Rust mirror of phone endpoints + parity case
 
 The C-side phone-camera path landed in commit `a7975cd`; this commit brings the Rust side to the same surface so the operator gets identical behaviour from both binaries, and adds a parity test that pins the two impls together going forward.

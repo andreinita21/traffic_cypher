@@ -1,9 +1,22 @@
 #!/usr/bin/env bash
-# Regression: the C password manager must NOT claim traffic entropy.
+# Regression: the C password manager's runtime traffic-entropy state must
+# accurately reflect reality.
 #
-# - GET /api/build/info returns build=c, traffic_entropy=false (no auth)
-# - After unlock, GET /api/entropy-snapshot returns has_traffic_entropy=false,
-#   even after the rotation daemon has been running for a couple of seconds.
+# After NEXT_STEPS.md Phase C (default-flip), the default C build advertises
+# traffic_entropy:true in /api/build/info (the build *has* the capability)
+# — but the runtime has_traffic_entropy flag must still report false until
+# frames have actually flowed through the entropy pool. This test verifies
+# the runtime-honesty invariant:
+#
+# - GET /api/build/info reports build=c, traffic_entropy=true (capability).
+# - After unlock with NO streams added, GET /api/entropy-snapshot reports
+#   has_traffic_entropy=false even after the rotation daemon has been
+#   running for several seconds (rotation_daemon would set the flag only
+#   if msm_pick_random_frame returned a frame, which can't happen without
+#   an active stream).
+#
+# The opt-out path (`make ENABLE_TRAFFIC_ENTROPY=0`) is covered separately
+# by tests/33_os_only_build.sh.
 
 set -euo pipefail
 
@@ -65,8 +78,9 @@ if ! echo "$build_info" | grep -q '"build":"c"'; then
     echo "FAIL: build/info should report build=c. Got: $build_info" >&2
     exit 1
 fi
-if ! echo "$build_info" | grep -q '"traffic_entropy":false'; then
-    echo "FAIL: build/info should report traffic_entropy=false. Got: $build_info" >&2
+if ! echo "$build_info" | grep -q '"traffic_entropy":true'; then
+    echo "FAIL: post-flip default build must report traffic_entropy=true (capability). Got: $build_info" >&2
+    echo "If you're running the ENABLE_TRAFFIC_ENTROPY=0 opt-out, run tests/33_os_only_build.sh instead." >&2
     exit 1
 fi
 
@@ -80,16 +94,18 @@ if [[ -z "$token" ]]; then
     exit 1
 fi
 
-# Give the rotation daemon a couple of cycles to run. If the C build were
-# still lying, it would have flipped has_traffic_entropy to true by now.
+# Give the rotation daemon a few cycles to run. With NO streams added, the
+# daemon's msm_pick_random_frame returns -1 every tick, so has_traffic_entropy
+# must stay false. If the flag were being set spuriously (without a real frame
+# in the pool), this assertion catches it.
 sleep 3
 
 snap=$(curl -s -H "Authorization: Bearer ${token}" "${BASE}/api/entropy-snapshot")
 echo "entropy-snapshot: $snap"
 if ! echo "$snap" | grep -q '"has_traffic_entropy":false'; then
-    echo "FAIL: /api/entropy-snapshot must report has_traffic_entropy=false in the C build." >&2
+    echo "FAIL: with no streams added, runtime has_traffic_entropy must stay false." >&2
     echo "Got: $snap" >&2
     exit 1
 fi
 
-echo "OK: C build honestly reports OS-only entropy."
+echo "OK: build advertises traffic_entropy capability; runtime honestly reports false until frames flow."
