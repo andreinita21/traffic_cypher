@@ -198,16 +198,28 @@ fuzz-clean:
 #
 #   make -C traffic_cypher_in_C msm_test && ./traffic_cypher_in_C/msm_test
 # ----------------------------------------------------------------------------
+# multi_stream.c now uses RAND_bytes for the phone upload-token (Phase B),
+# so the test binary needs OpenSSL too. hex_utils.c is also linked because
+# msm_register_phone hex-encodes the token.
 MSM_TEST_SRC := $(SRC_DIR)/multi_stream.c $(SRC_DIR)/stream_ingestion.c \
-                $(SRC_DIR)/frame_sampler.c
+                $(SRC_DIR)/frame_sampler.c $(SRC_DIR)/hex_utils.c
 MSM_TEST_CFLAGS := -O0 -g -std=c11 -I include -DENABLE_MSM_TEST_API \
                    -fstack-protector-strong
+MSM_TEST_LDFLAGS := -lpthread -lssl -lcrypto
+ifeq ($(UNAME_S),Darwin)
+  MSM_TEST_CFLAGS  += -I$(OPENSSL_PREFIX)/include
+  MSM_TEST_LDFLAGS += -L$(OPENSSL_PREFIX)/lib -framework Security
+endif
 ifeq ($(UNAME_S),Linux)
   MSM_TEST_CFLAGS += -D_GNU_SOURCE
+  ifdef OPENSSL_PREFIX
+    MSM_TEST_CFLAGS  += -I$(OPENSSL_PREFIX)/include
+    MSM_TEST_LDFLAGS += -L$(OPENSSL_PREFIX)/lib64 -L$(OPENSSL_PREFIX)/lib
+  endif
 endif
 
 msm_test: tests_c/msm_test.c $(MSM_TEST_SRC)
-	$(CC) $(MSM_TEST_CFLAGS) -o $@ $^ -lpthread
+	$(CC) $(MSM_TEST_CFLAGS) -o $@ $^ $(MSM_TEST_LDFLAGS)
 
 msm_test-clean:
 	rm -f msm_test

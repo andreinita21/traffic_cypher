@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Traffic Cypher · Phone Camera</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    min-height: 100vh;
+    font-family: -apple-system, system-ui, sans-serif;
+    background: #0a0a0a; color: #e7e7e7;
+  }
+  body {
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: flex-start;
+    padding: 24px 16px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  .sub { font-size: 13px; color: #9a9a9a; margin: 0 0 24px; }
+
+  .panel {
+    width: 100%; max-width: 420px;
+    background: #161616; border: 1px solid #2a2a2a;
+    border-radius: 12px; padding: 20px;
+    margin-bottom: 16px;
+  }
+  label { display: block; font-size: 12px; color: #9a9a9a; margin-bottom: 6px; }
+  input[type="text"] {
+    width: 100%; background: #0a0a0a; color: #e7e7e7;
+    border: 1px solid #333; border-radius: 8px;
+    padding: 10px 12px; font-size: 16px;
+    -webkit-appearance: none; appearance: none;
+  }
+  input[type="text"]:focus { outline: 1px solid #4a90e2; border-color: #4a90e2; }
+  button {
+    width: 100%; margin-top: 14px;
+    background: #4a90e2; color: white; border: none;
+    border-radius: 8px; padding: 12px 16px;
+    font-size: 15px; font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { background: #2a2a2a; color: #555; cursor: not-allowed; }
+  button.secondary { background: #2a2a2a; color: #c0c0c0; }
+
+  video, canvas { width: 100%; max-width: 320px; border-radius: 8px; background: #000; }
+  canvas { display: none; }
+
+  .row { display: flex; justify-content: space-between; font-size: 13px; padding: 6px 0; }
+  .row .k { color: #888; }
+  .row .v { color: #e7e7e7; font-variant-numeric: tabular-nums; }
+  .err { color: #e07a5f; font-size: 13px; margin-top: 8px; min-height: 1em; }
+  .ok  { color: #5fa86b; }
+
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<h1>Traffic Cypher · Phone Camera</h1>
+<p class="sub">Stream this phone's camera to your local Traffic Cypher daemon as an entropy source.</p>
+
+<div id="setup" class="panel">
+  <label for="cam-name">Camera name</label>
+  <input id="cam-name" type="text" placeholder="e.g. kitchen-phone" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false">
+  <button id="start-btn">Start streaming</button>
+  <div id="setup-err" class="err"></div>
+</div>
+
+<div id="live" class="panel hidden">
+  <video id="preview" autoplay playsinline muted></video>
+  <canvas id="capture" width="320" height="240"></canvas>
+  <div class="row"><span class="k">Name</span><span class="v" id="live-name">—</span></div>
+  <div class="row"><span class="k">Slot</span><span class="v" id="live-slot">—</span></div>
+  <div class="row"><span class="k">Frames sent</span><span class="v" id="live-frames">0</span></div>
+  <div class="row"><span class="k">Last result</span><span class="v" id="live-status">—</span></div>
+  <button id="stop-btn" class="secondary" style="margin-top:14px;">Stop streaming</button>
+</div>
+
+<script>
+'use strict';
+(function () {
+  var setupEl  = document.getElementById('setup');
+  var liveEl   = document.getElementById('live');
+  var nameEl   = document.getElementById('cam-name');
+  var startBtn = document.getElementById('start-btn');
+  var stopBtn  = document.getElementById('stop-btn');
+  var errEl    = document.getElementById('setup-err');
+  var videoEl  = document.getElementById('preview');
+  var canvasEl = document.getElementById('capture');
+  var liveName = document.getElementById('live-name');
+  var liveSlot = document.getElementById('live-slot');
+  var liveFr   = document.getElementById('live-frames');
+  var liveSt   = document.getElementById('live-status');
+
+  var state = {
+    label: '',
+    slot: null,
+    token: null,
+    stream: null,
+    timerId: null,
+    framesSent: 0,
+  };
+
+  function setErr(msg)  { errEl.textContent = msg; errEl.classList.remove('ok'); }
+  function clearErr()   { errEl.textContent = ''; }
+
+  startBtn.addEventListener('click', start);
+  stopBtn.addEventListener('click', stop);
+
+  async function start() {
+    var label = (nameEl.value || '').trim();
+    if (!label) { setErr('Camera name is required.'); return; }
+    if (label.length > 64) { setErr('Camera name must be ≤ 64 characters.'); return; }
+    clearErr();
+    startBtn.disabled = true;
+    startBtn.textContent = 'Starting…';
+
+    try {
+      // 1. Register with the server. No Bearer auth required for /api/streams/phone.
+      var resp = await fetch('/api/streams/phone', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: label }),
+      });
+      if (!resp.ok) {
+        var t = await resp.text();
+        throw new Error('register failed (' + resp.status + '): ' + t);
+      }
+      var reg = await resp.json();
+      state.label = label;
+      state.slot = reg.index;
+      state.token = reg.upload_token;
+
+      // 2. Open the camera. Will fail without HTTPS or localhost on most browsers.
+      state.stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 320 }, height: { ideal: 240 }, facingMode: 'environment' },
+        audio: false,
+      });
+      videoEl.srcObject = state.stream;
+
+      // 3. Swap setup → live panel, start 1-FPS capture loop.
+      setupEl.classList.add('hidden');
+      liveEl.classList.remove('hidden');
+      liveName.textContent = state.label;
+      liveSlot.textContent = String(state.slot);
+      liveFr.textContent = '0';
+      liveSt.textContent = 'starting…';
+
+      state.timerId = setInterval(captureAndSend, 1000);
+    } catch (e) {
+      setErr(String(e && e.message || e));
+      startBtn.disabled = false;
+      startBtn.textContent = 'Start streaming';
+    }
+  }
+
+  function stop() {
+    if (state.timerId) clearInterval(state.timerId);
+    state.timerId = null;
+    if (state.stream) state.stream.getTracks().forEach(function (t) { t.stop(); });
+    state.stream = null;
+    state.token = null;
+    state.slot = null;
+    state.framesSent = 0;
+    liveEl.classList.add('hidden');
+    setupEl.classList.remove('hidden');
+    startBtn.disabled = false;
+    startBtn.textContent = 'Start streaming';
+  }
+
+  /* Encode canvas RGBA → P6 PPM. 320*240*3 = 230400 bytes of pixels + a ~15-byte
+   * header. Drops the alpha channel; entropy pipeline doesn't need it. */
+  function rgbaToPpm(imgData) {
+    var w = imgData.width, h = imgData.height;
+    var rgba = imgData.data;
+    var header = 'P6\n' + w + ' ' + h + '\n255\n';
+    var hb = new TextEncoder().encode(header);
+    var out = new Uint8Array(hb.length + w * h * 3);
+    out.set(hb, 0);
+    var dst = hb.length;
+    var n = w * h;
+    for (var i = 0, j = 0; i < n; i++, j += 4) {
+      out[dst++] = rgba[j];
+      out[dst++] = rgba[j + 1];
+      out[dst++] = rgba[j + 2];
+    }
+    return out;
+  }
+
+  async function captureAndSend() {
+    if (!state.token || !videoEl.videoWidth) return;
+    var ctx = canvasEl.getContext('2d');
+    ctx.drawImage(videoEl, 0, 0, canvasEl.width, canvasEl.height);
+    var imgData = ctx.getImageData(0, 0, canvasEl.width, canvasEl.height);
+    var ppm = rgbaToPpm(imgData);
+    try {
+      var r = await fetch('/api/streams/phone/' + state.slot + '/frame', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'image/x-portable-pixmap',
+          'X-Upload-Token': state.token,
+        },
+        body: ppm,
+      });
+      if (r.ok || r.status === 204) {
+        state.framesSent++;
+        liveFr.textContent = String(state.framesSent);
+        liveSt.textContent = 'OK';
+      } else {
+        liveSt.textContent = 'HTTP ' + r.status;
+      }
+    } catch (e) {
+      liveSt.textContent = 'error: ' + (e && e.message || e);
+    }
+  }
+})();
+</script>
+</body>
+</html>

@@ -4,6 +4,58 @@ This file tracks step-by-step status of the items defined in `REMEDIATION_PLAN.m
 
 ---
 
+### 2026-05-13 — Phase B (NEXT_STEPS.md): phone-camera entropy source (C side)
+
+Second slice of `NEXT_STEPS.md`. Introduces a brand-new entropy source — the phone's own camera, accessed via a standalone capture page served by the daemon — alongside the existing YouTube/yt-dlp path. Both kinds of slots coexist in the same MSM; OS fallback still kicks in when neither is active. Behind `ENABLE_TRAFFIC_ENTROPY` like the rest of stage 3+.
+
+**User flow**
+1. Operator opens the dashboard, sees a new "Pair a phone camera" affordance under Live Streams that prints `http://<host>:9876/phone.html`.
+2. Phone visits the URL → page asks for a camera name + a Start Streaming click.
+3. On click: page POSTs to `/api/streams/phone` (no auth) → server returns `{index, upload_token}`; page calls `getUserMedia`; begins 1-FPS capture loop POSTing PPM frames to `/api/streams/phone/{N}/frame` with `X-Upload-Token`.
+4. Dashboard's `/api/streams` polling shows the slot as `Active` with `kind:"phone"` and a live `frames_captured` counter.
+
+**Wire-up**
+
+- `traffic_cypher_in_C/include/multi_stream.h`: new `slot_kind_t` enum (`SLOT_FFMPEG`/`SLOT_PHONE`); `kind` field added to `stream_status_t`; two new public functions `msm_register_phone` (allocates slot, generates 32-byte random token via `RAND_bytes`, writes 64-char lowercase hex to caller buffer) and `msm_push_phone_frame` (validates slot kind + constant-time-checks the token, ring-pushes the frame, transitions `CONNECTING` → `ACTIVE` on first success).
+- `traffic_cypher_in_C/src_c/multi_stream.c`:
+  - `stream_slot_t` gains `kind` + `upload_token[32]`.
+  - `msm_register_phone` / `msm_push_phone_frame` implemented; private `ct_eq_hex64()` constant-time 64-char hex comparator (volatile-accumulator pattern to defeat the compiler re-introducing early exit).
+  - `msm_get_statuses` now reports the slot kind.
+  - `msm_remove_stream` / `msm_free`: skip pthread joins for `SLOT_PHONE` (those slots have no prep or forwarder threads; phone removal is a synchronous slot-clear + token wipe).
+- `traffic_cypher_in_C/src_c/web_server.c`:
+  - `http_request_t` gets an `x_upload_token[128]` field; `parse_request` extracts the `X-Upload-Token` header (same pattern as the existing `Authorization` extraction).
+  - New handlers `handle_register_phone`, `handle_phone_frame` (both behind `ENABLE_TRAFFIC_ENTROPY`).
+  - Routes added BEFORE the generic `/api/*` auth gate: `POST /api/streams/phone` (public) and `POST /api/streams/phone/{N}/frame` (X-Upload-Token auth, no Bearer). Generic `/api/streams/{N}` DELETE still serves both kinds because `msm_remove_stream` is kind-aware. Phone slots don't touch `stream_config`, so the config-shift step is conditional.
+  - New static route `GET /phone.html` serves the capture page (loaded at startup via the existing `load_frontend_file` pattern). `frontend_phone` static + `frontend_phone_len` added.
+  - `handle_list_streams` (flag-on branch) now emits `"kind":"phone"` or `"kind":"ffmpeg"` per slot.
+  - Inline `parse_ppm_header()`: small P6 parser that extracts width/height/pixel-offset from a memory buffer. Doesn't reuse `frame_capture_read`'s parser (that one is `FILE*`-based). Rejects malformed input + caps dimensions at 65535.
+- `traffic_cypher_in_C/Makefile`: `msm_test` target now links OpenSSL + hex_utils.c (multi_stream.c uses `RAND_bytes` + `hex_encode`).
+- `frontend/phone.html` (new, 220 LOC including inline CSS/JS): self-contained capture page. Camera-name input + Start button → registers + opens camera + captures to canvas at 1 FPS → encodes PPM via `getImageData` → POSTs with the upload token. Stop button tears it down. No external deps.
+- `frontend/app.js`: Live Streams panel copy updated ("YouTube livestreams **and** phone cameras feed the same pipeline"). New "Pair a phone camera" row with an absolute URL pointing at the daemon's own host. Stream-list renderer extended with a `KIND_BADGE` whitelist (mirrors the `STATUS_CLASS` whitelist from #1a stage 4d) — `phone`/`ffmpeg` only; anything else collapses to empty string, defeating class-name injection if the server ever lied.
+- `tests/38_phone_camera_endpoint.sh` (new, 11 assertions): out-of-tree flag-on build, boots PM, serves /phone.html, registers a slot, pushes 3 synthetic 1×1 PPM frames, checks slot transitions to Active + `kind:"phone"` + `frames_captured ≥ 1`, polls `/api/entropy-snapshot` until `has_traffic_entropy:true`, asserts wrong-token POST → 403, asserts DELETE removes the slot. All curl + python3 — no real phone needed.
+
+**Verification**
+
+- `make -C traffic_cypher_in_C clean && make` — clean (default build, no phone code reachable).
+- `make -C traffic_cypher_in_C clean && make ENABLE_TRAFFIC_ENTROPY=1` — clean.
+- `./traffic_cypher_in_C/msm_test` — 28/28 PASS (test seam unchanged).
+- `bash tests/38_phone_camera_endpoint.sh` — 11/11 PASS. Slot transitions to Active after the first frame; `has_traffic_entropy:true` after ~3-5 s of frame flow.
+- `bash tests/run.sh` — **37 PASS + 1 SKIP** in 117 s on Apple Silicon (was 36; +1 new test). The 40 s delta vs. Phase A's 78 s comes from tests/37 + tests/38 each doing their own out-of-tree flag-on rebuild.
+- `BUILD_VARIANT=traffic_entropy bash tests/60_parity_smoke.sh` — 4/4 agree. Phone slots don't change the existing 4 anchor cases.
+
+**What's NOT in this commit (Rust mirror + parity case)**
+
+Per NEXT_STEPS.md Phase B's task list, B.3 (Rust mirror of `/api/streams/phone[/...]/frame`) and B.6 (parity `phone_streams_status` case) are deferred. The C side is what makes "traffic entropy works" land for the user; Rust parity for this specific endpoint can follow in a separate commit. The current state remains parity-clean because the new endpoints are net-new — neither implementation has them in the comparison suite yet.
+
+**Risks**
+
+- **HTTPS for phone camera**. `navigator.mediaDevices.getUserMedia` requires HTTPS or localhost. Phone connecting to `http://<laptop-ip>:9876` over HTTP will be refused by the browser. Documented in `NEXT_STEPS.md`'s "HTTPS caveat" section. Dev mitigation: Chrome flag `chrome://flags/#unsafely-treat-insecure-origin-as-secure` set to the daemon's URL, or run TLS termination in front of the daemon. TLS in the daemon itself is out of scope for v1.
+- **Slot exhaustion DoS**. A network actor can hammer `POST /api/streams/phone` to fill all 16 slots with `CONNECTING` phantoms. They can't push frames (no token), so the slots stay idle. Operator clears them via DELETE; auto-prune of idle phone slots is a future enhancement.
+- **Token lifetime**. Tokens are in-memory only — process restart loses them and the phone must re-pair. Acceptable per the v1 trust model (anyone who can access the daemon URL on the LAN can re-pair via the dashboard's pair-link).
+- **Frame size**. 320×240 PPM is ~230 KiB; well under the 8 MiB body cap. Higher resolutions would still fit, but the entropy pipeline scales O(width×height), so 320×240 stays the recommended default.
+
+---
+
 ### 2026-05-13 — Phase A (NEXT_STEPS.md): parity-variant in CI
 
 First slice of the `NEXT_STEPS.md` plan. Lands the CI safety net for the future default-flip: `c-traffic-entropy` now runs the parity smoke against the flag-on C build on every push, on both runners.

@@ -1,8 +1,10 @@
 #include "multi_stream.h"
 #include "stream_ingestion.h"
 #include "frame_sampler.h"
+#include "hex_utils.h"
 
 #include <errno.h>
+#include <openssl/rand.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -43,7 +45,17 @@ typedef struct {
     char            url[VAULT_FIELD_MAX];
     char            label[VAULT_LABEL_MAX];
     stream_state_t  status;
+    slot_kind_t     kind;
     uint64_t        frames_captured;
+
+    /*
+     * Phone-camera upload token (raw 32 bytes). Only set when kind == SLOT_PHONE.
+     * Constant-time compared against the X-Upload-Token header on each frame
+     * POST. Lifetime is the slot's lifetime; cleared on remove. Not exposed
+     * via msm_get_statuses — only the original msm_register_phone caller
+     * learns it.
+     */
+    uint8_t         upload_token[32];
 
     /*
      * `active`           1 if this slot is in use (CONNECTING/ACTIVE/FAILED/STOPPED).
@@ -411,6 +423,18 @@ int msm_remove_stream(multi_stream_manager_t *msm, int index) {
         return -1;
     }
 
+    /* Phone slots have no prep/forwarder pthreads and no ffmpeg child.
+     * Removal is a synchronous slot clear; the token is wiped so a
+     * subsequent reuse can't accidentally re-validate. */
+    if (slot->kind == SLOT_PHONE) {
+        memset(slot->upload_token, 0, sizeof(slot->upload_token));
+        slot->active = 0;
+        slot->cancel_requested = 0;
+        slot->status = STREAM_STOPPED;
+        pthread_mutex_unlock(&msm->lock);
+        return 0;
+    }
+
     /* Set cancel_requested so the prep pthread (if still resolving) bails out
      * between blocking calls instead of marching on to ffmpeg + forwarder.
      * Snapshot the thread handles + pid under the lock. */
@@ -564,6 +588,7 @@ int msm_get_statuses(multi_stream_manager_t *msm, stream_status_t *out, int max)
         memcpy(out[n].label, msm->slots[i].label, sizeof(out[n].label));
         out[n].status = msm->slots[i].status;
         out[n].frames_captured = msm->slots[i].frames_captured;
+        out[n].kind = msm->slots[i].kind;
         n++;
     }
     pthread_mutex_unlock(&msm->lock);
@@ -600,6 +625,12 @@ void msm_free(multi_stream_manager_t *msm) {
     for (int i = 0; i < VAULT_MAX_STREAMS; i++) {
         stream_slot_t *s = &msm->slots[i];
         if (!s->active) continue;
+        /* Phone slots have no pthreads or capture children; just clear. */
+        if (s->kind == SLOT_PHONE) {
+            memset(s->upload_token, 0, sizeof(s->upload_token));
+            s->active = 0;
+            continue;
+        }
         s->cancel_requested = 1;
         if (s->capture_pid > 0) {
             kill(s->capture_pid, SIGTERM);
@@ -637,6 +668,110 @@ void msm_free(multi_stream_manager_t *msm) {
     ring_free(&msm->ring);
     pthread_mutex_destroy(&msm->lock);
     free(msm);
+}
+
+/* ------------------------------------------------------------------------
+ * Phone-camera entropy source (NEXT_STEPS.md Phase B).
+ *
+ * Phone slots are an alternative to ffmpeg/yt-dlp ingestion: instead of the
+ * server pulling frames from an external video stream, the phone's browser
+ * POSTs raw PPM frames via HTTP. There is no prep pthread and no forwarder
+ * pthread — frames arrive on the HTTP worker thread and get ring-pushed
+ * inline. The per-slot upload_token authenticates each frame.
+ * ----------------------------------------------------------------------*/
+
+/* Constant-time hex compare to defeat timing side-channels on the token check.
+ * Both operands are 64-char lowercase hex strings (32 bytes of randomness).
+ * Returns 1 if equal, 0 otherwise. */
+static int ct_eq_hex64(const char *a, const char *b) {
+    unsigned char diff = 0;
+    for (size_t i = 0; i < 64; i++) {
+        diff |= (unsigned char)(a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
+int msm_register_phone(multi_stream_manager_t *msm, const char *label,
+                       char out_token_hex[65]) {
+    if (!msm || !label || !out_token_hex) return -1;
+
+    pthread_mutex_lock(&msm->lock);
+    int idx = find_free_slot_locked(msm);
+    if (idx < 0) {
+        pthread_mutex_unlock(&msm->lock);
+        return -1;
+    }
+    stream_slot_t *slot = &msm->slots[idx];
+    memset(slot, 0, sizeof(*slot));
+    slot->active = 1;
+    slot->kind = SLOT_PHONE;
+    slot->status = STREAM_CONNECTING;  /* → ACTIVE on first successful frame */
+    slot->prep_joined = 1;             /* No prep thread to join */
+    slot->forwarder_joined = 1;        /* No forwarder thread either */
+    /* Phone slots don't have a URL; label is the user-supplied camera name. */
+    strncpy(slot->label, label, sizeof(slot->label) - 1);
+    snprintf(slot->url, sizeof(slot->url), "phone://%s", slot->label);
+
+    /* Generate token under the lock so concurrent registers can't race for
+     * the same slot. RAND_bytes failure is treated as "no slot available". */
+    if (RAND_bytes(slot->upload_token, 32) != 1) {
+        memset(slot, 0, sizeof(*slot));
+        pthread_mutex_unlock(&msm->lock);
+        return -1;
+    }
+    hex_encode(slot->upload_token, 32, out_token_hex);  /* writes 64 chars + NUL */
+    pthread_mutex_unlock(&msm->lock);
+
+    return idx;
+}
+
+int msm_push_phone_frame(multi_stream_manager_t *msm, int index,
+                         const char *token_hex,
+                         const uint8_t *pixel_data, size_t pixel_data_len,
+                         uint32_t width, uint32_t height) {
+    if (!msm || !token_hex || !pixel_data || pixel_data_len == 0) return -1;
+    if (index < 0 || index >= VAULT_MAX_STREAMS) return -1;
+    if (width == 0 || height == 0) return -1;
+    if (strlen(token_hex) != 64) return -2;  /* mismatch by shape */
+
+    /* Validate slot kind + token under the lock. */
+    pthread_mutex_lock(&msm->lock);
+    stream_slot_t *slot = &msm->slots[index];
+    if (!slot->active || slot->kind != SLOT_PHONE) {
+        pthread_mutex_unlock(&msm->lock);
+        return -1;
+    }
+    char slot_hex[65];
+    hex_encode(slot->upload_token, 32, slot_hex);
+    if (!ct_eq_hex64(token_hex, slot_hex)) {
+        pthread_mutex_unlock(&msm->lock);
+        return -2;
+    }
+    /* First successful frame transitions CONNECTING → ACTIVE. */
+    if (slot->status == STREAM_CONNECTING) {
+        slot->status = STREAM_ACTIVE;
+    }
+    pthread_mutex_unlock(&msm->lock);
+
+    /* Copy pixels into a heap-owned frame so the caller can release their
+     * buffer immediately. The ring takes ownership of frame.data; on
+     * ring_push failure (ring closed) we free it. */
+    uint8_t *copy = (uint8_t *)malloc(pixel_data_len);
+    if (!copy) return -1;
+    memcpy(copy, pixel_data, pixel_data_len);
+
+    frame_t frame;
+    frame.width    = width;
+    frame.height   = height;
+    frame.data     = copy;
+    frame.data_len = pixel_data_len;
+    frame.sequence = 0;  /* phone slots don't sequence; pick_random ignores */
+
+    if (ring_push(&msm->ring, index, &frame) != 0) {
+        free(copy);
+        return -3;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------------

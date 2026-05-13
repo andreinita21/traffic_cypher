@@ -65,6 +65,8 @@ static char *frontend_js = NULL;
 static size_t frontend_js_len = 0;
 static char *frontend_css = NULL;
 static size_t frontend_css_len = 0;
+static char *frontend_phone = NULL;
+static size_t frontend_phone_len = 0;
 
 /* --- Pool / shutdown file-scope state (see worker pool block above) --- */
 static volatile sig_atomic_t server_running = 1;
@@ -220,6 +222,7 @@ typedef struct {
     char method[16];
     char path[2048];
     char auth_header[256];
+    char x_upload_token[128];  /* X-Upload-Token header (phone-camera frame POST) */
     char content_type[128];
     char *body;
     size_t body_len;
@@ -314,6 +317,20 @@ static int parse_request(int fd, http_request_t *req) {
             if (len >= sizeof(req->auth_header)) len = sizeof(req->auth_header) - 1;
             memcpy(req->auth_header, auth, len);
             req->auth_header[len] = '\0';
+        }
+    }
+
+    /* Extract X-Upload-Token header (phone-camera frame auth, NEXT_STEPS Phase B) */
+    char *xut = strcasestr(buf, "X-Upload-Token:");
+    if (xut) {
+        xut += 15;
+        while (*xut == ' ') xut++;
+        char *eol = strstr(xut, "\r\n");
+        if (eol) {
+            size_t len = (size_t)(eol - xut);
+            if (len >= sizeof(req->x_upload_token)) len = sizeof(req->x_upload_token) - 1;
+            memcpy(req->x_upload_token, xut, len);
+            req->x_upload_token[len] = '\0';
         }
     }
 
@@ -1235,12 +1252,31 @@ static void handle_add_stream(int fd, app_state_t *state, http_request_t *req) {
 
 static void handle_remove_stream(int fd, app_state_t *state, int index) {
 #ifdef ENABLE_TRAFFIC_ENTROPY
-    /* Cancel the MSM slot first (SIGTERM the ffmpeg child, join the forwarder
-     * thread). msm_remove_stream is idempotent and returns -1 on empty slots. */
-    if (state->msm) {
-        msm_remove_stream(state->msm, index);
+    /* MSM-level removal (joins prep/forwarder for ffmpeg slots; just clears
+     * the slot for phone slots). Returns -1 if the slot was empty. */
+    int msm_rc = state->msm ? msm_remove_stream(state->msm, index) : -1;
+
+    /* Phone slots are MSM-only — they don't live in stream_config, so the
+     * shift-down below is skipped. Whether we acknowledge depends on whether
+     * MSM actually had the slot. */
+    int touched_config = 0;
+    pthread_mutex_lock(&state->lock);
+    if (index >= 0 && index < state->stream_config.stream_count) {
+        memmove(&state->stream_config.streams[index],
+                &state->stream_config.streams[index + 1],
+                ((size_t)state->stream_config.stream_count - (size_t)index - 1) * sizeof(stream_entry_t));
+        state->stream_config.stream_count--;
+        save_stream_config(&state->stream_config);
+        touched_config = 1;
     }
-#endif
+    pthread_mutex_unlock(&state->lock);
+
+    if (msm_rc == 0 || touched_config) {
+        send_json(fd, 200, "OK", "{\"status\":\"removed\"}");
+    } else {
+        send_error(fd, 400, "Bad Request", "Stream index out of range");
+    }
+#else
     pthread_mutex_lock(&state->lock);
     if (index >= 0 && index < state->stream_config.stream_count) {
         memmove(&state->stream_config.streams[index],
@@ -1254,6 +1290,7 @@ static void handle_remove_stream(int fd, app_state_t *state, int index) {
         pthread_mutex_unlock(&state->lock);
         send_error(fd, 400, "Bad Request", "Stream index out of range");
     }
+#endif
 }
 
 #ifdef ENABLE_TRAFFIC_ENTROPY
@@ -1288,7 +1325,9 @@ static void handle_list_streams(int fd, app_state_t *state) {
         char num[32];
         snprintf(num, sizeof(num), "%llu", (unsigned long long)statuses[i].frames_captured);
         sb_append(&sb, num);
-        sb_append(&sb, "}");
+        sb_append(&sb, ",\"kind\":\"");
+        sb_append(&sb, statuses[i].kind == SLOT_PHONE ? "phone" : "ffmpeg");
+        sb_append(&sb, "\"}");
     }
 #else
     pthread_mutex_lock(&state->lock);
@@ -1319,6 +1358,145 @@ static void handle_list_streams(int fd, app_state_t *state) {
     send_json(fd, 200, "OK", buf);
     free(buf);
 }
+
+#ifdef ENABLE_TRAFFIC_ENTROPY
+/* --- Phone-camera entropy source (NEXT_STEPS.md Phase B) ---
+ *
+ * Two endpoints, both public (no Bearer auth):
+ *
+ *   POST /api/streams/phone        — register a phone slot; returns
+ *                                     {"index":N,"upload_token":"<64-hex>"}.
+ *                                     Trust model: anyone on the network
+ *                                     can register, but cannot push frames
+ *                                     without the token. Max 16 slots; a
+ *                                     malicious actor can DoS by filling
+ *                                     them all (operator-fixable via DELETE).
+ *
+ *   POST /api/streams/phone/{N}/frame
+ *                                  — push one PPM frame for slot N. Requires
+ *                                     X-Upload-Token header (constant-time
+ *                                     compared against the slot's token).
+ *                                     Body: raw P6 PPM bytes.
+ */
+
+/* Minimal PPM parser: extracts width, height, and offset-of-pixel-bytes from
+ * the binary P6 header. Returns 0 on success; -1 if malformed.
+ *
+ * We don't reuse frame_capture_read's parser because that one reads from a
+ * FILE*; here the data is already in a memory buffer. */
+static int parse_ppm_header(const uint8_t *buf, size_t buf_len,
+                            uint32_t *width, uint32_t *height, size_t *pixel_off) {
+    if (buf_len < 11) return -1;            /* "P6\n1 1\n255\n" min */
+    if (buf[0] != 'P' || buf[1] != '6') return -1;
+    /* Walk past whitespace + comments after "P6", then parse W H, then maxval,
+     * then a single whitespace, then pixels. */
+    size_t i = 2;
+    int tokens[3] = {0, 0, 0};
+    int t = 0;
+    while (t < 3 && i < buf_len) {
+        /* skip whitespace */
+        while (i < buf_len && (buf[i] == ' ' || buf[i] == '\n' ||
+                               buf[i] == '\r' || buf[i] == '\t')) i++;
+        /* skip comment line */
+        if (i < buf_len && buf[i] == '#') {
+            while (i < buf_len && buf[i] != '\n') i++;
+            continue;
+        }
+        /* parse decimal */
+        int v = 0;
+        int seen_digit = 0;
+        while (i < buf_len && buf[i] >= '0' && buf[i] <= '9') {
+            v = v * 10 + (buf[i] - '0');
+            seen_digit = 1;
+            if (v > 65535) return -1;  /* unreasonably large */
+            i++;
+        }
+        if (!seen_digit) return -1;
+        tokens[t++] = v;
+    }
+    if (t != 3) return -1;
+    /* One whitespace byte separates the maxval from the pixel data. */
+    if (i >= buf_len) return -1;
+    i++;
+    *width     = (uint32_t)tokens[0];
+    *height    = (uint32_t)tokens[1];
+    *pixel_off = i;
+    return 0;
+}
+
+static void handle_register_phone(int fd, app_state_t *state, http_request_t *req) {
+    char *label = json_body_get_string(req->body, "label");
+    if (!label || label[0] == '\0') {
+        free(label);
+        send_error(fd, 400, "Bad Request", "Missing or empty label");
+        return;
+    }
+
+    char token_hex[65];
+    int idx = -1;
+    if (state->msm) {
+        idx = msm_register_phone(state->msm, label, token_hex);
+    }
+    free(label);
+
+    if (idx < 0) {
+        send_error(fd, 503, "Service Unavailable",
+                   "no free stream slot (max 16) or manager unavailable");
+        return;
+    }
+
+    /* Persist nothing to stream_config: phone slots are ephemeral by design
+     * (tokens don't survive a restart, so the phone must re-pair anyway). */
+    char resp[256];
+    snprintf(resp, sizeof(resp),
+             "{\"index\":%d,\"upload_token\":\"%s\"}", idx, token_hex);
+    send_json(fd, 202, "Accepted", resp);
+}
+
+/* POST /api/streams/phone/{N}/frame */
+static void handle_phone_frame(int fd, app_state_t *state, int idx, http_request_t *req) {
+    if (!req->body || req->body_len == 0) {
+        send_error(fd, 400, "Bad Request", "empty body");
+        return;
+    }
+    if (req->x_upload_token[0] == '\0') {
+        send_error(fd, 401, "Unauthorized", "X-Upload-Token header required");
+        return;
+    }
+
+    uint32_t w = 0, h = 0;
+    size_t pixel_off = 0;
+    if (parse_ppm_header((const uint8_t *)req->body, req->body_len,
+                          &w, &h, &pixel_off) != 0) {
+        send_error(fd, 415, "Unsupported Media Type",
+                   "body must be a P6 PPM frame");
+        return;
+    }
+    size_t pixel_len = req->body_len - pixel_off;
+    if (pixel_len != (size_t)w * (size_t)h * 3) {
+        send_error(fd, 400, "Bad Request",
+                   "PPM pixel data length does not match width*height*3");
+        return;
+    }
+
+    int rc = msm_push_phone_frame(state->msm, idx, req->x_upload_token,
+                                  (const uint8_t *)req->body + pixel_off,
+                                  pixel_len, w, h);
+    if (rc == 0) {
+        send_json(fd, 204, "No Content", "");
+        return;
+    }
+    if (rc == -2) {
+        send_error(fd, 403, "Forbidden", "upload token mismatch");
+        return;
+    }
+    if (rc == -3) {
+        send_error(fd, 503, "Service Unavailable", "manager shutting down");
+        return;
+    }
+    send_error(fd, 400, "Bad Request", "invalid slot or frame");
+}
+#endif /* ENABLE_TRAFFIC_ENTROPY */
 
 static void handle_build_info(int fd) {
     /* Honest build descriptor. No auth required — the frontend needs this at
@@ -1367,6 +1545,15 @@ static void handle_request(int fd, app_state_t *state, http_request_t *req) {
             }
             return;
         }
+        if (strcmp(req->path, "/phone.html") == 0) {
+            if (frontend_phone) {
+                http_response_t resp = {200, "OK", "text/html", frontend_phone, frontend_phone_len};
+                send_response(fd, &resp);
+            } else {
+                send_error(fd, 404, "Not Found", "Phone page not found");
+            }
+            return;
+        }
     }
 
     /* API routes - check auth for protected routes */
@@ -1386,6 +1573,28 @@ static void handle_request(int fd, app_state_t *state, http_request_t *req) {
         handle_build_info(fd);
         return;
     }
+
+#ifdef ENABLE_TRAFFIC_ENTROPY
+    /* Phone-camera entropy endpoints (no Bearer auth — see handle_register_phone
+     * trust model comment). The frame POST is authenticated via X-Upload-Token
+     * which is checked inside the handler via constant-time compare. */
+    if (strcmp(req->path, "/api/streams/phone") == 0 && strcmp(req->method, "POST") == 0) {
+        handle_register_phone(fd, state, req);
+        return;
+    }
+    /* Match /api/streams/phone/{N}/frame */
+    if (strncmp(req->path, "/api/streams/phone/", 19) == 0 &&
+        strcmp(req->method, "POST") == 0) {
+        const char *tail = req->path + 19;
+        char *endp = NULL;
+        long idx = strtol(tail, &endp, 10);
+        if (endp != tail && *endp == '/' && strcmp(endp, "/frame") == 0 &&
+            idx >= 0 && idx < VAULT_MAX_STREAMS) {
+            handle_phone_frame(fd, state, (int)idx, req);
+            return;
+        }
+    }
+#endif
 
     /* All other API routes need auth */
     if (strncmp(req->path, "/api/", 5) == 0) {
@@ -1580,6 +1789,9 @@ int web_server_start(app_state_t *state, int port) {
     load_frontend_file("frontend/index.html", &frontend_index, &frontend_index_len);
     load_frontend_file("frontend/app.js", &frontend_js, &frontend_js_len);
     load_frontend_file("frontend/style.css", &frontend_css, &frontend_css_len);
+    /* phone.html is optional — missing on the OS-only build, present on the
+     * traffic-entropy build. NEXT_STEPS.md Phase B. */
+    load_frontend_file("frontend/phone.html", &frontend_phone, &frontend_phone_len);
 
     if (!frontend_index) {
         fprintf(stderr, "[WARN] Could not load frontend/index.html\n");

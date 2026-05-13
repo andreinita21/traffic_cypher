@@ -30,12 +30,22 @@ typedef enum {
     STREAM_STOPPED    = 3
 } stream_state_t;
 
+/* Distinguishes how a slot's frames arrive. SLOT_FFMPEG is the YouTube/HTTP-
+ * stream path (prep + forwarder pthread, ffmpeg + yt-dlp). SLOT_PHONE is the
+ * phone-camera path (no pthreads — frames POSTed directly into the ring by
+ * the HTTP handler authenticated via a per-slot upload token). */
+typedef enum {
+    SLOT_FFMPEG = 0,
+    SLOT_PHONE  = 1
+} slot_kind_t;
+
 /* Snapshot of a single stream slot. Returned by msm_get_statuses(). */
 typedef struct {
     char           url[VAULT_FIELD_MAX];
     char           label[VAULT_LABEL_MAX];
     stream_state_t status;
     uint64_t       frames_captured;
+    slot_kind_t    kind;
 } stream_status_t;
 
 typedef struct multi_stream_manager multi_stream_manager_t;
@@ -107,6 +117,45 @@ int  msm_get_statuses(multi_stream_manager_t *msm, stream_status_t *out, int max
 
 /* Number of slots currently in use (CONNECTING/ACTIVE/FAILED/STOPPED). */
 int  msm_stream_count(multi_stream_manager_t *msm);
+
+/*
+ * Phone-camera slot registration. Reserves an MSM slot of kind SLOT_PHONE
+ * (no pthreads spawned), generates a 32-byte upload token, writes its 64-char
+ * lowercase-hex representation + NUL into `out_token_hex` (caller-supplied
+ * buffer ≥65 bytes). Returns the slot index, or -1 if no slot is free / OOM.
+ *
+ * The token must be presented in subsequent frame POSTs (constant-time
+ * compared). It is intentionally not retrievable via msm_get_statuses — only
+ * the caller of msm_register_phone learns it. Tokens do not survive process
+ * restart; the phone client must re-register.
+ */
+int  msm_register_phone(multi_stream_manager_t *msm,
+                        const char *label,
+                        char out_token_hex[65]);
+
+/*
+ * Push one frame of pixel data into the ring for slot `index`, after
+ * validating the slot is in use, is a SLOT_PHONE, and the supplied
+ * token_hex matches the slot's upload token (constant-time compare).
+ *
+ * The frame is built from the caller's buffer (the function copies the
+ * pixel bytes into a heap-owned frame_t so the caller can free their
+ * buffer immediately after return). First successful push transitions
+ * the slot from STREAM_CONNECTING → STREAM_ACTIVE.
+ *
+ * Returns:
+ *    0 on success
+ *   -1 on slot-index out of range / slot not in use / wrong kind / OOM
+ *   -2 on token mismatch (caller should respond 403)
+ *   -3 on ring closed
+ */
+int  msm_push_phone_frame(multi_stream_manager_t *msm,
+                          int            index,
+                          const char    *token_hex,
+                          const uint8_t *pixel_data,
+                          size_t         pixel_data_len,
+                          uint32_t       width,
+                          uint32_t       height);
 
 #ifdef ENABLE_MSM_TEST_API
 /*

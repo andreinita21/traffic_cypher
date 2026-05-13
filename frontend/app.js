@@ -973,12 +973,17 @@
             <div class="settings-page">
                 <div class="settings-section glass">
                     <h3>\u{1F4E1} Live Streams</h3>
-                    <p style="font-size:13px;color:var(--text-muted);margin-bottom:16px">Manage YouTube livestreams used for entropy harvesting. Frames are randomly picked from active streams to generate encryption keys.</p>
+                    <p style="font-size:13px;color:var(--text-muted);margin-bottom:16px">Manage entropy sources. Frames from active streams are randomly picked to generate encryption keys. Both YouTube livestreams and phone cameras feed the same pipeline.</p>
                     <div id="stream-list">Loading...</div>
                     <div style="margin-top:16px;display:flex;gap:8px">
                         <input type="text" id="new-stream-url" placeholder="YouTube livestream URL" style="flex:2">
                         <input type="text" id="new-stream-label" placeholder="Label" style="flex:1">
                         <button class="btn btn-primary" id="add-stream-btn" style="white-space:nowrap">Add Stream</button>
+                    </div>
+                    <div id="phone-pair-row" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border-subtle);font-size:13px;color:var(--text-muted)">
+                        \u{1F4F1} Pair a phone camera: open
+                        <a id="phone-pair-link" target="_blank" rel="noopener" style="color:var(--green-bright);text-decoration:none">/phone.html</a>
+                        on the phone's browser (HTTPS or localhost required by the camera API).
                     </div>
                 </div>
 
@@ -1004,6 +1009,15 @@
         loadStreams();
         loadPipelineStatus();
         loadSettingsValues();
+
+        // Resolve the pair-phone URL against the daemon's own host so the user
+        // sees an absolute URL they can punch into their phone's browser.
+        const pairLink = $('#phone-pair-link');
+        if (pairLink) {
+            const absolute = window.location.origin + '/phone.html';
+            pairLink.textContent = absolute;
+            pairLink.href = absolute;
+        }
 
         const autoLockSlider = $('#auto-lock-slider');
         autoLockSlider.addEventListener('input', () => {
@@ -1067,9 +1081,17 @@
                 'Stopped':    'stopped',
                 'Disabled':   'disabled',
             };
+            // Per-source-kind badge \u2014 phone slots arrive without a YouTube URL
+            // and don't have a prep pthread on the server. Whitelisted same as
+            // status to defeat class-name injection via the server response.
+            const KIND_BADGE = {
+                'phone':  '\u{1F4F1} phone',
+                'ffmpeg': '\u{1F4FA} stream',
+            };
             listEl.innerHTML = streams.map((s, i) => {
                 const statusClass = STATUS_CLASS[s.status] || 'unknown';
                 const statusLabel = STATUS_CLASS[s.status] ? s.status : 'Unknown';
+                const kindBadge   = KIND_BADGE[s.kind] || '';
                 const frames = (typeof s.frames_captured === 'number' && s.frames_captured > 0)
                     ? s.frames_captured + ' frames'
                     : '\u2014';
@@ -1080,6 +1102,7 @@
                         <div class="stream-label">${esc(s.label)}</div>
                         <div class="stream-url">${esc(s.url)}</div>
                     </div>
+                    <span class="stream-kind" style="font-size:11px;color:var(--text-muted)">${esc(kindBadge)}</span>
                     <span class="stream-status" style="font-size:12px;color:var(--text-muted)">${esc(statusLabel)}</span>
                     <span class="stream-frames" style="font-size:12px;color:var(--text-muted)">${esc(frames)}</span>
                     <button class="btn btn-secondary btn-icon" data-edit="${i}" title="Edit">\u270F\uFE0F</button>
