@@ -28,7 +28,12 @@ TrafficCypher/
 
 Both implementations expose the same HTTP API and produce keys with the same construction, so they are directly comparable.
 
-> **Scope of the C implementation (current build).** The C **CLI binary** (`traffic-cypher`, `src_c/main.c`) wires traffic-frame entropy correctly. The C **password manager daemon** (`traffic-cypher-pm`) does *not* — it currently runs an OS-entropy-only rotation loop and does not open or read any stream. Streams added through its UI are persisted to config (so the Rust build on the same machine still benefits) but are reported as `Disabled` and `frames_captured: 0`, and `POST /api/streams` responds `501 Not Implemented`. Every build exposes a no-auth `GET /api/build/info` endpoint that reports `{"build":"c","traffic_entropy":false}` (C) or `{"build":"rust","traffic_entropy":true}` (Rust), and the shared frontend shows a top-of-screen banner whenever `traffic_entropy` is false. The full C `MultiStreamManager` port is tracked as remediation item #1a (Week 4+).
+> **Scope of the C implementation.** The C **CLI binary** (`traffic-cypher`, `src_c/main.c`) wires traffic-frame entropy correctly. The C **password manager daemon** (`traffic-cypher-pm`) has two build variants:
+>
+> - **Default build (`make`)** — runs an OS-entropy-only rotation loop and does not open or read any stream. Streams added through its UI are persisted to config (so the Rust build on the same machine still benefits) but are reported as `Disabled` and `frames_captured: 0`, and `POST /api/streams` responds `501 Not Implemented`. `GET /api/build/info` reports `{"build":"c","traffic_entropy":false}` and the shared frontend shows a top-of-screen banner.
+> - **`make ENABLE_TRAFFIC_ENTROPY=1`** — compiles the full C `MultiStreamManager` port (remediation #1a, stages 1–3 landed 2026-05-13; see `REMEDIATION_PROGRESS.md`). `POST /api/streams` resolves the URL via `yt-dlp`, spawns ffmpeg, and feeds frames into the rotation daemon's entropy pool. `GET /api/build/info` flips to `{"build":"c","traffic_entropy":true}`. The Rust build always reports `{"build":"rust","traffic_entropy":true}`.
+>
+> The default is **off** until the parity harness exercises the flag-on build (per `REMEDIATION_PLAN.md` #1a). Local regression coverage for the flag-on path lives in `tests/33_traffic_entropy_build.sh`.
 
 ---
 
@@ -94,6 +99,17 @@ A from-scratch C implementation. Two binaries:
 - `traffic-cypher-pm` — local password manager with web UI, JSON vault, TOTP, and password strength scoring.
 
 Builds via `make`. No package manager — dependencies (`OpenSSL`, `pthread`, `libm`) are linked at the system level.
+
+#### Build variants
+
+The C tree exposes a build-time toggle for the password-manager traffic-entropy pipeline:
+
+| Variant | Command | Traffic entropy in PM mode | `traffic-cypher-pm` behaviour |
+|---|---|---|---|
+| Default | `make` | default build: No | OS-entropy-only rotation; `POST /api/streams` returns `501`; `/api/build/info` reports `traffic_entropy:false`. |
+| Opt-in | `make ENABLE_TRAFFIC_ENTROPY=1` | `ENABLE_TRAFFIC_ENTROPY=1`: Yes | Full C `MultiStreamManager` port; `POST /api/streams` resolves and ingests; `/api/build/info` reports `traffic_entropy:true`. |
+
+The default is **off** until the parity harness exercises the flag-on build (per `REMEDIATION_PLAN.md` #1a). The flag-on path is exercised locally by `tests/33_traffic_entropy_build.sh`. Stages 1–3 of #1a landed 2026-05-13; the path-(a) full port is now reachable via the build flag. See `REMEDIATION_PROGRESS.md` for the 2026-05-13 stage entries.
 
 ### `traffic_cypher_in_Rust/`
 
