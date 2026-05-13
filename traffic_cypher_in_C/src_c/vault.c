@@ -400,6 +400,14 @@ static int parse_vault_entries(const char *json, vault_t *v) {
                     tags_start++;
                     const char *tag_end = tags_start;
                     while (*tag_end && *tag_end != '"') tag_end++;
+                    /* If we walked to the end-of-string without finding the
+                     * closing quote, the JSON is malformed — bail out. The
+                     * previous code did `tags_start = tag_end + 1` which
+                     * advanced past the NUL terminator and the next loop
+                     * iteration's `*tags_start` read off the end of the
+                     * malloc'd obj buffer (heap-buffer-overflow). Found by
+                     * the libFuzzer corpus added in NEXT_STEPS.md Phase E. */
+                    if (*tag_end != '"') break;
                     size_t tag_len = (size_t)(tag_end - tags_start);
                     if (tag_len < VAULT_LABEL_MAX) {
                         memcpy(e->tags[e->tag_count], tags_start, tag_len);
