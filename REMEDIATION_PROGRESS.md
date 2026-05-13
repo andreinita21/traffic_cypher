@@ -208,6 +208,31 @@ Moved `traffic_cypher_benchmark_report.docx` and `traffic_cypher_benchmark_repor
 
 ---
 
+### 2026-05-13 — CI repair: tests-job timeout bump
+
+The last three CI runs on `main` came back with a red `tests (ubuntu-latest)` job. Triage:
+
+| Run | Commit | Apparent failure | Real cause |
+|-----|--------|------------------|------------|
+| `25777632567` | `8c06de3` | `tests (ubuntu-latest)` 5m5s | **5-min hard timeout** — harness completed `PASSED: 31 (171s)`; Ubuntu setup overhead (~130s for OpenSSL 3.3 cache restore, cargo cache, rust toolchain) tipped total over the cap. No newer push, so concurrency-cancel is ruled out. |
+| `25769692804` | `5ec5990` | `tests (ubuntu-latest)` 5m16s | Same root cause. |
+| `25769608981` | `6effb7a` | both `tests` jobs 1m7s | **Concurrency-group cancellation** — `5ec5990` was pushed 2.5 min later and the `cancel-in-progress: true` group killed the in-flight run. Not a real failure. |
+
+The `X Process completed with exit code 1` annotation showing under `rust (...)` is the **informational** `cargo fmt --check` step (`continue-on-error: true` — see line 64 of `.github/workflows/ci.yml` and this doc's earlier note about the deferred 1,321-line formatting PR). The rust jobs themselves are ✓.
+
+**Fix**
+- `.github/workflows/ci.yml`: `tests.timeout-minutes` 5 → 10. The previous cap was sized when the harness had 26 tests; at 31 tests it no longer fits Ubuntu's setup overhead.
+
+**Verification**
+- `bash tests/run.sh` locally — **31/31 PASS** in 71s (Apple Silicon).
+- YAML parses; new value confirmed via regex (`tests timeout-minutes = 10`).
+
+**Risks**
+- None functional — purely a CI-timing knob. Lowest-risk possible change.
+- Default GitHub Actions runner timeout (6 h) still applies as an upper bound.
+
+---
+
 ### 2026-05-13 — Routine re-entry / verification pass
 
 Routine fired again on the same day after the previous run had already brought the project to its "Final state at end of run" above. No actionable items remained on `REMEDIATION_PLAN.md` (`Week 0`–`Week 3` complete; all 9 "What does not fit" backlog items complete; `Week 4+` #5c + #10d complete; only #1a — Full C `MultiStreamManager` port, ~2 weeks of focused C work per the plan — is intentionally deferred).

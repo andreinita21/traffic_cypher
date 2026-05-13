@@ -125,7 +125,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 5
+    # Bumped from 5 → 10. The harness grew 26 → 31 tests (~170s runtime), and
+    # Ubuntu setup overhead (OpenSSL 3.3 cache restore, cargo cache, rust
+    # toolchain) is ~130s, so the previous 5-min cap was clipping clean runs
+    # on Ubuntu (macOS finishes in ~3m47s comfortably).
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
