@@ -4,6 +4,34 @@ This file tracks step-by-step status of the items defined in `REMEDIATION_PLAN.m
 
 ---
 
+### 2026-05-13 — Week 4+ #1a stage 4: five-agent fan-out (CI / docs / replay / frontend / parity)
+
+Stage 4 of #1a was scoped as five independent slices and dispatched to five worktree-isolated agents running in parallel. Each landed as its own commit on `main` after a local merge + regression-suite verification.
+
+| Slice | Commit | What |
+|---|---|---|
+| 4b (CI matrix) | `4507973` | New `c-traffic-entropy` job (matrix: ubuntu + macOS) builds with `ENABLE_TRAFFIC_ENTROPY=1`, asserts the binary string flip, runs `tests/33`. Reuses the `c` job's OpenSSL 3.3 cache; runs in parallel with `c`/`rust`. `tests/33` pins the CI job name. |
+| 4e (docs) | `abe0d0e` | README "Scope of the C implementation" split per build variant; new "Build variants" subsection. `tests/36_readme_traffic_entropy_pinning.sh` pins the documented qualifier. |
+| 4a (replay) | `a1cf483` | `handle_unlock` snapshots `state->stream_config` under the lock, hands the heap-owned copy to a detached pthread that calls `msm_add_stream` per entry. All inside `#ifdef ENABLE_TRAFFIC_ENTROPY`; default build untouched. `tests/34_c_auto_replay.sh` static-checks the gate + call-site ordering, then rebuilds with the flag; integration SKIPs without yt-dlp. |
+| 4d (frontend) | `f8c2696` | `frontend/app.js` whitelist for the five recognised statuses (Connecting/Active/Failed/Stopped/Disabled) replaces the previous `${s.status.toLowerCase()}` class injection; `frames_captured` shown next to each entry with type-guarded rendering. `tests/35_frontend_stream_states.sh` pins the renderer. |
+| 4c (parity variant) | `aa33297` | `parity/parity_test.py` accepts `BUILD_VARIANT=default|traffic_entropy` via env var + `--variant` CLI flag; `parity/cases.json`'s `expected_diff` becomes `{variant: bool}` (scalar still supported for back-compat). `build_info.normalize_drop` widened to include `"build"` so the per-impl tag drops out of compare. Under the variant `streams_status` + `build_info` cases now both PASS (no longer KNOWN-DIVERGENT). |
+
+**Test count progression** (default `bash tests/run.sh`): 33 → 34 (E added `tests/36`) → 34 (A added `tests/34`, replaced the slot before D's rename to `tests/35`) → 35 (D's `tests/35` after rename) → 35 (C did not add a test script). Final state: **35 PASS + 1 SKIP** locally (the SKIP is `tests/34_c_auto_replay.sh`'s integration step, which requires yt-dlp; static + flagged-build checks all pass).
+
+**Collisions handled at merge**
+
+- Two agents (A, D) independently claimed `tests/34_*.sh` despite the brief explicitly steering D to `tests/35` on conflict. D's file was renamed in-place during merge; the script's own `# 34 — …` header line was bumped to `# 35 — …` for consistency.
+- Agent C's diff against the freshly-committed B/E/A/D state appeared as a large negative delta on those files (it was branched from the pre-stage-4 main). Resolved by checking out only C's actual additions (`parity/*`, `tests/60_parity_smoke.sh`) rather than the full branch diff.
+- This summary entry is being written *after* all five commits to avoid serialising the agents on a shared file (`REMEDIATION_PROGRESS.md`); each agent's per-slice notes can be reconstructed from the commit message.
+
+**What's still pending** (post-stage-4)
+
+- Default-flip: promoting `ENABLE_TRAFFIC_ENTROPY` from opt-in to default. Blocked on real-world soak of the flag-on build (no local yt-dlp install available); CI matrix in 4b will surface compile-time regressions in the meantime.
+- Async `msm_add_stream`: today's path blocks a worker thread for ~2–5 s per stream while yt-dlp resolves. A future enhancement would split into "reserve slot synchronously + spawn pthread for resolve + start" so POST responds immediately with `CONNECTING`. Documented in the stage 3 entry; not pulled into stage 4 to keep scope bounded.
+- Parity-variant CI: the new BUILD_VARIANT axis works locally but isn't wired into a CI job. Adding it requires deciding whether to extend the existing `c-traffic-entropy` job with a parity step, or split into a separate `parity-traffic-entropy` job.
+
+---
+
 ## Environment check (2026-05-13)
 
 | Check | Result |
