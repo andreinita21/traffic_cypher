@@ -205,3 +205,27 @@ Moved `traffic_cypher_benchmark_report.docx` and `traffic_cypher_benchmark_repor
 - Week 4+: #5c DOM construction pass complete; #10d **complete** (Rust + C); #1a Full C MultiStreamManager port deferred (~2 weeks of focused work per the plan).
 - Regression harness: 26 → **31** tests, all green.
 - Five commits pushed this session: `8b0ea7b` (build hardening), `827394b` (#5c DOM), `903c484` (Rust fuzz), `6effb7a` (C fuzz), and the upcoming reports commit.
+
+---
+
+### 2026-05-13 — Routine re-entry / verification pass
+
+Routine fired again on the same day after the previous run had already brought the project to its "Final state at end of run" above. No actionable items remained on `REMEDIATION_PLAN.md` (`Week 0`–`Week 3` complete; all 9 "What does not fit" backlog items complete; `Week 4+` #5c + #10d complete; only #1a — Full C `MultiStreamManager` port, ~2 weeks of focused C work per the plan — is intentionally deferred).
+
+**Re-verification run** (this routine, no code changes):
+
+| Check | Result |
+|------|--------|
+| `git status` | clean working tree |
+| `cargo build --release --bins --locked` | OK |
+| `cargo clippy --all-targets --locked -- -D warnings` | OK |
+| `make -C traffic_cypher_in_C clean && make` | OK |
+| `bash tests/run.sh` | **31/31 PASS** |
+
+**Why no new commits this run.** Per the routine's "be precise and conservative" rule, and the plan's explicit deferral notes, the remaining candidates are all out of scope for an unattended pass:
+
+- **#1a (Full C `MultiStreamManager` port).** The plan literally says "~2 weeks of focused C work"; not a one-routine job.
+- **CI wiring for fuzz harnesses.** Documented as "a separate plumbing PR" — Rust side needs nightly + `cargo-fuzz` install (fragile in CI), and the C side needs a corpus-cache strategy. The scaffolding + `tests/26_…` and `tests/27_…` already pin scaffolding regressions.
+- **Promote `cargo fmt --check` from informational to hard gate.** Local `cargo fmt --check` currently emits ~1.3k diff lines (legacy formatting baseline). That's a dedicated formatting PR, not a remediation step.
+
+Nothing was committed, nothing was pushed, no destructive operations were taken.
