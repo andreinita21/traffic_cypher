@@ -2,8 +2,9 @@ use crate::frame_sampler::Frame;
 use crate::stream_ingestion;
 use crate::frame_sampler;
 use anyhow::{Result, Context, bail};
-use tokio::sync::mpsc;
 use rand::Rng;
+use rand::RngCore;
+use tokio::sync::mpsc;
 use tracing::{info, warn, error};
 use std::collections::HashMap;
 
@@ -13,6 +14,7 @@ pub struct StreamStatus {
     pub label: String,
     pub status: StreamState,
     pub frames_captured: u64,
+    pub kind: SlotKind,
 }
 
 #[derive(Clone, Debug, serde::Serialize, PartialEq)]
@@ -21,6 +23,59 @@ pub enum StreamState {
     Active,
     Failed,
     Stopped,
+}
+
+/// Constant-time comparison of two 64-character lowercase-hex strings.
+/// Defeats timing side-channels on the phone upload-token check. Returns
+/// `true` iff both are 64 chars long and match.
+fn ct_eq_hex64(a: &str, b: &str) -> bool {
+    let aa = a.as_bytes();
+    let bb = b.as_bytes();
+    if aa.len() != 64 || bb.len() != 64 {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for i in 0..64 {
+        diff |= aa[i] ^ bb[i];
+    }
+    // The volatile read shape that std uses internally for similar checks
+    // isn't expressible cleanly in safe Rust; the loop above is straight-line
+    // and the result depends on the full byte sweep, so LLVM has no excuse
+    // to insert an early exit.
+    diff == 0
+}
+
+/// Errors from `push_phone_frame`. Distinguishes "not your slot" from
+/// "wrong token" because the HTTP layer maps them to 400 vs 403.
+#[derive(Debug)]
+pub enum PhoneFrameError {
+    NotFound,
+    TokenMismatch,
+    RingFull,
+}
+
+impl std::fmt::Display for PhoneFrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PhoneFrameError::NotFound => write!(f, "slot not found or not a phone slot"),
+            PhoneFrameError::TokenMismatch => write!(f, "upload token mismatch"),
+            PhoneFrameError::RingFull => write!(f, "frame ring at capacity"),
+        }
+    }
+}
+
+impl std::error::Error for PhoneFrameError {}
+
+/// Distinguishes how a slot's frames arrive. Mirrors the C `slot_kind_t`
+/// enum. `Ffmpeg` slots have a tokio task pulling frames from a yt-dlp +
+/// ffmpeg pipeline; `Phone` slots receive frames via HTTP POST from
+/// `/api/streams/phone/{index}/frame` authenticated by a per-slot upload
+/// token. NEXT_STEPS.md Phase B.
+#[derive(Clone, Debug, serde::Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SlotKind {
+    Ffmpeg,
+    Phone,
 }
 
 pub struct MultiStreamManager {
@@ -36,6 +91,11 @@ struct StreamHandle {
     frames_captured: u64,
     cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
     child: Option<tokio::process::Child>,
+    kind: SlotKind,
+    /// Only set for `SlotKind::Phone` — 32-byte random secret that the phone
+    /// client presents (as 64-char lowercase hex) in `X-Upload-Token` on
+    /// every frame POST. Wiped on remove. Not exposed via `get_statuses()`.
+    upload_token: Option<[u8; 32]>,
 }
 
 impl Default for MultiStreamManager {
@@ -78,6 +138,8 @@ impl MultiStreamManager {
             frames_captured: 0,
             cancel_tx: None,
             child: None,
+            kind: SlotKind::Ffmpeg,
+            upload_token: None,
         });
 
         // 1. Resolve the YouTube URL into a direct stream URL
@@ -202,6 +264,7 @@ impl MultiStreamManager {
                 label: h.label.clone(),
                 status: h.status.clone(),
                 frames_captured: h.frames_captured,
+                kind: h.kind.clone(),
             })
             .collect()
     }
@@ -245,6 +308,76 @@ impl MultiStreamManager {
         by_stream
             .remove(&chosen_index)
             .and_then(|mut frames| frames.pop())
+    }
+
+    /// Register a phone-camera slot — the alternative to ffmpeg/yt-dlp
+    /// ingestion. No tokio task is spawned; frames will arrive via
+    /// `push_phone_frame` from the HTTP layer. Generates a 32-byte random
+    /// upload token, returns `(slot_index, hex_token)`. NEXT_STEPS.md Phase B.
+    pub fn register_phone(&mut self, label: String) -> (usize, String) {
+        let mut token = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut token);
+        let token_hex = hex::encode(token);
+        let index = self.streams.len();
+        info!("Registering phone slot #{} '{}'", index, label);
+        self.streams.push(StreamHandle {
+            url: format!("phone://{}", label),
+            label,
+            status: StreamState::Connecting,
+            frames_captured: 0,
+            cancel_tx: None,
+            child: None,
+            kind: SlotKind::Phone,
+            upload_token: Some(token),
+        });
+        (index, token_hex)
+    }
+
+    /// Push one frame into the shared channel for a phone slot. Validates
+    /// the slot index, slot kind, and constant-time-compares the supplied
+    /// hex token against the slot's upload token. First successful push
+    /// transitions the slot CONNECTING → ACTIVE.
+    ///
+    /// Returns:
+    ///   `Ok(())` on success.
+    ///   `Err(PhoneFrameError::NotFound)` if `index` is out of range or the
+    ///       slot is not a SlotKind::Phone.
+    ///   `Err(PhoneFrameError::TokenMismatch)` on token mismatch — caller
+    ///       should respond 403.
+    ///   `Err(PhoneFrameError::RingFull)` if the bounded channel is at
+    ///       capacity — caller can respond 503 and let the phone retry.
+    pub async fn push_phone_frame(
+        &mut self,
+        index: usize,
+        token_hex: &str,
+        frame: Frame,
+    ) -> std::result::Result<(), PhoneFrameError> {
+        if index >= self.streams.len() {
+            return Err(PhoneFrameError::NotFound);
+        }
+        let slot = &self.streams[index];
+        if slot.kind != SlotKind::Phone {
+            return Err(PhoneFrameError::NotFound);
+        }
+        let expected = match slot.upload_token {
+            Some(t) => t,
+            None => return Err(PhoneFrameError::NotFound),
+        };
+        let expected_hex = hex::encode(expected);
+        if !ct_eq_hex64(token_hex, &expected_hex) {
+            return Err(PhoneFrameError::TokenMismatch);
+        }
+        // CONNECTING → ACTIVE on the first successful frame.
+        let slot_mut = &mut self.streams[index];
+        if slot_mut.status == StreamState::Connecting {
+            slot_mut.status = StreamState::Active;
+        }
+        // Non-blocking send so a full ring doesn't deadlock under the
+        // manager mutex. The phone client retries on the next tick.
+        self.frame_tx
+            .try_send((index, frame))
+            .map_err(|_| PhoneFrameError::RingFull)?;
+        Ok(())
     }
 
     /// Return the number of streams (including stopped ones).

@@ -1,4 +1,5 @@
 use axum::{
+    body::Bytes,
     extract::State,
     extract::Path,
     http::{HeaderMap, StatusCode},
@@ -24,12 +25,17 @@ use crate::{vault, totp, password_gen, key_rotation, multi_stream};
 const INDEX_HTML: &str = include_str!("../../../frontend/index.html");
 const APP_JS: &str = include_str!("../../../frontend/app.js");
 const STYLE_CSS: &str = include_str!("../../../frontend/style.css");
+// Phone-camera capture page (NEXT_STEPS.md Phase B). Single self-contained
+// file with inline CSS/JS; served unauthenticated so the phone client can
+// load it directly from any IP/host the daemon is reachable on.
+const PHONE_HTML: &str = include_str!("../../../frontend/phone.html");
 
 pub fn static_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(serve_index))
         .route("/app.js", get(serve_js))
         .route("/style.css", get(serve_css))
+        .route("/phone.html", get(serve_phone))
 }
 
 async fn serve_index() -> Html<&'static str> {
@@ -52,6 +58,10 @@ async fn serve_css() -> Response {
         STYLE_CSS,
     )
         .into_response()
+}
+
+async fn serve_phone() -> Html<&'static str> {
+    Html(PHONE_HTML)
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +96,12 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/streams", post(add_stream))
         .route("/streams/{index}", delete(remove_stream))
         .route("/streams/{index}", put(update_stream))
+        // Phone-camera entropy endpoints (NEXT_STEPS.md Phase B).
+        // No Bearer auth on register/frame — the per-slot upload token (returned
+        // by /streams/phone, presented in X-Upload-Token on each frame POST)
+        // is the auth boundary. Trust model documented in multi_stream.rs.
+        .route("/streams/phone", post(register_phone))
+        .route("/streams/phone/{index}/frame", post(push_phone_frame))
         // Status & entropy
         .route("/status", get(get_status))
         .route("/entropy-snapshot", get(entropy_snapshot))
@@ -877,6 +893,133 @@ async fn update_stream(
             (StatusCode::OK, Json(serde_json::json!({"status": "updated"}))).into_response()
         }
         Err(e) => err_json(StatusCode::BAD_REQUEST, &format!("{}", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phone-camera entropy handlers (NEXT_STEPS.md Phase B)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RegisterPhoneRequest {
+    label: String,
+}
+
+/// Reserve a phone-typed MSM slot. No Bearer auth — the per-slot upload token
+/// returned here is the auth boundary on subsequent frame POSTs. Trust model
+/// documented in multi_stream.rs::register_phone.
+async fn register_phone(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegisterPhoneRequest>,
+) -> Response {
+    if req.label.trim().is_empty() {
+        return err_json(StatusCode::BAD_REQUEST, "Missing or empty label");
+    }
+    if req.label.len() > 64 {
+        return err_json(StatusCode::BAD_REQUEST, "label must be ≤ 64 characters");
+    }
+    let mut mgr = state.stream_manager.lock().await;
+    let (index, token_hex) = mgr.register_phone(req.label);
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"index": index, "upload_token": token_hex})),
+    )
+        .into_response()
+}
+
+/// Parse a P6 PPM header from a memory buffer. Returns `(width, height,
+/// pixel_offset)` on success. Mirrors the C `parse_ppm_header` so frames
+/// produced by the same `frontend/phone.html` work against both daemons.
+fn parse_ppm_header(buf: &[u8]) -> std::result::Result<(u32, u32, usize), &'static str> {
+    if buf.len() < 11 || &buf[..2] != b"P6" {
+        return Err("body must start with P6");
+    }
+    let mut i = 2;
+    let mut tokens: [u32; 3] = [0; 3];
+    for tok in &mut tokens {
+        // skip whitespace
+        while i < buf.len() && matches!(buf[i], b' ' | b'\n' | b'\r' | b'\t') {
+            i += 1;
+        }
+        // skip comment
+        if i < buf.len() && buf[i] == b'#' {
+            while i < buf.len() && buf[i] != b'\n' {
+                i += 1;
+            }
+            // re-enter whitespace skip
+            while i < buf.len() && matches!(buf[i], b' ' | b'\n' | b'\r' | b'\t') {
+                i += 1;
+            }
+        }
+        let mut v: u32 = 0;
+        let mut seen_digit = false;
+        while i < buf.len() && buf[i].is_ascii_digit() {
+            v = v.saturating_mul(10).saturating_add(u32::from(buf[i] - b'0'));
+            seen_digit = true;
+            if v > 65535 {
+                return Err("PPM dimension out of range");
+            }
+            i += 1;
+        }
+        if !seen_digit {
+            return Err("malformed PPM header");
+        }
+        *tok = v;
+    }
+    if i >= buf.len() {
+        return Err("missing pixel data");
+    }
+    i += 1; // one whitespace byte after maxval
+    Ok((tokens[0], tokens[1], i))
+}
+
+/// POST /api/streams/phone/{index}/frame
+///
+/// Body: raw P6 PPM bytes. Headers: `X-Upload-Token: <64-char hex>`.
+/// On success returns 204; on token mismatch returns 403; on bad slot
+/// returns 400; on ring full returns 503.
+async fn push_phone_frame(
+    State(state): State<Arc<AppState>>,
+    Path(index): Path<usize>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if body.is_empty() {
+        return err_json(StatusCode::BAD_REQUEST, "empty body");
+    }
+    let token = match headers.get("x-upload-token").and_then(|v| v.to_str().ok()) {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => return err_json(StatusCode::UNAUTHORIZED, "X-Upload-Token header required"),
+    };
+    let (w, h, pixel_off) = match parse_ppm_header(&body) {
+        Ok(t) => t,
+        Err(e) => return err_json(StatusCode::UNSUPPORTED_MEDIA_TYPE, e),
+    };
+    let pixel_data = body[pixel_off..].to_vec();
+    if pixel_data.len() != (w as usize) * (h as usize) * 3 {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "PPM pixel data length does not match width*height*3",
+        );
+    }
+    let frame = crate::frame_sampler::Frame {
+        width: w,
+        height: h,
+        data: pixel_data,
+        sequence: 0,
+    };
+    let mut mgr = state.stream_manager.lock().await;
+    match mgr.push_phone_frame(index, &token, frame).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(multi_stream::PhoneFrameError::TokenMismatch) => {
+            err_json(StatusCode::FORBIDDEN, "upload token mismatch")
+        }
+        Err(multi_stream::PhoneFrameError::RingFull) => {
+            err_json(StatusCode::SERVICE_UNAVAILABLE, "frame ring at capacity")
+        }
+        Err(multi_stream::PhoneFrameError::NotFound) => {
+            err_json(StatusCode::BAD_REQUEST, "invalid slot or not a phone slot")
+        }
     }
 }
 

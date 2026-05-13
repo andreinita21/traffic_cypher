@@ -42,11 +42,11 @@ if curl -s -m 1 "http://127.0.0.1:9876/api/auth/status" >/dev/null 2>&1; then
     fail "Port 9876 is already in use; aborting"
 fi
 
-# Limit to 4 anchor cases so smoke stays under 30 s wall time on a 2024
+# Limit to 5 anchor cases so smoke stays under 30 s wall time on a 2024
 # laptop. Per-case wall time is dominated by 2× PM boot + 1 s port drain
 # per impl (~3-4 s/case). traffic_entropy variant adds ~10-20 s for the
 # tmp `make` invocation up front.
-if ! python3 "$REPO_ROOT/parity/parity_test.py" --max-cases 4; then
+if ! python3 "$REPO_ROOT/parity/parity_test.py" --max-cases 5; then
     fail "parity harness reported failures (BUILD_VARIANT=$BUILD_VARIANT)"
 fi
-pass "parity harness: 4 anchor cases agree (or are expected_diff) [BUILD_VARIANT=$BUILD_VARIANT]"
+pass "parity harness: 5 anchor cases agree (or are expected_diff) [BUILD_VARIANT=$BUILD_VARIANT]"

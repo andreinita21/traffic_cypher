@@ -638,6 +638,16 @@ def main() -> int:
             err(f"no cases matched names: {sorted(wanted)}")
             return 1
 
+    # Filter cases whose `variants` whitelist excludes the active build
+    # variant. Cases without a `variants` field run in every variant
+    # (back-compat with the original schema). `variants` exists for new
+    # endpoints whose route doesn't exist in the default build at all
+    # (e.g. /api/streams/phone — added under ENABLE_TRAFFIC_ENTROPY).
+    cases = [
+        c for c in cases
+        if "variants" not in c or variant in c["variants"]
+    ]
+
     if args.max_cases is not None:
         cases = cases[: args.max_cases]
 

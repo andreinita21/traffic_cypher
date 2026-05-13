@@ -4,6 +4,52 @@ This file tracks step-by-step status of the items defined in `REMEDIATION_PLAN.m
 
 ---
 
+### 2026-05-13 — Phase B.3 (NEXT_STEPS.md): Rust mirror of phone endpoints + parity case
+
+The C-side phone-camera path landed in commit `a7975cd`; this commit brings the Rust side to the same surface so the operator gets identical behaviour from both binaries, and adds a parity test that pins the two impls together going forward.
+
+**Rust mirror — `traffic_cypher_in_Rust/src/multi_stream.rs`**
+
+- New `SlotKind` enum (`Ffmpeg` / `Phone`); `kind` field added to `StreamStatus` (serialised lowercase: `"ffmpeg"` / `"phone"` — matches the C build's JSON shape).
+- `StreamHandle` gains `kind` + `upload_token: Option<[u8; 32]>`. The existing `cancel_tx` and `child` fields stay `None` for phone slots, which is why `remove_stream` Just Works for them with zero changes — the existing `if let Some(...)` branches no-op.
+- `register_phone(label) -> (usize, String)` generates 32 random bytes via `rand::thread_rng().fill_bytes()`, hex-encodes them, pushes a Connecting/Phone handle, returns the slot index and the hex token.
+- `push_phone_frame(index, token_hex, frame) -> Result<(), PhoneFrameError>` validates slot bounds, slot kind, then constant-time-compares the supplied hex against the slot's hex-encoded token via a private `ct_eq_hex64()` helper (a straight-line XOR-accumulator loop, mirroring the C side). On match: transitions Connecting → Active, then `try_send` (non-blocking — avoids deadlock holding the manager mutex over an `await` if the bounded ring is full).
+- New `PhoneFrameError` enum (`NotFound`/`TokenMismatch`/`RingFull`) implements `std::error::Error` so handlers can map it to the right HTTP status.
+
+**Rust HTTP layer — `traffic_cypher_in_Rust/src/web/routes.rs`**
+
+- `PHONE_HTML = include_str!("../../../frontend/phone.html")` mirrors the existing `INDEX_HTML` / `APP_JS` / `STYLE_CSS` pattern; `serve_phone` route under `static_routes()`.
+- New api routes: `POST /api/streams/phone` → `register_phone` (no Bearer auth — the upload token returned here is the auth boundary on subsequent frame POSTs), `POST /api/streams/phone/{index}/frame` → `push_phone_frame`.
+- `parse_ppm_header(&[u8])` ported from the C version, including the comment-skip + 65535 dimension cap. Returns `(width, height, pixel_offset)`. `clippy::needless_range_loop` resolved via `for tok in &mut tokens` instead of indexed `for t in 0..3`.
+- HTTP handlers map `PhoneFrameError::TokenMismatch` → 403, `RingFull` → 503, `NotFound` → 400, success → 204. PPM header errors → 415; size mismatch → 400. Empty body → 400.
+
+**Parity — `parity/cases.json`**
+
+- New `phone_register_and_status` case: POSTs `/api/streams/phone`, unlocks, GETs `/api/streams`, asserts both impls return the same shape. `normalize_drop` strips the random `upload_token` plus the usual session-token / entry_count / entropy_source fields.
+- New schema field `variants` (optional, array of variant names). When present, the case only runs under the matching `BUILD_VARIANT`. Cases without `variants` run in all variants (back-compat). The phone case uses `["traffic_entropy"]` because the default C build has no route — running it in `default` mode would 404 on the register POST and the harness's `expect_status: 202` would fail the case before the diff-with-Rust comparison.
+- `parity/parity_test.py` filters by `variants` after the case-name filter, before `max_cases` truncation.
+- `tests/60_parity_smoke.sh` bumps `--max-cases 4` → `5` so the new case actually runs under `BUILD_VARIANT=traffic_entropy`.
+
+**Tests — `tests/38_phone_camera_endpoint.sh`**
+
+Existing C-side block (11 assertions) unchanged. Appended a Rust-side block (8 assertions) at the bottom: drains port 9876 between binaries, boots `target/release/pm`, exercises `/phone.html`, register, 3 synthetic frame POSTs, `kind:"phone"` + Active in `/api/streams`, wrong-token → 403. Skip path if the Rust binary isn't built yet (`tests/00_build_rust.sh` produces it).
+
+**Verification**
+
+- `cd traffic_cypher_in_Rust && cargo build --release --bins --locked` — clean.
+- `cargo clippy --all-targets --locked -- -D warnings` — clean (1 lint fix: see above).
+- `cargo test --locked -- --test-threads=1` — **8/8 PASS**.
+- `bash tests/38_phone_camera_endpoint.sh` — **19/19 PASS** (was 11 — added 8 Rust assertions).
+- `bash tests/run.sh` — **37 PASS + 1 SKIP** in 119 s (test count unchanged; tests/38 grew internally).
+- `bash tests/60_parity_smoke.sh` (default mode) — 4 cases run (phone case filtered out by variant), 3 PASS + 1 KNOWN-DIVERGENT (the pre-existing `build_info`).
+- `BUILD_VARIANT=traffic_entropy bash tests/60_parity_smoke.sh` — **5/5 PASS, 0 KNOWN-DIVERGENT, 0 FAIL** in 5.7 s. Phone register + status match exactly between C and Rust.
+
+**Why `try_send` not `send().await` for phone frames**
+
+The phone frame handler in Rust holds the tokio manager mutex while calling `push_phone_frame`. If the bounded channel were full, `send().await` would suspend while still holding the lock — blocking every other operation on the manager (list_streams, add_stream, remove_stream) until a consumer drained an item. `try_send` returns `Err(RingFull)` immediately on saturation; the handler maps that to 503 and the phone client retries on its next 1-second tick. The bounded channel's whole purpose (backpressure) is preserved without the deadlock surface.
+
+---
+
 ### 2026-05-13 — Phase B (NEXT_STEPS.md): phone-camera entropy source (C side)
 
 Second slice of `NEXT_STEPS.md`. Introduces a brand-new entropy source — the phone's own camera, accessed via a standalone capture page served by the daemon — alongside the existing YouTube/yt-dlp path. Both kinds of slots coexist in the same MSM; OS fallback still kicks in when neither is active. Behind `ENABLE_TRAFFIC_ENTROPY` like the rest of stage 3+.

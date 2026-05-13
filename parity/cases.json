@@ -87,6 +87,23 @@
                 {"method": "GET", "path": "/api/build/info"}
             ],
             "normalize_drop": ["build"]
+        },
+        {
+            "name": "phone_register_and_status",
+            "variants": ["traffic_entropy"],
+            "reason": "POST /api/streams/phone is only routed when ENABLE_TRAFFIC_ENTROPY is defined. Skipped in BUILD_VARIANT=default because C has no route there (would 404 on the register POST). Under traffic_entropy the C and Rust impls return matching shapes: register → 202 {index, upload_token}; /api/streams shows kind:phone with Connecting status. Tokens are dropped via normalize_drop (random per call).",
+            "requests": [
+                {"method": "POST", "path": "/api/streams/phone",
+                 "body": {"label": "parity-phone"},
+                 "expect_status": 202},
+                {"method": "POST", "path": "/api/auth/unlock",
+                 "body": {"master_password": "testpass"},
+                 "save_token_from": "token"},
+                {"method": "GET",  "path": "/api/streams"}
+            ],
+            "normalize_drop": [
+                "upload_token", "token", "session_token", "entry_count", "entropy_source"
+            ]
         }
     ]
 }
