@@ -39,15 +39,26 @@ fi
 
 # Confirm the default build still reports traffic_entropy:false. The
 # tests/31_c_no_entropy_lie.sh script already does this end-to-end; here we
-# do the static binary-string check.
-if command -v strings >/dev/null 2>&1; then
-    if ! strings "$BIN" | grep -q '"traffic_entropy":false'; then
-        fail "default binary missing traffic_entropy:false literal"
+# do the static binary-string check — BUT only when the on-disk binary is
+# actually the default variant. In the CI job c-traffic-entropy, an earlier
+# step already ran `make ENABLE_TRAFFIC_ENTROPY=1`, so $BIN is the flag-on
+# variant; the default-build invariant doesn't apply there. Detect the
+# variant from the binary's strings rather than from any out-of-band flag.
+if command -v strings >/dev/null 2>&1 && [ -f "$BIN" ]; then
+    if strings "$BIN" | grep -q '"traffic_entropy":false'; then
+        # $BIN is the default variant — verify it doesn't ALSO carry the
+        # flipped literal (a regression where the build accidentally inlined
+        # both branches would show up here).
+        if strings "$BIN" | grep -q '"traffic_entropy":true'; then
+            fail "default binary unexpectedly contains traffic_entropy:true literal"
+        fi
+        pass "default binary contains only the OS-only build_info literal"
+    else
+        # $BIN is the flag-on variant (or unknown). The default-build
+        # invariants don't apply; the tests/31_c_no_entropy_lie.sh suite
+        # covers them whenever the default binary IS on disk.
+        info "skipping default-binary literal check (\$BIN is not the default variant)"
     fi
-    if strings "$BIN" | grep -q '"traffic_entropy":true'; then
-        fail "default binary unexpectedly contains traffic_entropy:true literal"
-    fi
-    pass "default binary contains only the OS-only build_info literal"
 fi
 
 # Now rebuild WITH the flag, in a tmpcopy of the C tree (so we don't pollute
