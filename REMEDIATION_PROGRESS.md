@@ -208,6 +208,49 @@ Moved `traffic_cypher_benchmark_report.docx` and `traffic_cypher_benchmark_repor
 
 ---
 
+### 2026-05-13 — Week 4+ #1a stage 3: `web_server` handlers + `/api/build/info` flip behind `ENABLE_TRAFFIC_ENTROPY`
+
+Third slice of the C `MultiStreamManager` port. Wires the producer side of the pipeline (stream HTTP handlers) into the manager and flips the build descriptor — gated behind the build-time flag the plan calls for at `REMEDIATION_PLAN.md:349`. Default `make` build is untouched: tests/run.sh stays at 32 → **33** PASS with no regression in any existing test.
+
+**Files**
+- `traffic_cypher_in_C/Makefile` — `ENABLE_TRAFFIC_ENTROPY=1` toggle adds `-DENABLE_TRAFFIC_ENTROPY` to `CFLAGS`. Default off.
+- `traffic_cypher_in_C/src_c/web_server.c`:
+  - `handle_add_stream` — under the flag, routes the request through `msm_add_stream` (which resolves URL via yt-dlp + spawns ffmpeg + the per-stream forwarder pthread). On success responds `200 {"status":"added","index":N}`. On any failure (resolve / capture / OOM) responds `500` with a diagnostic message. The configuration is still persisted alongside the MSM registration so a restart with the flag set still remembers the operator's stream list. Without the flag the body is the original 501 reply verbatim.
+  - `handle_list_streams` — under the flag, reads live `msm_get_statuses()` and serialises `{url,label,status,frames_captured}` for each active slot. New helper `stream_state_str()` (also gated) maps the enum to the four Rust-parity strings (`"Connecting"`, `"Active"`, `"Failed"`, `"Stopped"`). Without the flag the body is the original "Disabled / OS entropy only in C build" list verbatim.
+  - `handle_remove_stream` — under the flag, calls `msm_remove_stream` *before* the existing config-shift logic (so the forwarder pthread + ffmpeg child are torn down before the operator loses sight of which index they removed).
+  - `handle_build_info` — under the flag returns `{"build":"c","traffic_entropy":true}` (no banner note); without the flag stays at the existing `{"build":"c","traffic_entropy":false,"note":"OS entropy only; see README"}`.
+- `tests/33_traffic_entropy_build.sh` (new) — regression for the toggle. Static checks (Makefile + web_server.c have the gate; key_rotation.c does NOT — stage 2 daemon works in both modes), default-binary literal check, then an out-of-tree rebuild with the flag set, followed by an integration check against the rebuilt binary: `/api/build/info` returns `traffic_entropy:true`, `/api/streams` returns `[]` on a fresh manager, and POST `/api/streams` with a bogus URL returns 500 (resolve failed) instead of the old 501 ("Not Implemented"). Out-of-tree build lives under a `mktemp` workdir + `$WORK/frontend` symlink so the original `$C` build artifacts are untouched.
+
+**Build behaviour matrix**
+
+| Endpoint | Default build | `ENABLE_TRAFFIC_ENTROPY=1` build |
+|---|---|---|
+| `GET /api/build/info` | `{"build":"c","traffic_entropy":false,"note":"OS entropy only; see README"}` | `{"build":"c","traffic_entropy":true}` |
+| `GET /api/streams` (no streams added) | `[]` | `[]` |
+| `POST /api/streams` | `501 Not Implemented` (config persisted) | `200 {"status":"added","index":N}` on success, `500` on resolve/capture failure |
+| `DELETE /api/streams/{i}` | clears config only | calls `msm_remove_stream` then clears config |
+
+**Verification**
+- `make -C traffic_cypher_in_C clean && make` — clean. Default binary unchanged.
+- `make -C traffic_cypher_in_C clean && make ENABLE_TRAFFIC_ENTROPY=1` — clean. `strings traffic-cypher-pm | grep traffic_entropy` shows only the `true` literal (and no `false`).
+- `bash tests/run.sh` — **33/33 PASS** in 74s on Apple Silicon (was 32; +1 new opt-in build test).
+  - `tests/31_c_no_entropy_lie.sh` (3-second daemon soak on the default binary) — still passes; the default build path is unchanged.
+  - `tests/33_traffic_entropy_build.sh` (out-of-tree rebuild + integration) — passes 7/7 assertions including `traffic_entropy:true` flip, `[]` initial list, and the no-longer-501 POST.
+  - `tests/60_parity_smoke.sh` — `expected_diff` flags on `streams_status` + `build_info` still report `true` (correct: this commit doesn't yet land the parity flip; that's stage 4).
+- `cargo clippy --all-targets --locked -- -D warnings` — clean (no Rust files touched).
+
+**Caveat: `msm_add_stream` is synchronous and can block a worker for seconds**
+
+`resolve_stream_url` (yt-dlp) typically takes ~2-5 s on a real YouTube livestream; `frame_capture_start` adds another second for ffmpeg's first frame. With the 4-thread worker pool (`#7b`) added in `3183b27`, this means a single add-stream request can saturate ~25% of capacity until it completes. Acceptable for a single-user admin endpoint, but a future enhancement could split add_stream into a synchronous "reserve slot" + asynchronous "resolve + start" pthread so the HTTP response returns immediately with a `CONNECTING` status the operator can poll. Not done here to keep the diff focused.
+
+**What stage 4 still owes**
+- Flip `parity/anchor_cases.json` `expected_diff:false` for `streams_status` and `build_info` *only* when the parity harness exercises the `ENABLE_TRAFFIC_ENTROPY=1` C build. The current harness runs the default-build binary, so flipping unconditionally would break it — needs a `BUILD_VARIANT` axis in the parity runner.
+- Rewrite `tests/31_c_no_entropy_lie.sh` once the flag flips from "opt-in" to "default" — the test's "the C build lies about entropy" invariant becomes "the C build accurately reports `has_traffic_entropy` based on whether frames actually flowed".
+- Auto-replay persisted stream config on unlock so the user's saved streams come back on PM restart. Currently each PM start needs the user to re-POST every stream.
+- CI wiring: a separate job that runs `make ENABLE_TRAFFIC_ENTROPY=1 && bash tests/run.sh` (or just `tests/33_…`) to keep the flag-on build green. Held back because the existing C job already builds OpenSSL 3.3 from source on Ubuntu (~2 min) and the duplicated build would push tests well past the 10-min cap we just set.
+
+---
+
 ### 2026-05-13 — Week 4+ #1a stage 2: `rotation_daemon` rewrite (consumer side)
 
 Second slice of the C `MultiStreamManager` port. Rewires `rotation_daemon` in `traffic_cypher_in_C/src_c/key_rotation.c` so that, once a second, it first attempts `msm_pick_random_frame(state->msm, ...)`. On hit it runs the full Rust-parity pipeline — `extract_entropy` (full-frame SHA-256 + delta-from-previous + 8×8 block hashes) → `entropy_pool_push` → `entropy_pool_digest` → `mix_entropy` → `derive_key` — and sets `state->has_traffic_entropy = 1` (monotonic, matching `key_rotation.rs:138`). On miss it falls back to the pre-#1a `RAND_bytes`-only path verbatim.

@@ -1110,6 +1110,40 @@ static void handle_add_stream(int fd, app_state_t *state, http_request_t *req) {
         return;
     }
 
+#ifdef ENABLE_TRAFFIC_ENTROPY
+    /* Route through the multi_stream manager: resolves the URL via yt-dlp,
+     * starts ffmpeg, spawns the forwarder thread that pushes captured frames
+     * into the ring the rotation_daemon consumes from. Synchronous: blocks
+     * the worker until ffmpeg is up (typically a few seconds). */
+    int msm_index = -1;
+    if (state->msm) {
+        msm_index = msm_add_stream(state->msm, url, label);
+    }
+    if (msm_index < 0) {
+        send_error(fd, 500, "Internal Server Error",
+                   "stream resolve or capture-start failed; "
+                   "check that yt-dlp + ffmpeg are installed");
+        free(url); free(label);
+        return;
+    }
+
+    /* Persist alongside the MSM registration so the config survives restart. */
+    pthread_mutex_lock(&state->lock);
+    if (state->stream_config.stream_count < VAULT_MAX_STREAMS) {
+        stream_entry_t *se = &state->stream_config.streams[state->stream_config.stream_count];
+        memset(se, 0, sizeof(*se));
+        strncpy(se->url, url, VAULT_FIELD_MAX - 1);
+        strncpy(se->label, label, VAULT_LABEL_MAX - 1);
+        se->enabled = 1;
+        state->stream_config.stream_count++;
+        save_stream_config(&state->stream_config);
+    }
+    pthread_mutex_unlock(&state->lock);
+
+    char resp[128];
+    snprintf(resp, sizeof(resp), "{\"status\":\"added\",\"index\":%d}", msm_index);
+    send_json(fd, 200, "OK", resp);
+#else
     /* We still persist the config so the user's stream list survives across
      * restarts — Rust users on the same machine read the same file and will
      * benefit from ingestion. But the C daemon itself does not open the
@@ -1129,10 +1163,18 @@ static void handle_add_stream(int fd, app_state_t *state, http_request_t *req) {
     send_json(fd, 501, "Not Implemented",
               "{\"error\":\"Stream ingestion not implemented in this build; "
               "OS entropy only. See /api/build/info\"}");
+#endif
     free(url); free(label);
 }
 
 static void handle_remove_stream(int fd, app_state_t *state, int index) {
+#ifdef ENABLE_TRAFFIC_ENTROPY
+    /* Cancel the MSM slot first (SIGTERM the ffmpeg child, join the forwarder
+     * thread). msm_remove_stream is idempotent and returns -1 on empty slots. */
+    if (state->msm) {
+        msm_remove_stream(state->msm, index);
+    }
+#endif
     pthread_mutex_lock(&state->lock);
     if (index >= 0 && index < state->stream_config.stream_count) {
         memmove(&state->stream_config.streams[index],
@@ -1148,15 +1190,46 @@ static void handle_remove_stream(int fd, app_state_t *state, int index) {
     }
 }
 
+#ifdef ENABLE_TRAFFIC_ENTROPY
+static const char *stream_state_str(stream_state_t s) {
+    switch (s) {
+        case STREAM_CONNECTING: return "Connecting";
+        case STREAM_ACTIVE:     return "Active";
+        case STREAM_FAILED:     return "Failed";
+        case STREAM_STOPPED:    return "Stopped";
+        default:                return "Unknown";
+    }
+}
+#endif
+
 static void handle_list_streams(int fd, app_state_t *state) {
+    str_buf sb;
+    sb_init(&sb, 512);
+    sb_append(&sb, "[");
+#ifdef ENABLE_TRAFFIC_ENTROPY
+    /* Read live state from the multi_stream manager. */
+    stream_status_t statuses[VAULT_MAX_STREAMS];
+    int n = state->msm ? msm_get_statuses(state->msm, statuses, VAULT_MAX_STREAMS) : 0;
+    for (int i = 0; i < n; i++) {
+        if (i > 0) sb_append(&sb, ",");
+        sb_append(&sb, "{\"url\":\"");
+        sb_append_json_escaped(&sb, statuses[i].url);
+        sb_append(&sb, "\",\"label\":\"");
+        sb_append_json_escaped(&sb, statuses[i].label);
+        sb_append(&sb, "\",\"status\":\"");
+        sb_append(&sb, stream_state_str(statuses[i].status));
+        sb_append(&sb, "\",\"frames_captured\":");
+        char num[32];
+        snprintf(num, sizeof(num), "%llu", (unsigned long long)statuses[i].frames_captured);
+        sb_append(&sb, num);
+        sb_append(&sb, "}");
+    }
+#else
     pthread_mutex_lock(&state->lock);
     /* The C build does not implement stream ingestion yet. We still list the
      * configured streams (so the UI shows what the user configured and so the
      * config persists for parity with the Rust build), but every entry is
      * Disabled and reports zero frames. See /api/build/info. */
-    str_buf sb;
-    sb_init(&sb, 512);
-    sb_append(&sb, "[");
     for (int i = 0; i < state->stream_config.stream_count; i++) {
         if (i > 0) sb_append(&sb, ",");
         sb_append(&sb, "{\"url\":\"");
@@ -1168,8 +1241,9 @@ static void handle_list_streams(int fd, app_state_t *state) {
             "\"frames_captured\":0,"
             "\"note\":\"OS entropy only in C build; see /api/build/info\"}");
     }
-    sb_append(&sb, "]");
     pthread_mutex_unlock(&state->lock);
+#endif
+    sb_append(&sb, "]");
 
     char *buf = sb_release(&sb, NULL);
     if (!buf) {
@@ -1183,9 +1257,14 @@ static void handle_list_streams(int fd, app_state_t *state) {
 static void handle_build_info(int fd) {
     /* Honest build descriptor. No auth required — the frontend needs this at
      * page load to decide whether to render the OS-only banner. */
+#ifdef ENABLE_TRAFFIC_ENTROPY
+    send_json(fd, 200, "OK",
+              "{\"build\":\"c\",\"traffic_entropy\":true}");
+#else
     send_json(fd, 200, "OK",
               "{\"build\":\"c\",\"traffic_entropy\":false,"
               "\"note\":\"OS entropy only; see README\"}");
+#endif
 }
 
 /* --- Request router --- */

@@ -24,6 +24,19 @@ ifeq ($(CC_IS_GCC),1)
   CFLAGS += -Wstringop-truncation -Wstringop-overflow=4
 endif
 
+# Opt-in: route stream handlers through the multi_stream manager and flip
+# /api/build/info to traffic_entropy:true. Default off — keeps the #1b "honest
+# relabel" semantics for production builds until the port is exercised end to
+# end. REMEDIATION_PLAN.md:349.
+#
+#   make ENABLE_TRAFFIC_ENTROPY=1
+#
+# Once the C side has soaked under real streams and the parity harness is
+# updated, this becomes the default and #1b reverts.
+ifeq ($(ENABLE_TRAFFIC_ENTROPY),1)
+  CFLAGS += -DENABLE_TRAFFIC_ENTROPY
+endif
+
 # Platform-specific knobs.
 #
 # On Linux/glibc, -std=c11 hides POSIX symbols (clock_gettime, fdopen, fileno,
