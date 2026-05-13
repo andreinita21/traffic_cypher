@@ -168,7 +168,14 @@ ifeq ($(UNAME_S),Linux)
   FUZZ_CFLAGS += -D_GNU_SOURCE
   ifdef OPENSSL_PREFIX
     FUZZ_CFLAGS  += -I$(OPENSSL_PREFIX)/include
-    FUZZ_LDFLAGS += -L$(OPENSSL_PREFIX)/lib64 -L$(OPENSSL_PREFIX)/lib
+    # Embed rpath so the runtime loader finds OPENSSL_PREFIX's libcrypto
+    # (3.3+ with Argon2id) instead of the system's libcrypto.so.3 (Ubuntu
+    # 24.04 ships 3.0, which lacks the OPENSSL_3.2.0 symbol versions the
+    # fuzz wrappers pull through vault.c). Mirrors the production build's
+    # main LDFLAGS.
+    FUZZ_LDFLAGS += -L$(OPENSSL_PREFIX)/lib64 -L$(OPENSSL_PREFIX)/lib \
+                    -Wl,-rpath,$(OPENSSL_PREFIX)/lib64 \
+                    -Wl,-rpath,$(OPENSSL_PREFIX)/lib
   endif
 endif
 FUZZ_LIBS    := -lssl -lcrypto -lpthread -lm
