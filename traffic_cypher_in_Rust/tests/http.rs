@@ -222,14 +222,8 @@ async fn full_credential_lifecycle() {
     assert_eq!(status, StatusCode::OK);
 
     // 8. List is empty again.
-    let (status, list2) = send_json(
-        app,
-        "GET",
-        "/api/credentials",
-        Some(&token),
-        Value::Null,
-    )
-    .await;
+    let (status, list2) =
+        send_json(app, "GET", "/api/credentials", Some(&token), Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list2.as_array().map(|a| a.len()), Some(0));
 }
@@ -269,14 +263,7 @@ async fn protected_routes_require_auth() {
     let (app, _tmp) = fresh_app();
 
     // No Authorization header.
-    let (status, _) = send_json(
-        app,
-        "GET",
-        "/api/credentials",
-        None,
-        Value::Null,
-    )
-    .await;
+    let (status, _) = send_json(app, "GET", "/api/credentials", None, Value::Null).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -382,14 +369,7 @@ async fn tags_round_trip() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    let (status, list) = send_json(
-        app,
-        "GET",
-        "/api/credentials",
-        Some(&token),
-        Value::Null,
-    )
-    .await;
+    let (status, list) = send_json(app, "GET", "/api/credentials", Some(&token), Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     let arr = list.as_array().expect("list is array");
     assert_eq!(arr.len(), 1);
@@ -406,14 +386,7 @@ async fn build_info_no_auth() {
     // /api/build/info is the one /api/* endpoint that is explicitly
     // unauthenticated — frontends call it at init to decide whether to
     // show the "OS entropy only" banner.
-    let (status, body) = send_json(
-        app,
-        "GET",
-        "/api/build/info",
-        None,
-        Value::Null,
-    )
-    .await;
+    let (status, body) = send_json(app, "GET", "/api/build/info", None, Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["traffic_entropy"], json!(true));
     assert_eq!(body["build"], json!("rust"));

@@ -4,6 +4,32 @@ This file tracks step-by-step status of the items defined in `REMEDIATION_PLAN.m
 
 ---
 
+### 2026-05-13 — Phase D (NEXT_STEPS.md): `cargo fmt` + hard CI gate
+
+Mechanical. Runs `cargo fmt --all` over every Rust source in `traffic_cypher_in_Rust/` (src + tests + examples + fuzz + benchmark + bin), and flips the CI step from `continue-on-error: true` to a hard gate.
+
+The fmt diff was reported as ~1,321 lines of unified diff before the run (per `cargo fmt --check | wc -l`). Post-run all of those settle into the formatter's canonical layout — no more legacy spacing, import ordering, or multi-line-vs-collapsed function-call style drift.
+
+**Files**
+
+- 16 Rust source files reformatted. 274 lines deleted, 394 lines inserted (net +120 — most of the delta is the formatter expanding long single-line function calls into multi-line forms, and merging some short multi-line blocks into single lines). Mechanical; no semantic edits.
+- `.github/workflows/ci.yml` — the `cargo fmt --check` step in the `rust` job loses its `continue-on-error: true` and gets its comment block rewritten to call out the new hard-gate semantics. Step renamed `(informational)` → `(gate)`.
+
+**Verification**
+
+- `cargo fmt --check` — exit 0; zero diff lines remaining.
+- `cargo build --release --bins --locked` — clean (13.04 s).
+- `cargo clippy --all-targets --locked -- -D warnings` — clean.
+- `cargo test --locked -- --test-threads=1` — 8/8 PASS.
+- `bash tests/run.sh` — **37 PASS + 1 SKIP** in 107 s. No test count change.
+
+**Risks**
+
+- Anyone with an in-flight branch that touches Rust sources will now have to `cargo fmt` before opening a PR. The pre-existing `rustfmt.toml` (none — the project uses rustfmt defaults) makes this a zero-config invocation.
+- Any future Rust change must include the fmt result. The gate catches this cleanly at CI time.
+
+---
+
 ### 2026-05-13 — Phase C (NEXT_STEPS.md): `ENABLE_TRAFFIC_ENTROPY` default-flip
 
 The headline change: `make` (no flag) now produces the full traffic-entropy build. `make ENABLE_TRAFFIC_ENTROPY=0` is the legacy OS-only opt-out, retained for one release cycle. With this commit the project's stated thesis ("entropy-driven password manager via live video streams") is the C build's default behaviour for the first time. The original `#1b` "honest relabel" — which was the placeholder for this — is now genuinely resolved without qualification.

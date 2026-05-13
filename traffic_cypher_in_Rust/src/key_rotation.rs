@@ -1,8 +1,8 @@
+use crate::crypto_derivation;
 use crate::entropy_extractor;
 use crate::entropy_pool::EntropyPool;
 use crate::multi_stream::MultiStreamManager;
 use crate::system_entropy_mixer;
-use crate::crypto_derivation;
 
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};

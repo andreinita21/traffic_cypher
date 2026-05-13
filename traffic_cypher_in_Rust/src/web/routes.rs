@@ -1,10 +1,10 @@
 use axum::{
     body::Bytes,
-    extract::State,
     extract::Path,
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
-    routing::{get, post, put, delete},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::auth::validate_session;
 use super::state::AppState;
-use crate::{vault, totp, password_gen, key_rotation, multi_stream};
+use crate::{key_rotation, multi_stream, password_gen, totp, vault};
 
 // ---------------------------------------------------------------------------
 // Static file serving (embedded frontend)
@@ -52,12 +52,7 @@ async fn serve_js() -> Response {
 }
 
 async fn serve_css() -> Response {
-    (
-        StatusCode::OK,
-        [("content-type", "text/css")],
-        STYLE_CSS,
-    )
-        .into_response()
+    (StatusCode::OK, [("content-type", "text/css")], STYLE_CSS).into_response()
 }
 
 async fn serve_phone() -> Html<&'static str> {
@@ -237,7 +232,13 @@ struct RotateKeyResponse {
 }
 
 fn err_json(status: StatusCode, msg: &str) -> Response {
-    (status, Json(ErrorResponse { error: msg.to_string() })).into_response()
+    (
+        status,
+        Json(ErrorResponse {
+            error: msg.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 fn unauthorized() -> Response {
@@ -331,14 +332,24 @@ async fn record_unlock_failure(state: &Arc<AppState>) {
     for i in 1..UNLOCK_FAIL_LIMIT {
         match (times[oldest_idx], times[i]) {
             (None, _) => break,
-            (_, None) => { oldest_idx = i; break; }
-            (Some(a), Some(b)) => if b < a { oldest_idx = i; }
+            (_, None) => {
+                oldest_idx = i;
+                break;
+            }
+            (Some(a), Some(b)) => {
+                if b < a {
+                    oldest_idx = i;
+                }
+            }
         }
     }
     times[oldest_idx] = Some(now);
 
     // If all 5 slots are populated and all within the 60 s window, lock out.
-    if times.iter().all(|t| matches!(t, Some(t0) if now.duration_since(*t0) <= UNLOCK_WINDOW)) {
+    if times
+        .iter()
+        .all(|t| matches!(t, Some(t0) if now.duration_since(*t0) <= UNLOCK_WINDOW))
+    {
         *state.unlock_lockout_until.write().await =
             Some(now + Duration::from_secs(unlock_lockout_secs()));
     }
@@ -364,10 +375,7 @@ fn rate_limited_response(retry_after_secs: u64) -> Response {
         .into_response()
 }
 
-async fn unlock(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<UnlockRequest>,
-) -> Response {
+async fn unlock(State(state): State<Arc<AppState>>, Json(req): Json<UnlockRequest>) -> Response {
     // Rate-limit gate. During lockout, *all* unlock attempts (right or wrong)
     // return 429 — we don't even call load_vault.
     if let Some(secs) = check_unlock_lockout(&state).await {
@@ -406,8 +414,15 @@ async fn unlock(
                 for stream_entry in streams {
                     if stream_entry.enabled {
                         let mut mgr = sm.lock().await;
-                        if let Err(e) = mgr.add_stream(stream_entry.url.clone(), stream_entry.label.clone()).await {
-                            tracing::warn!("Failed to connect stream '{}': {}", stream_entry.label, e);
+                        if let Err(e) = mgr
+                            .add_stream(stream_entry.url.clone(), stream_entry.label.clone())
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to connect stream '{}': {}",
+                                stream_entry.label,
+                                e
+                            );
                         }
                     }
                 }
@@ -420,26 +435,32 @@ async fn unlock(
             let sm_clone = state.stream_manager.clone();
             let rs_clone = state.rotation_state.clone();
             tokio::spawn(async move {
-                key_rotation::start_rotation_daemon(
-                    sm_clone, rs_clone, cancel_rx,
-                ).await;
+                key_rotation::start_rotation_daemon(sm_clone, rs_clone, cancel_rx).await;
             });
 
-            (StatusCode::OK, Json(UnlockResponse { token, entry_count, entropy_source })).into_response()
+            (
+                StatusCode::OK,
+                Json(UnlockResponse {
+                    token,
+                    entry_count,
+                    entropy_source,
+                }),
+            )
+                .into_response()
         }
         Err(e) => {
             // Record failure; if 5-in-60s tripped, the NEXT attempt is the
             // one that gets 429 (per spec: "5 failures → next attempt locks").
             record_unlock_failure(&state).await;
-            err_json(StatusCode::UNAUTHORIZED, &format!("Failed to unlock: {}", e))
+            err_json(
+                StatusCode::UNAUTHORIZED,
+                &format!("Failed to unlock: {}", e),
+            )
         }
     }
 }
 
-async fn lock(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Response {
+async fn lock(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
     if !validate_session(&headers, &state).await {
         return unauthorized();
     }
@@ -463,12 +484,14 @@ async fn lock(
         let _ = mgr.remove_stream(0).await;
     }
 
-    (StatusCode::OK, Json(serde_json::json!({"status": "locked"}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "locked"})),
+    )
+        .into_response()
 }
 
-async fn auth_status(
-    State(state): State<Arc<AppState>>,
-) -> Json<AuthStatusResponse> {
+async fn auth_status(State(state): State<Arc<AppState>>) -> Json<AuthStatusResponse> {
     let unlocked = *state.is_unlocked.read().await;
     // Check auto-lock
     if unlocked && state.check_auto_lock().await {
@@ -522,8 +545,16 @@ async fn list_credentials(
         let q_lower = q.to_lowercase();
         entries.retain(|e| {
             e.label.to_lowercase().contains(&q_lower)
-                || e.username.as_deref().unwrap_or("").to_lowercase().contains(&q_lower)
-                || e.website.as_deref().unwrap_or("").to_lowercase().contains(&q_lower)
+                || e.username
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&q_lower)
+                || e.website
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&q_lower)
                 || e.tags.iter().any(|t| t.to_lowercase().contains(&q_lower))
         });
     }
@@ -599,7 +630,10 @@ async fn create_credential(
     let v = state.vault.read().await;
     match v.get_by_id(&id) {
         Some(entry) => (StatusCode::CREATED, Json(entry.clone())).into_response(),
-        None => err_json(StatusCode::INTERNAL_SERVER_ERROR, "Entry created but not found"),
+        None => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Entry created but not found",
+        ),
     }
 }
 
@@ -645,7 +679,11 @@ async fn update_credential(
         }
     }
     if let Some(totp_secret) = req.totp_secret {
-        entry.totp_secret = if totp_secret.is_empty() { None } else { Some(totp_secret) };
+        entry.totp_secret = if totp_secret.is_empty() {
+            None
+        } else {
+            Some(totp_secret)
+        };
     }
     if let Some(notes) = req.notes {
         entry.notes = Some(notes);
@@ -690,7 +728,11 @@ async fn delete_credential(
         return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e);
     }
 
-    (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "deleted"})),
+    )
+        .into_response()
 }
 
 async fn get_totp(
@@ -714,10 +756,18 @@ async fn get_totp(
     };
 
     match totp::generate_totp(secret) {
-        Ok((code, remaining)) => {
-            (StatusCode::OK, Json(TotpResponse { code, seconds_remaining: remaining })).into_response()
-        }
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("TOTP error: {}", e)),
+        Ok((code, remaining)) => (
+            StatusCode::OK,
+            Json(TotpResponse {
+                code,
+                seconds_remaining: remaining,
+            }),
+        )
+            .into_response(),
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("TOTP error: {}", e),
+        ),
     }
 }
 
@@ -745,17 +795,18 @@ async fn generate_password(
     let password = password_gen::generate(&opts);
     let strength = password_gen::calculate_strength(&password);
 
-    (StatusCode::OK, Json(GeneratePasswordResponse { password, strength })).into_response()
+    (
+        StatusCode::OK,
+        Json(GeneratePasswordResponse { password, strength }),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
 // Key rotation handler
 // ---------------------------------------------------------------------------
 
-async fn rotate_key(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Response {
+async fn rotate_key(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
     if !validate_session(&headers, &state).await {
         return unauthorized();
     }
@@ -773,7 +824,10 @@ async fn rotate_key(
     let v = state.vault.read().await;
     let master = state.master_password.read().await;
     if let Err(e) = vault::rotate_dek(&v, master.as_str(), &new_dek, source) {
-        return err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("Key rotation failed: {}", e));
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Key rotation failed: {}", e),
+        );
     }
 
     // Update in-memory DEK. Wrap in `Zeroizing` so the prior key bytes are
@@ -781,20 +835,21 @@ async fn rotate_key(
     *state.current_dek.write().await = Some(zeroize::Zeroizing::new(new_dek));
     *state.entropy_source.write().await = source.to_string();
 
-    (StatusCode::OK, Json(RotateKeyResponse {
-        status: "rotated".to_string(),
-        entropy_source: source.to_string(),
-    })).into_response()
+    (
+        StatusCode::OK,
+        Json(RotateKeyResponse {
+            status: "rotated".to_string(),
+            entropy_source: source.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
 // Stream handlers
 // ---------------------------------------------------------------------------
 
-async fn list_streams(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Response {
+async fn list_streams(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
     if !validate_session(&headers, &state).await {
         return unauthorized();
     }
@@ -839,7 +894,11 @@ async fn add_stream(
         }
     });
 
-    (StatusCode::CREATED, Json(serde_json::json!({"status": "connecting", "label": req.label}))).into_response()
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({"status": "connecting", "label": req.label})),
+    )
+        .into_response()
 }
 
 async fn remove_stream(
@@ -860,7 +919,11 @@ async fn remove_stream(
                 config.streams.remove(index);
                 let _ = vault::save_stream_config(&config);
             }
-            (StatusCode::OK, Json(serde_json::json!({"status": "removed"}))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "removed"})),
+            )
+                .into_response()
         }
         Err(e) => err_json(StatusCode::BAD_REQUEST, &format!("{}", e)),
     }
@@ -890,7 +953,11 @@ async fn update_stream(
                 }
                 let _ = vault::save_stream_config(&config);
             }
-            (StatusCode::OK, Json(serde_json::json!({"status": "updated"}))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "updated"})),
+            )
+                .into_response()
         }
         Err(e) => err_json(StatusCode::BAD_REQUEST, &format!("{}", e)),
     }
@@ -954,7 +1021,9 @@ fn parse_ppm_header(buf: &[u8]) -> std::result::Result<(u32, u32, usize), &'stat
         let mut v: u32 = 0;
         let mut seen_digit = false;
         while i < buf.len() && buf[i].is_ascii_digit() {
-            v = v.saturating_mul(10).saturating_add(u32::from(buf[i] - b'0'));
+            v = v
+                .saturating_mul(10)
+                .saturating_add(u32::from(buf[i] - b'0'));
             seen_digit = true;
             if v > 65535 {
                 return Err("PPM dimension out of range");
@@ -1027,10 +1096,7 @@ async fn push_phone_frame(
 // Status & Settings handlers
 // ---------------------------------------------------------------------------
 
-async fn get_status(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Response {
+async fn get_status(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
     if !validate_session(&headers, &state).await {
         return unauthorized();
     }
@@ -1043,19 +1109,20 @@ async fn get_status(
     let entry_count = v.entries.len();
     let entropy_source = state.entropy_source.read().await.clone();
 
-    (StatusCode::OK, Json(StatusResponse {
-        rotation,
-        stream_count,
-        streams,
-        entry_count,
-        entropy_source,
-    })).into_response()
+    (
+        StatusCode::OK,
+        Json(StatusResponse {
+            rotation,
+            stream_count,
+            streams,
+            entry_count,
+            entropy_source,
+        }),
+    )
+        .into_response()
 }
 
-async fn entropy_snapshot(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Response {
+async fn entropy_snapshot(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
     if !validate_session(&headers, &state).await {
         return unauthorized();
     }
@@ -1069,21 +1136,22 @@ async fn entropy_snapshot(
         hex::encode(&latest_entropy[..std::cmp::min(latest_entropy.len(), 32)])
     };
 
-    (StatusCode::OK, Json(EntropySnapshotResponse {
-        key_epoch: rotation.key_epoch,
-        frames_processed: rotation.frames_processed,
-        pool_depth: rotation.pool_depth,
-        has_traffic_entropy: rotation.has_traffic_entropy,
-        is_running: rotation.is_running,
-        entropy_source,
-        latest_key_hex,
-    })).into_response()
+    (
+        StatusCode::OK,
+        Json(EntropySnapshotResponse {
+            key_epoch: rotation.key_epoch,
+            frames_processed: rotation.frames_processed,
+            pool_depth: rotation.pool_depth,
+            has_traffic_entropy: rotation.has_traffic_entropy,
+            is_running: rotation.is_running,
+            entropy_source,
+            latest_key_hex,
+        }),
+    )
+        .into_response()
 }
 
-async fn get_settings(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Response {
+async fn get_settings(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
     if !validate_session(&headers, &state).await {
         return unauthorized();
     }
@@ -1091,10 +1159,14 @@ async fn get_settings(
     let auto_lock = *state.auto_lock_minutes.read().await;
     let config = vault::load_stream_config();
 
-    (StatusCode::OK, Json(SettingsResponse {
-        auto_lock_minutes: auto_lock,
-        streams: config.streams,
-    })).into_response()
+    (
+        StatusCode::OK,
+        Json(SettingsResponse {
+            auto_lock_minutes: auto_lock,
+            streams: config.streams,
+        }),
+    )
+        .into_response()
 }
 
 async fn update_settings(
@@ -1113,5 +1185,9 @@ async fn update_settings(
         let _ = vault::save_stream_config(&config);
     }
 
-    (StatusCode::OK, Json(serde_json::json!({"status": "updated"}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "updated"})),
+    )
+        .into_response()
 }

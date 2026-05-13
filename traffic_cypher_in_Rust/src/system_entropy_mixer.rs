@@ -8,8 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub fn mix_entropy(pool_digest: &[u8; 32]) -> [u8; 32] {
     // 32 bytes of OS entropy
     let mut os_entropy = [0u8; 32];
-    getrandom::getrandom(&mut os_entropy)
-        .expect("Failed to get OS entropy");
+    getrandom::getrandom(&mut os_entropy).expect("Failed to get OS entropy");
 
     // Current timestamp in nanoseconds
     let timestamp = SystemTime::now()

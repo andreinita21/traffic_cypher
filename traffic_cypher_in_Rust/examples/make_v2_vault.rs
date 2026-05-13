@@ -71,7 +71,10 @@ fn main() {
     let vault_nonce = [0x33u8; 12];
     let dek = [0x44u8; 32];
 
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let vault = Vault {
         entries: vec![VaultEntry {
             id: "11111111-1111-4111-8111-111111111111".to_string(),

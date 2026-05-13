@@ -143,7 +143,10 @@ async fn main() -> Result<()> {
     // Cleanup
     let _ = ffmpeg_child.kill().await;
     let _ = ffmpeg_child.wait().await;
-    info!("Goodbye! Generated keys from {} frames.", previous_key.map_or(0, |_| pool.len()));
+    info!(
+        "Goodbye! Generated keys from {} frames.",
+        previous_key.map_or(0, |_| pool.len())
+    );
 
     Ok(())
 }
@@ -163,7 +166,8 @@ async fn save_debug_frame(frame: &frame_sampler::Frame) {
 }
 
 fn print_banner() {
-    println!(r#"
+    println!(
+        r#"
 ╔══════════════════════════════════════════════════════════╗
 ║                                                          ║
 ║   🚦  T R A F F I C   C Y P H E R  🔐                  ║
@@ -171,5 +175,6 @@ fn print_banner() {
 ║   Turning live city motion into rotating crypto keys     ║
 ║                                                          ║
 ╚══════════════════════════════════════════════════════════╝
-"#);
+"#
+    );
 }

@@ -20,7 +20,8 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    println!(r#"
+    println!(
+        r#"
 ╔══════════════════════════════════════════════════════════╗
 ║                                                          ║
 ║     T R A F F I C   C Y P H E R                          ║
@@ -29,7 +30,8 @@ async fn main() -> Result<()> {
 ║   Dashboard: http://127.0.0.1:9876                       ║
 ║                                                          ║
 ╚══════════════════════════════════════════════════════════╝
-"#);
+"#
+    );
 
     let state = Arc::new(web::state::AppState::new());
     let router = web::create_router(state);

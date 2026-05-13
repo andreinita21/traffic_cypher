@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -24,15 +24,23 @@ pub async fn start_frame_capture(
 
     let mut child = Command::new("ffmpeg")
         .args([
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5",
-            "-i", stream_url,
-            "-vf", "fps=1,scale=320:240",
-            "-f", "image2pipe",
-            "-vcodec", "ppm",
-            "-an",           // no audio
-            "-loglevel", "error",
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+            "-i",
+            stream_url,
+            "-vf",
+            "fps=1,scale=320:240",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "ppm",
+            "-an", // no audio
+            "-loglevel",
+            "error",
             "pipe:1",
         ])
         .stdout(std::process::Stdio::piped())
@@ -41,7 +49,9 @@ pub async fn start_frame_capture(
         .spawn()
         .context("Failed to spawn ffmpeg. Is it installed?")?;
 
-    let stdout = child.stdout.take()
+    let stdout = child
+        .stdout
+        .take()
         .context("Failed to capture ffmpeg stdout")?;
 
     // Spawn a task to continuously read and parse PPM frames
@@ -75,7 +85,9 @@ async fn read_ppm_stream(
 
         let pixel_bytes = (width * height * 3) as usize;
         let mut pixel_data = vec![0u8; pixel_bytes];
-        reader.read_exact(&mut pixel_data).await
+        reader
+            .read_exact(&mut pixel_data)
+            .await
             .context("Failed to read PPM pixel data")?;
 
         sequence += 1;

@@ -1,9 +1,9 @@
-pub mod state;
-pub mod routes;
 pub mod auth;
+pub mod routes;
+pub mod state;
 
+use axum::http::{header, HeaderValue, Method};
 use axum::Router;
-use axum::http::{HeaderValue, Method, header};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 

@@ -327,9 +327,15 @@ fn derive_kek_argon2id(
     t_cost: u32,
     p_cost: u32,
 ) -> Result<Zeroizing<[u8; 32]>> {
-    let params = Params::new(m_cost, t_cost, p_cost, Some(32))
-        .map_err(|e| anyhow!("Invalid Argon2id parameters (m={}, t={}, p={}): {}",
-                             m_cost, t_cost, p_cost, e))?;
+    let params = Params::new(m_cost, t_cost, p_cost, Some(32)).map_err(|e| {
+        anyhow!(
+            "Invalid Argon2id parameters (m={}, t={}, p={}): {}",
+            m_cost,
+            t_cost,
+            p_cost,
+            e
+        )
+    })?;
     let a = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut kek = Zeroizing::new([0u8; 32]);
     a.hash_password_into(master_password.as_bytes(), salt, &mut *kek)
@@ -415,11 +421,7 @@ fn encrypt_vault_data(dek: &[u8; 32], vault: &Vault) -> Result<(Vec<u8>, [u8; 12
 /// Decrypt vault data with a DEK using AES-256-GCM.
 /// The decrypted JSON bytes are held in a `Zeroizing<Vec<u8>>` so the
 /// heap allocation is overwritten before being freed.
-fn decrypt_vault_data(
-    dek: &[u8; 32],
-    ciphertext: &[u8],
-    nonce_bytes: &[u8; 12],
-) -> Result<Vault> {
+fn decrypt_vault_data(dek: &[u8; 32], ciphertext: &[u8], nonce_bytes: &[u8; 12]) -> Result<Vault> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek));
     let nonce = Nonce::from_slice(nonce_bytes);
     let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
@@ -494,8 +496,7 @@ pub fn load_vault(master_password: &str) -> Result<UnlockedVault> {
 }
 
 fn load_vault_v2(master_password: &str, contents: &str) -> Result<UnlockedVault> {
-    let vf: VaultFileV2 =
-        serde_json::from_str(contents).context("Vault v2 file is corrupt")?;
+    let vf: VaultFileV2 = serde_json::from_str(contents).context("Vault v2 file is corrupt")?;
 
     let kek_salt = hex::decode(&vf.kek_salt).context("Invalid kek_salt")?;
     let (wdn, vn, wrapped_dek, vault_ciphertext) = decode_envelope_fields(
@@ -507,9 +508,7 @@ fn load_vault_v2(master_password: &str, contents: &str) -> Result<UnlockedVault>
 
     // Legacy HKDF KEK. Microseconds — no need to time-log it.
     let kek = derive_kek_hkdf(master_password, &kek_salt);
-    tracing::info!(
-        "Loaded v2 vault — will auto-upgrade to v3 (Argon2id) on next save"
-    );
+    tracing::info!("Loaded v2 vault — will auto-upgrade to v3 (Argon2id) on next save");
 
     let dek = unwrap_dek(&kek, &wrapped_dek, &wdn)?;
     let vault = decrypt_vault_data(&dek, &vault_ciphertext, &vn)?;
@@ -523,8 +522,7 @@ fn load_vault_v2(master_password: &str, contents: &str) -> Result<UnlockedVault>
 }
 
 fn load_vault_v3(master_password: &str, contents: &str) -> Result<UnlockedVault> {
-    let vf: VaultFileV3 =
-        serde_json::from_str(contents).context("Vault v3 file is corrupt")?;
+    let vf: VaultFileV3 = serde_json::from_str(contents).context("Vault v3 file is corrupt")?;
 
     if vf.kdf != "argon2id" {
         return Err(anyhow!(
@@ -724,8 +722,7 @@ pub fn rotate_dek(
 /// Generate a cryptographically random password of `length` printable characters.
 pub fn generate_password(length: usize) -> String {
     // Charset: lower + upper + digits + symbols (avoids ambiguous chars like l/1/O/0)
-    const CHARSET: &[u8] =
-        b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789!@#$%^&*-_=+";
+    const CHARSET: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789!@#$%^&*-_=+";
     let mut bytes = vec![0u8; length];
     getrandom::getrandom(&mut bytes).expect("getrandom failed");
     bytes
@@ -804,9 +801,11 @@ mod tests {
     /// unique path per call additionally protects against stale files from
     /// previous runs.
     fn with_test_vault<F: FnOnce()>(tag: &str, f: F) {
-        let path = std::env::temp_dir()
-            .join(format!("test_traffic_cypher_vault_{}_{}.json",
-                          tag, std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "test_traffic_cypher_vault_{}_{}.json",
+            tag,
+            std::process::id()
+        ));
         // Clean up before
         let _ = fs::remove_file(&path);
         std::env::set_var("TRAFFIC_CYPHER_VAULT_PATH", path.to_str().unwrap());
@@ -874,10 +873,8 @@ mod tests {
     fn test_argon2id_kek_kat() {
         // include_str! pins the fixture into the test binary so test runs
         // don't depend on the harness's working directory.
-        const FIXTURE: &str =
-            include_str!("../../test_fixtures/argon2id_kek_kat.json");
-        let v: serde_json::Value =
-            serde_json::from_str(FIXTURE).expect("parse KAT fixture");
+        const FIXTURE: &str = include_str!("../../test_fixtures/argon2id_kek_kat.json");
+        let v: serde_json::Value = serde_json::from_str(FIXTURE).expect("parse KAT fixture");
 
         let password = v["password"].as_str().unwrap();
         let salt = hex::decode(v["salt_hex"].as_str().unwrap()).unwrap();
@@ -886,11 +883,13 @@ mod tests {
         let p_cost = v["p_cost"].as_u64().unwrap() as u32;
         let expected_hex = v["expected_kek_hex"].as_str().unwrap();
 
-        let kek = derive_kek_argon2id(password, &salt, m_cost, t_cost, p_cost)
-            .expect("derive");
-        assert_eq!(hex::encode(*kek), expected_hex,
+        let kek = derive_kek_argon2id(password, &salt, m_cost, t_cost, p_cost).expect("derive");
+        assert_eq!(
+            hex::encode(*kek),
+            expected_hex,
             "Argon2id KEK output diverged from pinned KAT — check the argon2 \
-             crate version, Algorithm/Version flags, and parameter wiring.");
+             crate version, Algorithm/Version flags, and parameter wiring."
+        );
     }
 
     #[test]
@@ -987,9 +986,12 @@ mod tests {
             let mut vault = Vault::default();
             vault.entries.push(VaultEntry::new(
                 "Test Entry".to_string(),
-                None, None,
+                None,
+                None,
                 "original_password".to_string(),
-                None, None, vec![],
+                None,
+                None,
+                vec![],
             ));
 
             // Save with original DEK
@@ -1045,22 +1047,24 @@ mod tests {
     fn test_v2_to_v3_auto_upgrade() {
         with_test_vault("v2_upgrade", || {
             // Drop the bundled v2 fixture in place.
-            const V2_FIXTURE: &str =
-                include_str!("../../test_fixtures/sample_vault_v2.json");
+            const V2_FIXTURE: &str = include_str!("../../test_fixtures/sample_vault_v2.json");
             std::fs::write(vault_path(), V2_FIXTURE).unwrap();
 
             // 1. Load with the right password — works through the v2 path.
-            let unlocked = load_vault("upgrade-fixture-pw")
-                .expect("load v2 fixture");
+            let unlocked = load_vault("upgrade-fixture-pw").expect("load v2 fixture");
             assert!(unlocked.needs_upgrade, "v2 file must flag needs_upgrade");
             assert_eq!(unlocked.vault.entries.len(), 1);
             assert_eq!(unlocked.vault.entries[0].label, "v2-upgrade-test");
-            assert_eq!(unlocked.vault.entries[0].password,
-                       "v2-secret-do-not-lose");
+            assert_eq!(unlocked.vault.entries[0].password, "v2-secret-do-not-lose");
 
             // 2. Save: writes v3.
-            save_vault(&unlocked.vault, "upgrade-fixture-pw",
-                       &unlocked.dek, &unlocked.entropy_source).unwrap();
+            save_vault(
+                &unlocked.vault,
+                "upgrade-fixture-pw",
+                &unlocked.dek,
+                &unlocked.entropy_source,
+            )
+            .unwrap();
 
             let after = std::fs::read_to_string(vault_path()).unwrap();
             let v: serde_json::Value = serde_json::from_str(&after).unwrap();
@@ -1068,12 +1072,10 @@ mod tests {
             assert_eq!(v["kdf"], "argon2id");
 
             // 3. Reload (via v3 path) — content preserved.
-            let reloaded = load_vault("upgrade-fixture-pw")
-                .expect("reload after upgrade");
+            let reloaded = load_vault("upgrade-fixture-pw").expect("reload after upgrade");
             assert!(!reloaded.needs_upgrade);
             assert_eq!(reloaded.vault.entries.len(), 1);
-            assert_eq!(reloaded.vault.entries[0].password,
-                       "v2-secret-do-not-lose");
+            assert_eq!(reloaded.vault.entries[0].password, "v2-secret-do-not-lose");
         });
     }
 
@@ -1085,14 +1087,12 @@ mod tests {
             // Minimal file with a future version. Other fields are absent;
             // the version-probe step fails first, so they don't need to be
             // valid.
-            std::fs::write(vault_path(),
-                r#"{"version": 99, "kek_salt": "00"}"#).unwrap();
+            std::fs::write(vault_path(), r#"{"version": 99, "kek_salt": "00"}"#).unwrap();
             let err = match load_vault("anything") {
                 Ok(_) => panic!("expected load_vault to fail on version=99"),
                 Err(e) => e.to_string(),
             };
-            assert!(err.contains("Unsupported vault version 99"),
-                    "got: {}", err);
+            assert!(err.contains("Unsupported vault version 99"), "got: {}", err);
         });
     }
 

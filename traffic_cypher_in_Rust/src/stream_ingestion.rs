@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::path::Path;
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -13,8 +13,9 @@ pub async fn resolve_stream_url(youtube_url: &str) -> Result<String> {
 
     let output = Command::new(&yt_dlp)
         .args([
-            "-g",             // print the direct URL only
-            "-f", "best",     // best single format
+            "-g", // print the direct URL only
+            "-f",
+            "best", // best single format
             "--no-warnings",
             youtube_url,
         ])

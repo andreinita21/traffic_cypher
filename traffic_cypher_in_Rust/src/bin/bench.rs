@@ -136,8 +136,7 @@ fn main() {
             WARMUP,
             MED_ITERS,
             || {
-                let _ =
-                    entropy_extractor::extract_entropy(&fd, Some(&pf), FRAME_W, FRAME_H);
+                let _ = entropy_extractor::extract_entropy(&fd, Some(&pf), FRAME_W, FRAME_H);
             },
         ));
     }
@@ -166,10 +165,15 @@ fn main() {
     }));
 
     // 6. Password generation (24 chars)
-    results.push(run_bench("password_generate_24", WARMUP, FAST_ITERS, || {
-        let opts = password_gen::PasswordOptions::default();
-        let _ = password_gen::generate(&opts);
-    }));
+    results.push(run_bench(
+        "password_generate_24",
+        WARMUP,
+        FAST_ITERS,
+        || {
+            let opts = password_gen::PasswordOptions::default();
+            let _ = password_gen::generate(&opts);
+        },
+    ));
 
     // 7. Password strength calculation
     results.push(run_bench(
@@ -241,24 +245,29 @@ fn main() {
     // 12. Vault save + load cycle
     {
         std::env::set_var("TRAFFIC_CYPHER_VAULT_PATH", "/tmp/bench_vault_rust.json");
-        results.push(run_bench("vault_save_load_cycle", WARMUP, SLOW_ITERS, || {
-            let mut small_vault = vault::Vault::default();
-            let entry = vault::VaultEntry::new(
-                "SaveLoadTest".to_string(),
-                Some("https://test.com".to_string()),
-                Some("user".to_string()),
-                "SecureP@ss!".to_string(),
-                None,
-                Some("Test notes".to_string()),
-                vec![],
-            );
-            small_vault.add_or_update(entry);
+        results.push(run_bench(
+            "vault_save_load_cycle",
+            WARMUP,
+            SLOW_ITERS,
+            || {
+                let mut small_vault = vault::Vault::default();
+                let entry = vault::VaultEntry::new(
+                    "SaveLoadTest".to_string(),
+                    Some("https://test.com".to_string()),
+                    Some("user".to_string()),
+                    "SecureP@ss!".to_string(),
+                    None,
+                    Some("Test notes".to_string()),
+                    vec![],
+                );
+                small_vault.add_or_update(entry);
 
-            let dek = vault::generate_dek_from_os();
-            vault::save_vault(&small_vault, "benchmark_master_password_2024", &dek, "os")
-                .unwrap();
-            let _ = vault::load_vault("benchmark_master_password_2024").unwrap();
-        }));
+                let dek = vault::generate_dek_from_os();
+                vault::save_vault(&small_vault, "benchmark_master_password_2024", &dek, "os")
+                    .unwrap();
+                let _ = vault::load_vault("benchmark_master_password_2024").unwrap();
+            },
+        ));
         let _ = std::fs::remove_file("/tmp/bench_vault_rust.json");
     }
 
@@ -300,8 +309,7 @@ fn main() {
             WARMUP,
             FAST_ITERS,
             || {
-                let _ =
-                    search_vault.get_by_id("00000000-0000-0000-0000-000000000000");
+                let _ = search_vault.get_by_id("00000000-0000-0000-0000-000000000000");
             },
         ));
     }
@@ -310,15 +318,20 @@ fn main() {
     {
         let fd = frame_data.clone();
         let pf = prev_frame.clone();
-        results.push(run_bench("full_entropy_pipeline", WARMUP, MED_ITERS, || {
-            let extracted =
-                entropy_extractor::extract_entropy(&fd, Some(&pf), FRAME_W, FRAME_H);
-            let mut pool = entropy_pool::EntropyPool::new(8);
-            pool.push(extracted.entropy_bytes);
-            let digest = pool.digest();
-            let mixed = system_entropy_mixer::mix_entropy(&digest);
-            let _ = crypto_derivation::derive_key(&mixed, None, 32);
-        }));
+        results.push(run_bench(
+            "full_entropy_pipeline",
+            WARMUP,
+            MED_ITERS,
+            || {
+                let extracted =
+                    entropy_extractor::extract_entropy(&fd, Some(&pf), FRAME_W, FRAME_H);
+                let mut pool = entropy_pool::EntropyPool::new(8);
+                pool.push(extracted.entropy_bytes);
+                let digest = pool.digest();
+                let mixed = system_entropy_mixer::mix_entropy(&digest);
+                let _ = crypto_derivation::derive_key(&mixed, None, 32);
+            },
+        ));
     }
 
     let total_elapsed = total_start.elapsed().as_secs_f64() * 1000.0;

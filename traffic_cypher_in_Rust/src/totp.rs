@@ -1,5 +1,5 @@
-use anyhow::{Result, anyhow};
-use totp_rs::{Algorithm, TOTP, Secret};
+use anyhow::{anyhow, Result};
+use totp_rs::{Algorithm, Secret, TOTP};
 
 /// Generate a current TOTP code from a base32 secret.
 /// Returns (code: String, seconds_remaining: u32)
@@ -8,13 +8,8 @@ pub fn generate_totp(secret_base32: &str) -> Result<(String, u32)> {
         .to_bytes()
         .map_err(|e| anyhow!("Invalid TOTP secret: {}", e))?;
 
-    let totp = TOTP::new(
-        Algorithm::SHA1,
-        6,
-        1,
-        30,
-        secret,
-    ).map_err(|e| anyhow!("Failed to create TOTP: {}", e))?;
+    let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret)
+        .map_err(|e| anyhow!("Failed to create TOTP: {}", e))?;
 
     let time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

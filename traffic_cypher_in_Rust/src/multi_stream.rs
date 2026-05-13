@@ -1,12 +1,12 @@
+use crate::frame_sampler;
 use crate::frame_sampler::Frame;
 use crate::stream_ingestion;
-use crate::frame_sampler;
-use anyhow::{Result, Context, bail};
+use anyhow::{bail, Context, Result};
 use rand::Rng;
 use rand::RngCore;
-use tokio::sync::mpsc;
-use tracing::{info, warn, error};
 use std::collections::HashMap;
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct StreamStatus {
@@ -125,10 +125,7 @@ impl MultiStreamManager {
     pub async fn add_stream(&mut self, url: String, label: String) -> Result<usize> {
         let index = self.streams.len();
 
-        info!(
-            "Adding stream #{} '{}' from {}",
-            index, label, url
-        );
+        info!("Adding stream #{} '{}' from {}", index, label, url);
 
         // Mark as connecting before the async resolve
         self.streams.push(StreamHandle {
@@ -217,7 +214,11 @@ impl MultiStreamManager {
     /// entry from the vec entirely.
     pub async fn remove_stream(&mut self, index: usize) -> Result<()> {
         if index >= self.streams.len() {
-            bail!("Stream index {} out of range (have {})", index, self.streams.len());
+            bail!(
+                "Stream index {} out of range (have {})",
+                index,
+                self.streams.len()
+            );
         }
 
         let handle = &mut self.streams[index];
@@ -241,9 +242,18 @@ impl MultiStreamManager {
 
     /// Update a stream's label and/or URL (metadata only — does not restart
     /// the capture pipeline).
-    pub fn update_stream(&mut self, index: usize, label: Option<String>, url: Option<String>) -> Result<()> {
+    pub fn update_stream(
+        &mut self,
+        index: usize,
+        label: Option<String>,
+        url: Option<String>,
+    ) -> Result<()> {
         if index >= self.streams.len() {
-            bail!("Stream index {} out of range (have {})", index, self.streams.len());
+            bail!(
+                "Stream index {} out of range (have {})",
+                index,
+                self.streams.len()
+            );
         }
         let handle = &mut self.streams[index];
         if let Some(l) = label {

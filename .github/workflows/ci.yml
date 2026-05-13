@@ -59,10 +59,9 @@ jobs:
       - name: cargo clippy --all-targets --locked -- -D warnings
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      # Informational: main currently fails `cargo fmt --check` locally.
-      # Flip to a hard gate after the formatting PR.
-      - name: cargo fmt --check (informational)
-        continue-on-error: true
+      # Hard gate since NEXT_STEPS.md Phase D (2026-05-13): every Rust source
+      # in this tree is rustfmt-clean. Regressions get caught at PR review.
+      - name: cargo fmt --check (gate)
         run: cargo fmt --check
 
   c:
