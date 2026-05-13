@@ -28,6 +28,15 @@ grep -q 'ENABLE_TRAFFIC_ENTROPY' "$C/src_c/key_rotation.c" \
     && fail "key_rotation.c should NOT gate on ENABLE_TRAFFIC_ENTROPY (stage 2 daemon works for both)"
 pass "Makefile + web_server.c expose the ENABLE_TRAFFIC_ENTROPY toggle"
 
+# Pin the CI job name so a future workflow rename can't quietly delete the
+# opt-in-build coverage. If you rename the job, update this string too.
+CI_YML="$REPO_ROOT/.github/workflows/ci.yml"
+if [ -f "$CI_YML" ]; then
+    grep -q 'c-traffic-entropy' "$CI_YML" \
+        || fail "ci.yml missing 'c-traffic-entropy' job — rename without updating this test would lose ENABLE_TRAFFIC_ENTROPY CI coverage"
+    pass "ci.yml still defines the c-traffic-entropy job"
+fi
+
 # Confirm the default build still reports traffic_entropy:false. The
 # tests/31_c_no_entropy_lie.sh script already does this end-to-end; here we
 # do the static binary-string check.

@@ -116,6 +116,66 @@ jobs:
           make -C traffic_cypher_in_C clean
           make -C traffic_cypher_in_C
 
+  c-traffic-entropy:
+    # Week 4+ #1a stage 4: prove the opt-in ENABLE_TRAFFIC_ENTROPY=1 build
+    # compiles cleanly on both runners and that the binary carries the flipped
+    # build_info literal. Kept parallel to `c` and `rust` (no `needs:`) so a
+    # break here doesn't block the default-build test matrix.
+    name: c-traffic-entropy (${{ matrix.os }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Re-use the OpenSSL 3.3 cache the `c` job populates — same key, same
+      # path, so a cache miss here only happens when the `c` job also missed.
+      - name: Cache OpenSSL 3.3 (Ubuntu)
+        if: runner.os == 'Linux'
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/openssl-3.3
+          key: ${{ runner.os }}-openssl-3.3.2-v1
+      - name: Build OpenSSL 3.3 (Ubuntu, cache miss)
+        if: runner.os == 'Linux' && steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          cd /tmp
+          curl -fsSL https://www.openssl.org/source/openssl-3.3.2.tar.gz -o openssl.tgz
+          tar -xzf openssl.tgz
+          cd openssl-3.3.2
+          ./Configure --prefix=/usr/local/openssl-3.3 --libdir=lib64 \
+            no-tests no-docs no-apps linux-x86_64
+          make -j"$(nproc)" build_libs
+          sudo make install_dev install_runtime_libs
+      - name: Export OPENSSL_PREFIX (Ubuntu)
+        if: runner.os == 'Linux'
+        run: echo "OPENSSL_PREFIX=/usr/local/openssl-3.3" >> "$GITHUB_ENV"
+
+      - name: Install OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: brew install openssl@3
+
+      - name: make ENABLE_TRAFFIC_ENTROPY=1
+        run: make -C traffic_cypher_in_C ENABLE_TRAFFIC_ENTROPY=1
+
+      - name: Verify build_info literal flipped
+        run: |
+          strings traffic_cypher_in_C/traffic-cypher-pm \
+            | grep -q '"traffic_entropy":true' \
+            || { echo "binary missing traffic_entropy:true literal"; exit 1; }
+
+      # tests/33 is the only test we need: it does its own out-of-tree rebuild
+      # with the flag, so it proves the flag-on build still produces a working
+      # binary. Skipping tests/run.sh keeps this job a fast build smoke check.
+      - name: Run tests/33_traffic_entropy_build.sh
+        run: bash tests/33_traffic_entropy_build.sh
+
   tests:
     name: tests (${{ matrix.os }})
     needs: [rust, c]
