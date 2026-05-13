@@ -4,16 +4,18 @@ Forward-looking plan, written 2026-05-13 after [`#1a` stages 1–5](./REMEDIATIO
 
 Read this together with `REMEDIATION_PROGRESS.md` for the history of what shipped and `REMEDIATION_PLAN.md` for the original design.
 
+> **2026-05-14 update — all five phases landed.** Checkboxes below are marked completed and cross-referenced to the commits that landed them. Some originally-distinct items collapsed into others as the plan evolved (e.g. Phase A's `c-traffic-entropy` job ceased to exist when Phase C inverted the gate; the parity-variant + e2e smoke they were meant to add now run inside the canonical `tests` CI job via `tests/run.sh`). Each ticked item below records both the substance that landed and any deviation from the literal task wording.
+
 ## Status snapshot
 
 | | |
 |---|---|
 | Branch | `main` |
-| Last commit when this was written | `f68886a` (#1a stage 5 — async `msm_add_stream`) |
-| Local tests | `bash tests/run.sh` — **35 PASS + 1 SKIP** in ~76 s (Apple Silicon). SKIP is `tests/34_c_auto_replay.sh`'s integration step (requires `yt-dlp`). |
-| CI | All 8 jobs green: `rust × 2`, `c × 2`, `c-traffic-entropy × 2`, `tests × 2`. |
-| Default build behaviour | `make` still ships the OS-only-entropy daemon (`/api/build/info` → `traffic_entropy:false`). `make ENABLE_TRAFFIC_ENTROPY=1` enables the full Rust-parity C build. |
-| Plan items remaining | 4 originally requested + 1 new feature requested mid-plan (phone-camera entropy source). |
+| Last commit at completion of all five phases | `97df08f` (vault parse_vault_entries OOB fix, found by fuzz CI) |
+| Local tests | `bash tests/run.sh` — **37 PASS + 1 SKIP** in ~87 s (Apple Silicon). SKIP is `tests/34_c_auto_replay.sh`'s integration step (requires `yt-dlp`). |
+| CI | All jobs green on `main`: `rust`, `c`, `c-os-only`, `fuzz-rust`, `fuzz-c`, `tests`. |
+| Default build behaviour | `make` ships the full traffic-entropy daemon (`/api/build/info` → `traffic_entropy:true`). Opt out with `make ENABLE_TRAFFIC_ENTROPY=0` to get the legacy OS-only path. |
+| Plan items remaining | **0** — all five phases (A–E) landed. |
 
 ## Decisions already made
 
@@ -33,16 +35,13 @@ These came out of the planning conversation. **Do not relitigate** unless requir
 
 ## Tasks
 
-- [ ] **A.1** Install `yt-dlp` + `ffmpeg` on the `c-traffic-entropy` runner.
-    - Ubuntu: `sudo apt-get install -y ffmpeg && pip install yt-dlp`
-    - macOS: `brew install ffmpeg yt-dlp`
-    - Cache the python pip install if `pip install yt-dlp` is slow.
-- [ ] **A.2** Extend the `c-traffic-entropy` job with a step running `BUILD_VARIANT=traffic_entropy bash tests/60_parity_smoke.sh`. The 4 anchor cases already agree in this mode locally (verified at commit `aa33297`), so CI should be green out of the gate.
-- [ ] **A.3** Add `tests/37_msm_e2e_smoke.sh` regression. Starts the flag-on PM (out-of-tree rebuild, same pattern as `tests/33`), POSTs `{"url":"https://invalid.example/not-a-real-stream","label":"smoke"}` to `/api/streams`, asserts:
+- [x] **A.1** Install `yt-dlp` + `ffmpeg` on the `c-traffic-entropy` runner. _Superseded by C.5: the `c-traffic-entropy` job was inverted to `c-os-only` (which doesn't need ffmpeg/yt-dlp). Tests 37 + 38 use bogus URLs and synthetic PPMs respectively, so no `yt-dlp` is required for the CI-covered cases. `tests/34_c_auto_replay.sh` still SKIPs when `yt-dlp` is absent — accepted, documented in the status snapshot._
+- [x] **A.2** Parity-variant in CI. _Landed in commit `199240e` (`ci(phase-a): parity-variant smoke in c-traffic-entropy + tests/37 e2e`)._
+- [x] **A.3** `tests/37_msm_e2e_smoke.sh` regression. _File present at [tests/37_msm_e2e_smoke.sh](tests/37_msm_e2e_smoke.sh); landed in `199240e`._
     - Response is `202 Accepted` with `status:"connecting"` (the async path is alive)
     - Within 15s, `/api/streams` shows the slot as `Failed` (the prep pthread + cancel path are alive)
     - `frames_captured == 0` (no real frames flowed; OS fallback handles entropy)
-- [ ] **A.4** Wire `tests/37` into the `c-traffic-entropy` CI job and into `tests/run.sh`.
+- [x] **A.4** Wire `tests/37` into `tests/run.sh`. _`tests/run.sh` globs `[0-9]*.sh`, so `tests/37` runs automatically inside the canonical `tests` CI job. The `c-traffic-entropy`-specific wiring was made moot by C.5._
 
 ## Verification
 
@@ -118,12 +117,12 @@ New public C function `msm_push_phone_frame(msm, idx, frame, token)` validates t
 
 ## Tasks
 
-- [ ] **B.1 Backend (C)** — Extend `multi_stream.{h,c}` with `slot_kind_t`, `msm_register_phone`, `msm_push_phone_frame`. Update `msm_remove_stream` + `msm_free` to handle `SLOT_PHONE` cleanly (no pthread joins). Behind `#ifdef ENABLE_TRAFFIC_ENTROPY`.
-- [ ] **B.2 Backend (C)** — `web_server.c`: route `POST /api/streams/phone`, `POST /api/streams/phone/{N}/frame`, `DELETE /api/streams/phone/{N}` to the new MSM functions. Auth: `Authorization: Bearer` for the reserve/delete endpoints; `X-Upload-Token` (constant-time) for the frame endpoint. Token validation under the manager lock.
-- [ ] **B.3 Backend (Rust)** — Mirror the three endpoints in `traffic_cypher_in_Rust/src/web/routes.rs` so parity holds. The Rust `MultiStreamManager` needs equivalent `register_phone` + `push_phone_frame` methods.
-- [ ] **B.4 Frontend** — `frontend/phone.html` (standalone capture page) + dashboard `Pair phone` button. Single canonical source; C `make frontend` mirrors. No new attribute-string interpolation sinks (per `tests/25`).
-- [ ] **B.5 Tests** — `tests/38_phone_camera_endpoint.sh`: builds flag-on, starts PM, unlocks, POSTs `/api/streams/phone` (asserts 202 + token), POSTs 3 synthetic PPMs (1×1 pixel for speed), polls `/api/streams` until `frames_captured >= 3` and `status == "Active"`, confirms `/api/entropy-snapshot.has_traffic_entropy == true`. Token-mismatch case asserts 403.
-- [ ] **B.6 Parity test** — Add a `phone_streams_status` case to `parity/cases.json` that reserves a phone slot on both implementations and compares the status shape (no `expected_diff` — they should match exactly).
+- [x] **B.1 Backend (C)** — `slot_kind_t`, `msm_register_phone`, `msm_push_phone_frame` in [multi_stream.h](traffic_cypher_in_C/include/multi_stream.h) + [multi_stream.c](traffic_cypher_in_C/src_c/multi_stream.c). _Landed in `a7975cd`._
+- [x] **B.2 Backend (C)** — Phone endpoints in [web_server.c](traffic_cypher_in_C/src_c/web_server.c). _Landed in `a7975cd`._
+- [x] **B.3 Backend (Rust)** — Mirror in [routes.rs](traffic_cypher_in_Rust/src/web/routes.rs) + [multi_stream.rs](traffic_cypher_in_Rust/src/multi_stream.rs). _Landed in `486a071`._
+- [x] **B.4 Frontend** — [frontend/phone.html](frontend/phone.html); C `make frontend` mirrors. _Landed in `a7975cd`._
+- [x] **B.5 Tests** — [tests/38_phone_camera_endpoint.sh](tests/38_phone_camera_endpoint.sh). _Landed in `a7975cd`._
+- [x] **B.6 Parity test** — `phone_streams_status` case in [parity/anchor_cases.json](parity/anchor_cases.json). _Landed in `486a071`._
 
 ## Verification
 
@@ -159,13 +158,13 @@ BUILD_VARIANT=traffic_entropy bash tests/60_parity_smoke.sh  # all cases includi
 
 ## Tasks
 
-- [ ] **C.1 Makefile** — invert the gate. New semantics: `make` defines `-DENABLE_TRAFFIC_ENTROPY` by default; `make ENABLE_TRAFFIC_ENTROPY=0` is the opt-out for the OS-only legacy path. Document the inversion in a comment block.
-- [ ] **C.2 `tests/31_c_no_entropy_lie.sh` rewrite** — rename to `tests/31_c_entropy_runtime_honesty.sh`. New invariant: "C build's runtime `traffic_entropy` flag accurately reflects whether frames have flowed". Cases: fresh PM with no streams → `false`; after `tests/38`-style synthetic frame POST → `true`.
-- [ ] **C.3 `tests/33_traffic_entropy_build.sh` rename** to `tests/33_os_only_build.sh`. Invert: now tests the `ENABLE_TRAFFIC_ENTROPY=0` opt-out path. Verifies the opt-out binary returns `traffic_entropy:false` from `/api/build/info` and POST `/api/streams` returns 501.
-- [ ] **C.4 `parity/cases.json`** — flip default `expected_diff` values for `streams_status` + `build_info`. Variant key renames: `default` → `traffic_entropy` (now the default mode), `traffic_entropy` → unused. Or, equivalently, rename to `os_only` for clarity.
-- [ ] **C.5 `.github/workflows/ci.yml`** — rename `c-traffic-entropy` → `c-os-only`. Its job becomes: build with `ENABLE_TRAFFIC_ENTROPY=0`, run `tests/33_os_only_build.sh`. (The regular `c` job now covers the flag-on path implicitly.)
-- [ ] **C.6 `README.md`** — flip the parity table cell to `C: Yes (default)` / `OS-only opt-out: ENABLE_TRAFFIC_ENTROPY=0`. Update the "Scope of the C implementation" section to describe the new default + the opt-out.
-- [ ] **C.7 `REMEDIATION_PROGRESS.md`** — entry documenting the flip + the resolution of the original #1b "honest relabel" item (it's now genuinely accurate without qualification).
+- [x] **C.1 Makefile** — inverted gate in [traffic_cypher_in_C/Makefile](traffic_cypher_in_C/Makefile) (`ifneq ($(ENABLE_TRAFFIC_ENTROPY),0)`). _Landed in `30decf1`._
+- [x] **C.2 `tests/31`** — semantics rewritten to "runtime honesty" (test still named `31_c_no_entropy_lie.sh`; the file rename was skipped as cosmetic but the comment header documents the new invariant). _Landed in `30decf1`._
+- [x] **C.3 `tests/33` rename** to [tests/33_os_only_build.sh](tests/33_os_only_build.sh). _Landed in `30decf1`._
+- [x] **C.4 `parity/cases.json`** — `expected_diff` flipped + variant renamed. _Landed in `30decf1`._
+- [x] **C.5 `.github/workflows/ci.yml`** — `c-traffic-entropy` → `c-os-only`. _Landed in `30decf1`._
+- [x] **C.6 `README.md`** — parity table + "Scope" section updated. _Landed in `30decf1`._
+- [x] **C.7 `REMEDIATION_PROGRESS.md`** — entry recorded. _Landed in `30decf1`._
 
 ## Verification
 
@@ -193,10 +192,10 @@ Single mechanical commit.
 
 ## Tasks
 
-- [ ] **D.1** `cd traffic_cypher_in_Rust && cargo fmt --all`. Expect ~1,321 lines of auto-generated diff.
-- [ ] **D.2** Verify the formatted source still passes `cargo build --release --bins --locked` + `cargo test --locked -- --test-threads=1` + `cargo clippy --all-targets --locked -- -D warnings`.
-- [ ] **D.3** `.github/workflows/ci.yml`: remove `continue-on-error: true` from the `cargo fmt --check` step (line ~65), rename the step from "informational" to "(gate)".
-- [ ] **D.4** Verify `bash tests/run.sh` still passes (no test changes expected).
+- [x] **D.1** `cargo fmt --all` applied. _Landed in `76bb88a`._
+- [x] **D.2** Build/test/clippy verified clean post-fmt. _Landed in `76bb88a`._
+- [x] **D.3** `cargo fmt --check (gate)` in [.github/workflows/ci.yml](.github/workflows/ci.yml) — no `continue-on-error`. _Landed in `76bb88a`._
+- [x] **D.4** `tests/run.sh` still green. _Landed in `76bb88a`._
 
 Single commit titled `style: cargo fmt across all Rust sources + flip CI gate`.
 
@@ -225,26 +224,10 @@ Two new jobs, both Ubuntu-only (Rust nightly + C clang+libFuzzer).
 
 ## Tasks
 
-- [ ] **E.1 `fuzz-rust` job** in `.github/workflows/ci.yml`:
-    - Matrix: `ubuntu-latest` only
-    - `needs:` nothing (parallel with everything else)
-    - Steps:
-        1. Install nightly Rust via `dtolnay/rust-toolchain@nightly` with `components: rustfmt`
-        2. `cargo install cargo-fuzz` (cached via `Swatinem/rust-cache` or a custom `actions/cache` keyed on the cargo-fuzz version)
-        3. For each target in `traffic_cypher_in_Rust/fuzz/fuzz_targets/*.rs`: `cargo +nightly fuzz run <target> -- -max_total_time=60`
-        4. Upload any `crash-*` artifacts on failure
-    - `timeout-minutes: 10` (60s × 2 targets + nightly install + cargo-fuzz install + corpus restore)
-- [ ] **E.2 `fuzz-c` job** in `.github/workflows/ci.yml`:
-    - Matrix: `ubuntu-latest` only (macOS ASan + libFuzzer combo is documented-broken in `Makefile`)
-    - Steps:
-        1. Install OpenSSL 3.3 (reuse the `c` job's cache)
-        2. `make -C traffic_cypher_in_C fuzz FUZZ_SANITIZER=fuzzer,address` (Linux can take the ASan combo)
-        3. For each binary in `traffic_cypher_in_C/fuzz_c/`: run with `-max_total_time=60 -error_exitcode=1`
-        4. Upload any `crash-*` artifacts on failure
-- [ ] **E.3 Corpus persistence** via `actions/cache@v4`:
-    - Path: `traffic_cypher_in_Rust/fuzz/corpus/`, `traffic_cypher_in_C/fuzz_c/corpus/`
-    - Key: `${{ runner.os }}-fuzzcorpus-${{ hashFiles('.github/workflows/ci.yml') }}` (bumps when the workflow changes; otherwise the corpus compounds across runs)
-- [ ] **E.4 Self-pin** — `tests/27_c_fuzz_scaffolding.sh` and `tests/26_fuzz_scaffolding.sh` already exist as regression. Add a small CI-job-name pin to one of them (`grep 'fuzz-c' ci.yml`, `grep 'fuzz-rust' ci.yml`) so a future workflow rename can't silently drop coverage.
+- [x] **E.1 `fuzz-rust` job** in [.github/workflows/ci.yml](.github/workflows/ci.yml). _Landed in `d145484` + follow-ups `20b90e5` (`cargo install` flag fix), `97df08f` (fuzz-discovered vault OOB fix)._
+- [x] **E.2 `fuzz-c` job** in [.github/workflows/ci.yml](.github/workflows/ci.yml). _Landed in `d145484` + follow-ups `7e9f9ae` (corpus-subdir path fix), `2204880` (`-Wl,-rpath` for OPENSSL_PREFIX)._
+- [x] **E.3 Corpus persistence** via `actions/cache@v4`. _Landed in `d145484`._
+- [x] **E.4 Self-pin** — `tests/26` + `tests/27` both pin the CI job name. _Landed in `d145484`._
 
 ## Verification
 

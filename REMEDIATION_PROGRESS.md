@@ -4,6 +4,67 @@ This file tracks step-by-step status of the items defined in `REMEDIATION_PLAN.m
 
 ---
 
+### 2026-05-14 — Routine re-entry: NEXT_STEPS.md checkbox hygiene + verification pass
+
+Routine re-entry on a clean working tree. No new functional remediation items pending: `REMEDIATION_PLAN.md` Weeks 0–3 + the nine-item backlog + Week 4+ #5c + #10d are all complete (verified in earlier entries), and all five `NEXT_STEPS.md` phases (A–E) landed earlier this week (`199240e`, `a7975cd`, `486a071`, `30decf1`, `76bb88a`, `d145484`, with three fuzz-CI follow-up commits and one fuzz-discovered vault OOB fix at `97df08f`).
+
+The only documentation drift left was `NEXT_STEPS.md`: its 25 checkboxes were all still literally `- [ ]` (unchecked), even though every item had landed. This entry records the verification pass + the checkbox hygiene fix.
+
+**Five-agent fan-out summary**
+
+| Agent | Result |
+|-------|--------|
+| **Security Agent** | No new vulnerabilities found in re-read. The most recent CI run (`97df08f`) closed a fuzz-discovered heap-buffer-overflow in `parse_vault_entries`. No new fuzz crashes in the latest run. `tests/15_cors_narrow`, `tests/16_static_zeroize`, `tests/18_unlock_rate_limit`, `tests/24_hardening_flags`, `tests/41_atomic_vault_writes` still pass. |
+| **Rust Agent** | `cargo build --release --bins --locked` ✓, `cargo test --locked -- --test-threads=1` → 8/8 PASS ✓, `cargo fmt --check` (hard gate) ✓, `cargo clippy --all-targets --locked -- -D warnings` ✓. `rust-toolchain.toml` MSRV pin + `[profile.release]` LTO/strip still in place. |
+| **C Agent** | `make -C traffic_cypher_in_C clean && make` clean on Apple Silicon (OPENSSL_PREFIX=`/opt/homebrew/opt/openssl@3`). Default build now defines `-DENABLE_TRAFFIC_ENTROPY` (verified via the compile line) — Phase C inversion is observable. `msm_test` 28/28 PASS implicitly via `tests/29`. |
+| **Testing & CI Agent** | `bash tests/run.sh` → **37 PASS + 1 SKIP** in 87 s on Apple Silicon. SKIP is `tests/34_c_auto_replay.sh` (no `yt-dlp` locally; expected). Latest CI run on `main` (`97df08f`) is green across all six jobs (`rust`, `c`, `c-os-only`, `fuzz-rust`, `fuzz-c`, `tests`). |
+| **GitHub/Repo Hygiene Agent** | `git status` clean. `git log` consistent with the progress narrative. No machine-specific paths leaked. No stray generated artefacts in the tree. The doc drift in `NEXT_STEPS.md` (25 stale unchecked boxes) is the only finding worth a commit. |
+
+**Files changed this entry**
+
+- `NEXT_STEPS.md` — status snapshot updated (test count `35 → 37 PASS + 1 SKIP`; reference commit `f68886a → 97df08f`; "Plan items remaining" set to **0**); all 25 checkboxes ticked with per-item landing-commit references. Two cosmetic-vs-substance deviations called out inline:
+    - **A.1 (yt-dlp/ffmpeg install on `c-traffic-entropy`)** was superseded by C.5: the `c-traffic-entropy` job ceased to exist. Tests 37/38 use bogus URLs + synthetic PPMs, so no `yt-dlp` is needed for the CI-covered cases.
+    - **C.2 file rename (`tests/31_c_no_entropy_lie.sh` → `tests/31_c_entropy_runtime_honesty.sh`)** was skipped as cosmetic; the file's comment header documents the rewritten "runtime honesty" invariant in its current location.
+- `REMEDIATION_PROGRESS.md` — this entry.
+
+**Verification (this run)**
+
+| Check | Result |
+|------|--------|
+| `git status` | clean working tree |
+| `cargo build --release --bins --locked` | OK |
+| `cargo test --locked -- --test-threads=1` | 8 passed; 0 failed |
+| `cargo fmt --check` (hard gate) | OK |
+| `cargo clippy --all-targets --locked -- -D warnings` | OK |
+| `make -C traffic_cypher_in_C clean && make` | OK |
+| `bash tests/run.sh` | **37 PASS + 1 SKIP** (87 s) |
+| `grep -c '^- \[ \]' NEXT_STEPS.md` | **0** (was 25) |
+| `grep -c '^- \[x\]' NEXT_STEPS.md` | **25** (was 0) |
+
+**Why no code changes**
+
+Per the routine's "be precise and conservative" rule, and the prior re-entry's precedent: the only remaining out-of-scope candidate is `#1a` full C `MultiStreamManager` port, which the plan explicitly deferred as "~2 weeks of focused C work". Every other plan item has either landed or has been documented as intentionally superseded. The honest update is to mark the documentation accordingly, not to invent fresh code changes.
+
+**Environment check (one-time, this run)**
+
+- OS: Darwin arm64 (macOS).
+- Tools present: `git`, `make`, `gcc`, `clang`, `rustc 1.95.0`, `cargo 1.95.0`, `rustfmt`, `clippy-driver`, `python3`, `curl`, `jq`, `ffmpeg`, OpenSSL 3 (Homebrew).
+- Tools absent locally (acceptable, documented):
+    - `yt-dlp` — only needed for `tests/34_c_auto_replay.sh` real-stream variant, which SKIPs cleanly without it.
+    - `actionlint` — optional per the routine; YAML inspected manually instead.
+    - `pkg-config` — not required because OpenSSL is referenced via `OPENSSL_PREFIX` directly in the Makefile.
+- No installations performed: nothing missing was on the routine's "install if possible" list as required for the work attempted this run.
+
+**Resume summary**
+
+- Last completed week per `REMEDIATION_PROGRESS.md`: **Week 4+ (everything in the plan), plus all five `NEXT_STEPS.md` phases.**
+- Last completed week per Git history: same — most recent functional commit is `97df08f` (fuzz-discovered vault OOB fix); the chain back to `199240e` (Phase A) is intact.
+- Last completed week per code inspection: same — verified by the file/symbol existence checks above and the 37-PASS run.
+- Resume point chosen: documentation hygiene only (no functional work remains in scope of the plan).
+- Mismatch noted: `NEXT_STEPS.md` checkboxes were stale (25 `[ ]` boxes) despite every item having landed. Fixed in this commit.
+
+---
+
 ### 2026-05-13 — Phase E (NEXT_STEPS.md): fuzz CI smoke (Rust + C)
 
 The last item on the NEXT_STEPS.md plan. Wires 60-second libFuzzer smokes for both the Rust and C fuzz targets into CI, so any new commit that introduces a panic / crash / OOB read in the parsing surfaces is caught at PR time rather than nightly.
