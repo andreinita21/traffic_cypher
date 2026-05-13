@@ -598,6 +598,63 @@ static void reset_unlock_rate_state_locked(app_state_t *state) {
     state->unlock_lockout_until = 0;
 }
 
+#ifdef ENABLE_TRAFFIC_ENTROPY
+/* Heap-allocated snapshot of the persisted stream list, handed off from the
+ * unlock handler to the replay pthread. The handler owns state->stream_config
+ * (which it reads under state->lock); we copy the slots we need into our own
+ * heap buffer so the replay thread can iterate without holding the state lock
+ * across multi-second yt-dlp calls. */
+typedef struct {
+    multi_stream_manager_t *msm;
+    int                     count;
+    stream_entry_t          streams[VAULT_MAX_STREAMS];
+} stream_replay_snapshot_t;
+
+/* Why a detached thread: msm_add_stream is synchronous and calls yt-dlp +
+ * starts ffmpeg per entry (~2-5 s each). Replaying inline from handle_unlock
+ * would stall the HTTP response by 30+ s for a full 16-stream config. */
+static void *stream_replay_main(void *arg) {
+    stream_replay_snapshot_t *snap = (stream_replay_snapshot_t *)arg;
+    if (snap && snap->msm) {
+        for (int i = 0; i < snap->count; i++) {
+            const stream_entry_t *se = &snap->streams[i];
+            if (!se->enabled) continue;
+            (void)msm_add_stream(snap->msm, se->url, se->label);
+        }
+    }
+    free(snap);
+    return NULL;
+}
+
+/* Snapshot the persisted streams under the lock, then launch a detached
+ * pthread that re-registers each one with the manager. The thread frees the
+ * snapshot on exit. Returns 0 on success, -1 on allocation / pthread failure
+ * (in which case the snapshot is freed before return and unlock proceeds
+ * without replay). Caller must hold state->lock. */
+static int spawn_stream_replay_locked(app_state_t *state) {
+    if (!state->msm || state->stream_config.stream_count == 0) {
+        return 0;
+    }
+    stream_replay_snapshot_t *snap = malloc(sizeof(*snap));
+    if (!snap) {
+        return -1;
+    }
+    snap->msm = state->msm;
+    snap->count = state->stream_config.stream_count;
+    if (snap->count > VAULT_MAX_STREAMS) snap->count = VAULT_MAX_STREAMS;
+    memcpy(snap->streams, state->stream_config.streams,
+           (size_t)snap->count * sizeof(stream_entry_t));
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, stream_replay_main, snap) != 0) {
+        free(snap);
+        return -1;
+    }
+    pthread_detach(tid);
+    return 0;
+}
+#endif
+
 static void handle_unlock(int fd, app_state_t *state, http_request_t *req) {
     char *master_pw = json_body_get_string(req->body, "master_password");
     if (!master_pw) {
@@ -646,6 +703,13 @@ static void handle_unlock(int fd, app_state_t *state, http_request_t *req) {
     /* Load stream config */
     load_stream_config(&state->stream_config);
     state->auto_lock_minutes = state->stream_config.settings.auto_lock_minutes;
+
+#ifdef ENABLE_TRAFFIC_ENTROPY
+    if (spawn_stream_replay_locked(state) != 0) {
+        fprintf(stderr, "warning: failed to spawn stream replay thread; "
+                        "persisted streams will not auto-register\n");
+    }
+#endif
 
     /* Start rotation daemon */
     state->rotation_stop = 0;
