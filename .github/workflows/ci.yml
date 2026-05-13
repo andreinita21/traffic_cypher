@@ -117,10 +117,15 @@ jobs:
           make -C traffic_cypher_in_C
 
   c-traffic-entropy:
-    # Week 4+ #1a stage 4: prove the opt-in ENABLE_TRAFFIC_ENTROPY=1 build
-    # compiles cleanly on both runners and that the binary carries the flipped
-    # build_info literal. Kept parallel to `c` and `rust` (no `needs:`) so a
-    # break here doesn't block the default-build test matrix.
+    # NEXT_STEPS.md Phase A: exercise the opt-in ENABLE_TRAFFIC_ENTROPY=1 build
+    # end-to-end. Builds C with the flag, asserts the binary-string flip,
+    # builds Rust (needed for parity), installs yt-dlp+ffmpeg, then runs both
+    # the build-only regression (tests/33) and the parity-variant smoke
+    # (BUILD_VARIANT=traffic_entropy → all 4 anchor cases must agree under
+    # the flag; this is the safety net for the future default-flip).
+    #
+    # Kept parallel to `c` and `rust` (no `needs:`) so a break here doesn't
+    # block the default-build test matrix.
     name: c-traffic-entropy (${{ matrix.os }})
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
@@ -128,7 +133,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 8
+    timeout-minutes: 12
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -161,6 +166,38 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install openssl@3
 
+      # Rust toolchain + cache — needed for the parity-variant step. The
+      # variant runs `parity/parity_test.py` which boots one Rust PM and one
+      # C PM (rebuilt out-of-tree with ENABLE_TRAFFIC_ENTROPY=1) and diffs
+      # their responses for each anchor case.
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: traffic_cypher_in_Rust
+
+      - name: cargo build --release --bins --locked
+        run: cargo build --release --bins --locked
+        working-directory: traffic_cypher_in_Rust
+
+      # yt-dlp + ffmpeg for the async pipeline e2e check. tests/37 does NOT
+      # require them to be present — it tests the resolve-failure path with
+      # a bogus URL — but parity's stream-related cases (streams_status)
+      # benefit from both being available.
+      - name: Install yt-dlp + ffmpeg (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          # yt-dlp via pip — apt's version is often months behind YouTube.
+          python3 -m pip install --user --quiet yt-dlp
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install yt-dlp + ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg yt-dlp
+
       - name: make ENABLE_TRAFFIC_ENTROPY=1
         run: make -C traffic_cypher_in_C ENABLE_TRAFFIC_ENTROPY=1
 
@@ -170,11 +207,28 @@ jobs:
             | grep -q '"traffic_entropy":true' \
             || { echo "binary missing traffic_entropy:true literal"; exit 1; }
 
-      # tests/33 is the only test we need: it does its own out-of-tree rebuild
-      # with the flag, so it proves the flag-on build still produces a working
-      # binary. Skipping tests/run.sh keeps this job a fast build smoke check.
+      # tests/33: scaffolding + build-only checks (does its own out-of-tree
+      # rebuild). The CI-job-name pin inside this test guards against the
+      # job being renamed without updating coverage.
       - name: Run tests/33_traffic_entropy_build.sh
         run: bash tests/33_traffic_entropy_build.sh
+
+      # tests/37: end-to-end async pipeline smoke. Bogus URL → 202 promptly
+      # → slot transitions to Failed within 15s. Proves the prep pthread
+      # path is alive in CI without depending on a real YouTube reachability.
+      - name: Run tests/37_msm_e2e_smoke.sh
+        run: bash tests/37_msm_e2e_smoke.sh
+
+      # Parity-variant smoke: ensures the flag-on C build matches Rust on
+      # every anchor case. Restore the default C binary first so the
+      # variant build is the only thing under test (parity_test.py does its
+      # own out-of-tree rebuild for the variant).
+      - name: Restore default C build for Rust-vs-C parity
+        run: |
+          make -C traffic_cypher_in_C clean
+          make -C traffic_cypher_in_C
+      - name: Run parity smoke (BUILD_VARIANT=traffic_entropy)
+        run: BUILD_VARIANT=traffic_entropy bash tests/60_parity_smoke.sh
 
   tests:
     name: tests (${{ matrix.os }})

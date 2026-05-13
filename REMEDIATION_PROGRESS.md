@@ -4,6 +4,36 @@ This file tracks step-by-step status of the items defined in `REMEDIATION_PLAN.m
 
 ---
 
+### 2026-05-13 — Phase A (NEXT_STEPS.md): parity-variant in CI
+
+First slice of the `NEXT_STEPS.md` plan. Lands the CI safety net for the future default-flip: `c-traffic-entropy` now runs the parity smoke against the flag-on C build on every push, on both runners.
+
+**Wire-up**
+
+- `.github/workflows/ci.yml` — `c-traffic-entropy` job extended:
+  - Adds Rust toolchain install + `Swatinem/rust-cache` + `cargo build --release --bins --locked` (parity needs the Rust PM).
+  - Adds yt-dlp + ffmpeg install steps (apt-get + pip on Ubuntu, brew on macOS). `python3 -m pip install --user yt-dlp` is preferred over apt since apt's yt-dlp is typically months behind YouTube; `$HOME/.local/bin` is added to `GITHUB_PATH`.
+  - After the existing `tests/33` build-only smoke, runs:
+    - `tests/37_msm_e2e_smoke.sh` — end-to-end POST/poll loop.
+    - `make clean && make` to restore the *default* C binary (parity's variant mode rebuilds the C side itself; the default binary on disk must NOT be the flag-on one or parity_test.py's variant detection gets confused).
+    - `BUILD_VARIANT=traffic_entropy bash tests/60_parity_smoke.sh` — all 4 anchor cases must agree under the flag.
+  - `timeout-minutes` bumped 8 → 12 (Rust cold-build + yt-dlp/ffmpeg install + parity smoke + tests/33 + tests/37 fit comfortably in 12).
+- `tests/37_msm_e2e_smoke.sh` (new) — out-of-tree `make ENABLE_TRAFFIC_ENTROPY=1` build, boots PM, unlocks, POSTs `https://invalid.example/not-a-real-stream`, asserts 202 within 2s, polls `/api/streams` up to 15s for `Failed`, confirms `frames_captured == 0`. 7 assertions. Bogus URL on purpose — proves the prep-pthread → resolve → fail → cancel-window-honoured path is alive without needing real YouTube reachability.
+
+**Verification**
+
+- `bash tests/37_msm_e2e_smoke.sh` — POST elapsed `0.02s`, slot reaches Failed in ~1s. 7/7 PASS.
+- `bash tests/run.sh` — **36 PASS + 1 SKIP** in 78s on Apple Silicon (was 35; +1 new test). The SKIP is `tests/34_c_auto_replay.sh`'s yt-dlp-dependent integration step.
+- `BUILD_VARIANT=traffic_entropy bash tests/60_parity_smoke.sh` — `PASS: 4   KNOWN-DIVERGENT: 0   FAIL: 0` in 4.4s.
+
+**Risks**
+
+- yt-dlp pip install adds ~30s to the CI job; cached in pip's user-site cache by default but `actions/cache` would compound across runs. Not optimised here — push-time tradeoff is acceptable.
+- The "make clean && make" restore step exists because `parity_test.py`'s `BUILD_VARIANT=traffic_entropy` mode rebuilds the C side in a temp dir but the Rust side reads `traffic_cypher_in_C/traffic-cypher-pm` for the default-mode comparison check (if any). Without the restore, residual flag-on artifacts on disk could confuse the default-variant lookup. Defensive; cheap; harmless.
+- `tests/37` adds ~25s to local `bash tests/run.sh` (out-of-tree rebuild). Acceptable but watch this as the suite grows.
+
+---
+
 ### 2026-05-13 — Week 4+ #1a stage 5: async `msm_add_stream` (prep pthread)
 
 Removes the multi-second blocking caveat documented in the stage 3 entry. `msm_add_stream` no longer calls `resolve_stream_url` (yt-dlp) or `frame_capture_start` (ffmpeg) on the caller's thread — those run in a per-slot prep pthread spawned by `msm_add_stream` and joined by `msm_remove_stream` / `msm_free`.
