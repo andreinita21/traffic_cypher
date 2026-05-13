@@ -156,6 +156,14 @@ void app_state_init(app_state_t *state) {
     state->auto_lock_minutes = 5;
     state->last_activity = (uint64_t)time(NULL);
     strcpy(state->entropy_source, "os");
+
+    /* Ring capacity 256 matches Rust's tokio::mpsc::channel(256) at
+     * multi_stream.rs:51. msm_new returns NULL on OOM; rotation_daemon and
+     * the (future) stream handlers tolerate NULL. */
+    state->msm = msm_new(256);
+    if (!state->msm) {
+        fprintf(stderr, "[WARN] msm_new failed — stream ingestion disabled\n");
+    }
 }
 
 void app_state_touch(app_state_t *state) {
@@ -1567,6 +1575,14 @@ int web_server_start(app_state_t *state, int port) {
     pthread_mutex_unlock(&state->lock);
     if (rotation_was_running) {
         pthread_join(state->rotation_thread, NULL);
+    }
+
+    /* Tear down the multi_stream manager last — rotation_daemon was the
+     * consumer; with it joined no other thread reads state->msm. msm_free
+     * SIGTERMs every forwarder + joins them before freeing the ring. */
+    if (state->msm) {
+        msm_free(state->msm);
+        state->msm = NULL;
     }
 
     free(frontend_index);

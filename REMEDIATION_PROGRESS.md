@@ -208,6 +208,46 @@ Moved `traffic_cypher_benchmark_report.docx` and `traffic_cypher_benchmark_repor
 
 ---
 
+### 2026-05-13 — Week 4+ #1a stage 2: `rotation_daemon` rewrite (consumer side)
+
+Second slice of the C `MultiStreamManager` port. Rewires `rotation_daemon` in `traffic_cypher_in_C/src_c/key_rotation.c` so that, once a second, it first attempts `msm_pick_random_frame(state->msm, ...)`. On hit it runs the full Rust-parity pipeline — `extract_entropy` (full-frame SHA-256 + delta-from-previous + 8×8 block hashes) → `entropy_pool_push` → `entropy_pool_digest` → `mix_entropy` → `derive_key` — and sets `state->has_traffic_entropy = 1` (monotonic, matching `key_rotation.rs:138`). On miss it falls back to the pre-#1a `RAND_bytes`-only path verbatim.
+
+**Why no build flag is needed.** Stage 1 shipped the MSM symbols but no producer side (`web_server.c::handle_add_stream` still returns 501). Until stage 3 lands the producer wiring, `msm_pick_random_frame` always returns -1 → the daemon takes the OS-only path every tick → behaviour is observationally identical to before. The new code path is reachable but inert; no `ENABLE_TRAFFIC_ENTROPY` macro is required.
+
+**Files**
+- `traffic_cypher_in_C/include/web_server.h` — added `#include "multi_stream.h"` and `multi_stream_manager_t *msm;` field on `app_state_t` with a docstring describing the staged wire-up.
+- `traffic_cypher_in_C/src_c/web_server.c`:
+  - `app_state_init()` — calls `msm_new(256)` (matches Rust's `tokio::mpsc::channel(256)` at `multi_stream.rs:51`); NULL tolerated with a stderr warning.
+  - `web_server_start()` end-of-function cleanup — `msm_free(state->msm)` after the rotation daemon has joined.
+- `traffic_cypher_in_C/src_c/key_rotation.c` — full rewrite of `rotation_daemon`. Adds `<entropy_extractor.h>`, `<multi_stream.h>`, `<frame_sampler.h>`, `<stdlib.h>`. Caches `msm` at daemon start under the lock and treats NULL as "no streams". Manages `previous_frame_data` ownership across iterations.
+
+**Behaviour matrix**
+
+| State | Stage 1 | Stage 2 (this commit) |
+|---|---|---|
+| C PM with no streams added (current real-world state) | OS-only path; `has_traffic_entropy=0` | OS-only path; `has_traffic_entropy=0` |
+| C PM with streams added (future stage 3) | n/a — `handle_add_stream` returns 501 | Frame path; `has_traffic_entropy=1` once a frame flows |
+| C PM `rotation_running` snapshot | ✓ | ✓ |
+| C PM `key_epoch` ticks every second | ✓ | ✓ |
+| C PM `pool_depth` grows | ✓ (capped at pool capacity 8) | ✓ (same) |
+| C PM `frames_processed` | unchanged from pre-#1a (stays 0) | increments on each frame hit (currently 0 because none flow) |
+
+**Verification**
+- `make -C traffic_cypher_in_C clean && make` — clean.
+- `make -C traffic_cypher_in_C msm_test && ./traffic_cypher_in_C/msm_test` — 28/28 PASS (unchanged from stage 1; daemon doesn't drive the test).
+- `bash tests/run.sh` — **32/32 PASS** in 73s on Apple Silicon. The critical regressions here:
+  - `tests/31_c_no_entropy_lie.sh` (3-second daemon soak): C PM still reports `has_traffic_entropy:false`. Confirms the daemon takes the OS-only path when no streams are added.
+  - `tests/50_c_pm_stress.sh`: 20-entry × 10-history-each stress under the new daemon — passes within budget.
+  - `tests/60_parity_smoke.sh`: `expected_diff` flags on `streams_status` and `build_info` are still `true` (correct — stage 3 will flip them).
+- `cargo build --release` / `cargo clippy --all-targets -- -D warnings` / `cargo test` — clean (no Rust files touched).
+
+**Risks**
+- `pool_chain` allocation can fail under memory pressure; silently dropped (chain still works because `new_key` lives in `previous_key`). Previously the same allocation existed without a NULL guard — the new code adds one because the daemon now uses more memory per tick when frames flow.
+- A frame's pixel buffer may be up to `1280×720×3 ≈ 2.6 MiB` (ffmpeg `scale=320:240` in `frame_sampler.c:51` caps it at 230 KiB in practice). The daemon keeps one `previous_frame_data` plus the just-picked frame across iterations — 2 × 230 KiB peak. Acceptable.
+- `state->msm` reads in the daemon are racy with `app_state_init` only if the daemon could start before init — it can't (daemon is started by `handle_unlock` after init completes), so the snapshot read at daemon start is safe without a lock.
+
+---
+
 ### 2026-05-13 — Week 4+ #1a stage 1: `multi_stream` C module + bounded MPSC ring + unit tests
 
 First substantive landing of the C `MultiStreamManager` port (`REMEDIATION_PLAN.md:332`). The plan estimates the *full* port at ~2 weeks; this commit delivers the foundation — the module, the bounded MPSC ring, the per-stream forwarder thread, and a unit-test harness — without touching `web_server.c` or `rotation_daemon`. The production behaviour is unchanged: the symbols ship in the binary but no caller invokes them yet.

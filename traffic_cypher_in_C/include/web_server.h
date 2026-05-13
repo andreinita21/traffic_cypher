@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <pthread.h>
 #include "vault.h"
+#include "multi_stream.h"
 
 /* --- App state (shared across request handlers) --- */
 
@@ -42,6 +43,19 @@ typedef struct {
 
     /* Stream config */
     stream_config_t stream_config;
+
+    /* Multi-stream manager. Owns the per-stream forwarder threads and the
+     * shared bounded MPSC ring the rotation daemon consumes from. Created
+     * once at app_state_init() (capacity 256 — matches Rust's
+     * tokio::mpsc::channel at multi_stream.rs:51); freed in web_server_start()
+     * after the rotation daemon has joined. NULL on allocation failure;
+     * rotation_daemon and the stream handlers both tolerate NULL.
+     *
+     * Wire-up arrives in stages: stage 1 (current) ships the module + ring;
+     * stage 2 (this commit) makes rotation_daemon consume from it; stage 3
+     * routes handle_add_stream/handle_list_streams/handle_remove_stream
+     * through the manager and flips /api/build/info traffic_entropy:true. */
+    multi_stream_manager_t *msm;
 
     /* Rate limit for /api/auth/unlock (REMEDIATION_PLAN.md §8). Process-
      * lifetime only — restart clears, single-user localhost service so no
