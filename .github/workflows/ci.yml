@@ -191,6 +191,139 @@ jobs:
       - name: Run tests/33_os_only_build.sh
         run: bash tests/33_os_only_build.sh
 
+  fuzz-rust:
+    # NEXT_STEPS.md Phase E: 60s libFuzzer smoke per Rust target on every
+    # push. cargo-fuzz needs nightly. Targets live in
+    # traffic_cypher_in_Rust/fuzz/fuzz_targets/ (NOT in the parent
+    # workspace — see the comment block in fuzz/Cargo.toml). Persists
+    # corpus across runs via actions/cache so coverage compounds.
+    name: fuzz-rust (ubuntu)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo-fuzz install + parent target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            traffic_cypher_in_Rust
+            traffic_cypher_in_Rust/fuzz
+          # Cargo-fuzz itself goes under ~/.cargo/bin via `cargo install`;
+          # Swatinem's action caches that automatically.
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Corpus seeds are committed; the cache layers any new units found
+      # by earlier runs on top, so coverage grows monotonically. Key on
+      # the workflow file's SHA so a CI overhaul resets the cache cleanly.
+      - name: Restore fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: traffic_cypher_in_Rust/fuzz/corpus
+          key: ${{ runner.os }}-fuzz-rust-corpus-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-fuzz-rust-corpus-
+
+      # 60s per target. -error_exitcode=1 forces libFuzzer to exit non-zero
+      # on any crash so the job fails (default is exit-with-the-crashing-process).
+      - name: cargo +nightly fuzz run vault_version_probe (60s)
+        working-directory: traffic_cypher_in_Rust
+        run: cargo +nightly fuzz run vault_version_probe -- -max_total_time=60 -error_exitcode=1
+      - name: cargo +nightly fuzz run vault_v3_envelope (60s)
+        working-directory: traffic_cypher_in_Rust
+        run: cargo +nightly fuzz run vault_v3_envelope -- -max_total_time=60 -error_exitcode=1
+
+      # Surface crash inputs as workflow artifacts so a maintainer can grab
+      # the minimal reproducer without re-running locally.
+      - name: Upload crashes (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-rust-crashes
+          path: |
+            traffic_cypher_in_Rust/fuzz/artifacts/**
+          if-no-files-found: ignore
+
+  fuzz-c:
+    # NEXT_STEPS.md Phase E: 60s libFuzzer smoke per C target on every push.
+    # ubuntu-latest ships clang with libFuzzer + ASan; the macOS combo is
+    # documented-broken (see traffic_cypher_in_C/Makefile FUZZ_SANITIZER
+    # comment) — Linux-only is the right matrix here.
+    name: fuzz-c (ubuntu)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache OpenSSL 3.3 (Ubuntu)
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/openssl-3.3
+          key: ${{ runner.os }}-openssl-3.3.2-v1
+      - name: Build OpenSSL 3.3 (cache miss)
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          cd /tmp
+          curl -fsSL https://www.openssl.org/source/openssl-3.3.2.tar.gz -o openssl.tgz
+          tar -xzf openssl.tgz
+          cd openssl-3.3.2
+          ./Configure --prefix=/usr/local/openssl-3.3 --libdir=lib64 \
+            no-tests no-docs no-apps linux-x86_64
+          make -j"$(nproc)" build_libs
+          sudo make install_dev install_runtime_libs
+      - name: Export OPENSSL_PREFIX
+        run: echo "OPENSSL_PREFIX=/usr/local/openssl-3.3" >> "$GITHUB_ENV"
+
+      - name: Restore fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: traffic_cypher_in_C/fuzz_c/corpus
+          key: ${{ runner.os }}-fuzz-c-corpus-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-fuzz-c-corpus-
+
+      # Linux clang supports the fuzzer+address sanitizer combo (the macOS
+      # arm64 issue documented in the Makefile doesn't apply here).
+      - name: Build fuzz targets (clang + fuzzer,address)
+        run: make -C traffic_cypher_in_C fuzz FUZZ_CC=clang FUZZ_SANITIZER=fuzzer,address
+
+      - name: Run fuzz_hex_decode (60s)
+        run: |
+          cd traffic_cypher_in_C
+          ./fuzz_c/fuzz_hex_decode fuzz_c/corpus/fuzz_hex_decode \
+            -max_total_time=60 -error_exitcode=1
+      - name: Run fuzz_json_get_string (60s)
+        run: |
+          cd traffic_cypher_in_C
+          ./fuzz_c/fuzz_json_get_string fuzz_c/corpus/fuzz_json_get_string \
+            -max_total_time=60 -error_exitcode=1
+      - name: Run fuzz_parse_vault_entries (60s)
+        run: |
+          cd traffic_cypher_in_C
+          ./fuzz_c/fuzz_parse_vault_entries fuzz_c/corpus/fuzz_parse_vault_entries \
+            -max_total_time=60 -error_exitcode=1
+
+      - name: Upload crashes (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-c-crashes
+          path: |
+            traffic_cypher_in_C/fuzz_c/crash-*
+            traffic_cypher_in_C/fuzz_c/leak-*
+            traffic_cypher_in_C/fuzz_c/oom-*
+          if-no-files-found: ignore
+
   tests:
     name: tests (${{ matrix.os }})
     needs: [rust, c]

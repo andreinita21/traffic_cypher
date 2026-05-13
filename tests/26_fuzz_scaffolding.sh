@@ -58,3 +58,12 @@ if grep -q '^\[workspace\]' "$RUST/Cargo.toml"; then
         "parent Cargo.toml lists fuzz as a workspace member (would break stable CI)"
 fi
 pass "fuzz/ correctly isolated from the parent build"
+
+# 7. Pin the CI job name so a future workflow rename can't quietly drop
+#    fuzz coverage. NEXT_STEPS.md Phase E wired this on 2026-05-13.
+CI_YML="$REPO_ROOT/.github/workflows/ci.yml"
+if [ -f "$CI_YML" ]; then
+    grep -q 'fuzz-rust' "$CI_YML" \
+        || fail "ci.yml missing 'fuzz-rust' job — rename without updating this test would lose Rust fuzz CI coverage"
+    pass "ci.yml still defines the fuzz-rust job"
+fi

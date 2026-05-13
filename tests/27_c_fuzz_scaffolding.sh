@@ -61,3 +61,12 @@ pass "seed corpora populated for all 3 targets"
 grep -q '\.dSYM' "$C/fuzz_c/.gitignore" \
     || fail "fuzz_c/.gitignore does not ignore *.dSYM (will pollute commits on macOS)"
 pass "fuzz_c/.gitignore covers binaries + crash-* + .dSYM"
+
+# 8. Pin the CI job name so a future workflow rename can't quietly drop
+#    fuzz coverage. NEXT_STEPS.md Phase E wired this on 2026-05-13.
+CI_YML="$REPO_ROOT/.github/workflows/ci.yml"
+if [ -f "$CI_YML" ]; then
+    grep -q 'fuzz-c' "$CI_YML" \
+        || fail "ci.yml missing 'fuzz-c' job — rename without updating this test would lose C fuzz CI coverage"
+    pass "ci.yml still defines the fuzz-c job"
+fi

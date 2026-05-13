@@ -4,6 +4,53 @@ This file tracks step-by-step status of the items defined in `REMEDIATION_PLAN.m
 
 ---
 
+### 2026-05-13 — Phase E (NEXT_STEPS.md): fuzz CI smoke (Rust + C)
+
+The last item on the NEXT_STEPS.md plan. Wires 60-second libFuzzer smokes for both the Rust and C fuzz targets into CI, so any new commit that introduces a panic / crash / OOB read in the parsing surfaces is caught at PR time rather than nightly.
+
+**Two new CI jobs**
+
+- `fuzz-rust` (ubuntu-latest) — installs nightly Rust + `cargo install cargo-fuzz`, restores the seed corpus from `actions/cache`, then runs each target in `traffic_cypher_in_Rust/fuzz/fuzz_targets/` (currently `vault_version_probe` + `vault_v3_envelope`) for 60s with `-max_total_time=60 -error_exitcode=1`. Crashes uploaded as workflow artefacts via `actions/upload-artifact@v4` (only on failure, `if-no-files-found: ignore`).
+- `fuzz-c` (ubuntu-latest only — the macOS arm64 + libFuzzer + ASan combo is documented-broken in the `Makefile`'s `FUZZ_SANITIZER` block) — restores OpenSSL 3.3 (reuses the cache the `c` job populates), restores the seed corpus, then `make fuzz FUZZ_CC=clang FUZZ_SANITIZER=fuzzer,address` and runs each of the three C targets (`fuzz_hex_decode`, `fuzz_json_get_string`, `fuzz_parse_vault_entries`) for 60s with `-error_exitcode=1`. Same crash-artefact upload pattern.
+
+**Corpus persistence**
+
+`actions/cache@v4` on each target's `corpus/` directory, keyed on `${{ runner.os }}-fuzz-{rust,c}-corpus-${{ hashFiles('.github/workflows/ci.yml') }}`. Cache key bumps when the workflow file changes (CI overhauls reset cleanly); within a single workflow generation, corpus units found by earlier runs compound on top of the committed seeds. `restore-keys` lets a fresh key version inherit the previous corpus rather than starting cold.
+
+**Self-pinning**
+
+`tests/26_fuzz_scaffolding.sh` + `tests/27_c_fuzz_scaffolding.sh` each gain a small assertion that `ci.yml` contains the corresponding job name (`fuzz-rust` / `fuzz-c`). A future workflow rename without updating these tests would lose fuzz CI coverage; the assertion fails loudly.
+
+**Why ubuntu-only**
+
+- Rust nightly + cargo-fuzz works on macOS but adds ~3 min of toolchain install per run for marginal coverage benefit — Linux's libFuzzer build is the canonical one.
+- The C side has a documented macOS arm64 bug in the LLVM 20 ASan runtime that hangs libFuzzer init. The `Makefile`'s `FUZZ_SANITIZER` knob makes this explicit (default `fuzzer` only on macOS; `fuzzer,address` is opt-in for Linux). Running C fuzz on macOS would either disable ASan (losing the bug coverage) or hang the runner. Linux-only is the right matrix.
+
+**Verification**
+
+- `python3 -c "...print(jobs)"` against the rewritten `ci.yml` reports `['rust', 'c', 'c-os-only', 'fuzz-rust', 'fuzz-c', 'tests']`.
+- `bash tests/26_fuzz_scaffolding.sh` — passes; the new `fuzz-rust` pin reports green.
+- `bash tests/27_c_fuzz_scaffolding.sh` — passes; the new `fuzz-c` pin reports green.
+- `bash tests/run.sh` — **37 PASS + 1 SKIP** in 87 s (test count unchanged; both fuzz tests grew one assertion each).
+- Local smoke: each Rust target runs cleanly for 60s with `cargo +nightly fuzz run …` (cargo-fuzz already installed locally); each C target runs cleanly with `./fuzz_c/<target> … -max_total_time=10` (10s on a laptop confirms the entry point + sanitizer wire-up).
+
+**This closes the NEXT_STEPS.md plan**
+
+Phases A through E are all landed. The project is functionally complete by the maintainer's definition:
+
+| Phase | What | Commit |
+|---|---|---|
+| A | Parity-variant CI safety net | `199240e` |
+| B | Phone-camera entropy source (C side) | `a7975cd` |
+| B.3 | Phone-camera Rust mirror + parity case | `486a071` |
+| C | `ENABLE_TRAFFIC_ENTROPY` default-flip | `30decf1` |
+| D | `cargo fmt` + hard CI gate | `76bb88a` |
+| E | Fuzz CI (60s push-time smoke) | this commit |
+
+Default `make` ships full traffic entropy with two ingestion paths (YouTube via yt-dlp/ffmpeg + phone camera via PPM POST), parity-verified against Rust on every push, with libFuzzer smokes catching panics on the parsing surfaces.
+
+---
+
 ### 2026-05-13 — Phase D (NEXT_STEPS.md): `cargo fmt` + hard CI gate
 
 Mechanical. Runs `cargo fmt --all` over every Rust source in `traffic_cypher_in_Rust/` (src + tests + examples + fuzz + benchmark + bin), and flips the CI step from `continue-on-error: true` to a hard gate.
