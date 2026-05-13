@@ -217,8 +217,11 @@ jobs:
           # Cargo-fuzz itself goes under ~/.cargo/bin via `cargo install`;
           # Swatinem's action caches that automatically.
 
+      # --locked dropped intentionally: cargo-fuzz's Cargo.lock pins an old
+      # `rustix` that fails to compile against current nightly Rust
+      # (rustc_attrs feature drift). Let cargo resolve a working version.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz
 
       # Corpus seeds are committed; the cache layers any new units found
       # by earlier runs on top, so coverage grows monotonically. Key on
