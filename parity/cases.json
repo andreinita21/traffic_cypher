@@ -10,8 +10,14 @@
         "  normalize_drop    array<string>     JSON keys whose values are dropped",
         "                                      before comparison (timestamps,",
         "                                      ids, nonces, etc.)",
-        "  expected_diff     bool (optional)   if true, mismatch is reported as",
-        "                                      KNOWN-DIVERGENT instead of FAIL",
+        "  expected_diff     bool | object     if true, mismatch is reported as",
+        "                    (optional)        KNOWN-DIVERGENT instead of FAIL.",
+        "                                      May also be an object keyed by",
+        "                                      BUILD_VARIANT (e.g. {\"default\":true,",
+        "                                      \"traffic_entropy\":false}); the",
+        "                                      runner resolves it to a scalar bool",
+        "                                      using the active variant, falling",
+        "                                      back to the \"default\" key or false.",
         "  reason            string (optional) why expected_diff is set",
         "",
         "Request shape:",
@@ -61,8 +67,8 @@
         },
         {
             "name": "streams_status",
-            "expected_diff": true,
-            "reason": "C build has no MultiStreamManager port; tracked as #1a in REMEDIATION_PLAN.md. Flip expected_diff to false once #1a lands.",
+            "expected_diff": {"default": true, "traffic_entropy": false},
+            "reason": "Default C build has the static 'Disabled' stub. With ENABLE_TRAFFIC_ENTROPY=1 (BUILD_VARIANT=traffic_entropy) the C build reads from multi_stream_manager_t and matches Rust ([] on a fresh PM). Tracked as #1a in REMEDIATION_PLAN.md.",
             "requests": [
                 {"method": "POST", "path": "/api/auth/unlock",
                  "body": {"master_password": "testpass"},
@@ -75,12 +81,12 @@
         },
         {
             "name": "build_info",
-            "expected_diff": true,
-            "reason": "Rust returns traffic_entropy:true and build:rust; C returns traffic_entropy:false and build:c. Flip expected_diff to false once #1a (path-a) lands and the C build genuinely mixes traffic entropy.",
+            "expected_diff": {"default": true, "traffic_entropy": false},
+            "reason": "Default C build returns traffic_entropy:false; Rust returns true. With ENABLE_TRAFFIC_ENTROPY=1 (BUILD_VARIANT=traffic_entropy) the C build flips to traffic_entropy:true and matches. Note: build field itself ('c' vs 'rust') is dropped via normalize_drop.",
             "requests": [
                 {"method": "GET", "path": "/api/build/info"}
             ],
-            "normalize_drop": []
+            "normalize_drop": ["build"]
         }
     ]
 }

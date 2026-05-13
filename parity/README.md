@@ -23,6 +23,10 @@ python3 parity/parity_test.py --max-cases 4
 
 # Run a single case by name, with per-request logging:
 python3 parity/parity_test.py --case create_with_tags --verbose
+
+# Run against the ENABLE_TRAFFIC_ENTROPY=1 C build (rebuilds C into a
+# tmpdir; does not touch the canonical traffic_cypher_in_C/traffic-cypher-pm):
+BUILD_VARIANT=traffic_entropy python3 parity/parity_test.py --max-cases 4
 ```
 
 The harness exits **0** when every case either matched exactly or was
@@ -119,7 +123,7 @@ existing keys without bumping the version.
 | `name`            | string         | Shown in the run output. Must be unique within `cases`.                |
 | `requests`        | array<request> | Replayed in order. See below for the request shape.                    |
 | `normalize_drop`  | array<string>  | JSON keys whose values are stripped before comparison (recursive).     |
-| `expected_diff`   | bool           | If true, divergence is reported as `KNOWN-DIVERGENT` instead of fail.  |
+| `expected_diff`   | bool or object | If true, divergence is reported as `KNOWN-DIVERGENT` instead of fail. May also be an object keyed by `BUILD_VARIANT` (e.g. `{"default": true, "traffic_entropy": false}`); the runner resolves it to a scalar using the active variant, falling back to the `"default"` key and then to `false`. |
 | `reason`          | string         | Why `expected_diff` is set. Link the tracking issue.                   |
 
 | Request field      | Type   | Purpose                                                                |
@@ -142,20 +146,50 @@ existing keys without bumping the version.
   compare. The two impls do not guarantee insertion order on this set
   field.
 
+## `BUILD_VARIANT` axis
+
+The harness can run against either C build flavour:
+
+| Variant            | C binary                                                                                                  | When to use                                                                                  |
+|--------------------|-----------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------|
+| `default` (unset)  | `traffic_cypher_in_C/traffic-cypher-pm` (the canonical default build)                                     | Every push. This is what `tests/60_parity_smoke.sh` runs from `tests/run.sh`.                |
+| `traffic_entropy`  | Built fresh into `mktemp -d` via `make ENABLE_TRAFFIC_ENTROPY=1`. Canonical default binary is untouched.  | A separate CI job; exercises `/api/build/info` + `/api/streams` parity under the flag.       |
+
+Selecting:
+
+- env var: `BUILD_VARIANT=traffic_entropy python3 parity/parity_test.py`
+- CLI flag: `python3 parity/parity_test.py --variant traffic_entropy`
+
+How it flows through:
+
+1. `BUILD_VARIANT` is read from the environment in `parity_test.py`
+   (default `"default"`). The `--variant` CLI flag overrides it.
+2. If `variant == "traffic_entropy"`, the harness rsyncs the C tree
+   into a tmpdir, symlinks `<repo>/frontend` next to it (so the
+   Makefile's `frontend` phony resolves the same way it does at the
+   repo root), runs `make ENABLE_TRAFFIC_ENTROPY=1`, and points the
+   replay loop at the tmp binary. The canonical
+   `traffic_cypher_in_C/traffic-cypher-pm` is never touched.
+3. For each case, `expected_diff` is resolved via
+   `resolve_expected_diff(case, variant)`: a scalar bool wins as-is;
+   an object is looked up by `variant`, then by `"default"`, then
+   falls back to `False`. This keeps old scalar-style flags
+   backwards-compatible.
+
+The `tests/60_parity_smoke.sh` wrapper passes `BUILD_VARIANT` through
+unchanged, so an unset env runs exactly the same code path as before.
+Doubling the smoke up with both variants would double parity wall time
+on every CI run, so we don't — the second variant is for a separate
+CI job.
+
 ## Anchor cases (initial four)
 
-| Name                | Purpose                                                                                                            | Outcome today        |
-|---------------------|--------------------------------------------------------------------------------------------------------------------|----------------------|
-| `unlock_and_status` | Unlock → status → lock → status. Locks in the auth state-machine.                                                  | PASS                 |
-| `create_with_tags`  | Unlock, create with `tags`, GET, list. Catches future regressions of #8 (C `tags` drop).                           | PASS                 |
-| `streams_status`    | Unlock, GET `/api/streams`. Catches the #1 streams divergence once streams are configured.                         | PASS (flagged)*      |
-| `build_info`        | GET `/api/build/info`. Proves the harness sees real divergence — C returns `traffic_entropy:false`, Rust true.     | KNOWN-DIVERGENT      |
-
-\* `streams_status` is flagged `expected_diff: true` because once #1a
-(the C `MultiStreamManager` port) lands and streams are configured,
-the two impls will diverge by design until parity work completes. On a
-fresh vault both currently return `[]`, so the case happens to pass
-today. Flip `expected_diff` to `false` when #1a lands.
+| Name                | Purpose                                                                                                            | `default` outcome    | `traffic_entropy` outcome |
+|---------------------|--------------------------------------------------------------------------------------------------------------------|----------------------|---------------------------|
+| `unlock_and_status` | Unlock → status → lock → status. Locks in the auth state-machine.                                                  | PASS                 | PASS                      |
+| `create_with_tags`  | Unlock, create with `tags`, GET, list. Catches future regressions of #8 (C `tags` drop).                           | PASS                 | PASS                      |
+| `streams_status`    | Unlock, GET `/api/streams`. Default C build returns the static "Disabled" stub; ENABLE_TRAFFIC_ENTROPY=1 reads from `multi_stream_manager_t`. | KNOWN-DIVERGENT      | PASS                      |
+| `build_info`        | GET `/api/build/info`. Default C returns `traffic_entropy:false`; ENABLE_TRAFFIC_ENTROPY=1 flips to `traffic_entropy:true`. The `build` field (`c` vs `rust`) is normalised out. | KNOWN-DIVERGENT      | PASS                      |
 
 ## Adding a new case
 

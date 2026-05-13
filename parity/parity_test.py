@@ -13,10 +13,24 @@ time, socket. Runnable as:
     python3 parity/parity_test.py --max-cases 4
     python3 parity/parity_test.py --case create_with_tags
     python3 parity/parity_test.py --verbose
+    BUILD_VARIANT=traffic_entropy python3 parity/parity_test.py
+
+The BUILD_VARIANT env var (or --variant CLI flag) selects which C build
+to exercise:
+    default          — use the canonical traffic_cypher_in_C/traffic-cypher-pm
+                       binary (whatever the default Makefile invocation
+                       produced). Per-case `expected_diff` is read from
+                       the "default" key (if the value is an object) or
+                       used as-is (if it is a scalar bool).
+    traffic_entropy  — rsync the C tree into a tmpdir, build with
+                       `make ENABLE_TRAFFIC_ENTROPY=1`, and point the
+                       harness at that binary. Per-case `expected_diff`
+                       is read from the "traffic_entropy" key.
 
 Exits 0 if every case either matched exactly or is flagged
-`expected_diff: true`. Exits 1 on any unflagged divergence or any
-infrastructure failure (binary missing, port stuck, etc.).
+`expected_diff: true` (for the active variant). Exits 1 on any
+unflagged divergence or any infrastructure failure (binary missing,
+port stuck, build failure, etc.).
 """
 
 import argparse
@@ -40,8 +54,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CASES_PATH = Path(__file__).resolve().parent / "cases.json"
 
-C_PM_PATH = REPO_ROOT / "traffic_cypher_in_C" / "traffic-cypher-pm"
+C_PM_DEFAULT_PATH = REPO_ROOT / "traffic_cypher_in_C" / "traffic-cypher-pm"
 RUST_PM_PATH = REPO_ROOT / "traffic_cypher_in_Rust" / "target" / "release" / "pm"
+
+# BUILD_VARIANT axis: selects which C binary to run and which per-case
+# expected_diff to apply. "default" keeps the original behaviour (the
+# already-built default C binary). "traffic_entropy" rebuilds the C tree
+# with ENABLE_TRAFFIC_ENTROPY=1 into a tmpdir (so the default binary other
+# tests depend on is not clobbered) and points the harness at that binary.
+KNOWN_VARIANTS = ("default", "traffic_entropy")
+BUILD_VARIANT = os.environ.get("BUILD_VARIANT", "default") or "default"
 
 PM_PORT = 9876
 PM_BASE = f"http://127.0.0.1:{PM_PORT}"
@@ -209,6 +231,142 @@ def pretty(value) -> str:
 
 
 # ---------------------------------------------------------------------------
+# BUILD_VARIANT resolution
+# ---------------------------------------------------------------------------
+
+def resolve_expected_diff(case: dict, variant: str) -> bool:
+    """Return the effective `expected_diff` bool for the active variant.
+
+    Accepts either a scalar bool (legacy: same answer for every variant)
+    or an object keyed by variant name. For an object, the active variant
+    wins; if absent, fall back to the "default" key; if that is also
+    absent, fall back to `False`. Anything else (None, missing) is False.
+    """
+    raw = case.get("expected_diff", False)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, dict):
+        if variant in raw:
+            return bool(raw[variant])
+        if "default" in raw:
+            return bool(raw["default"])
+        return False
+    # Unexpected shape — treat as no expected divergence so we surface the
+    # malformed config as a real failure rather than silently hiding it.
+    return False
+
+
+def build_c_with_traffic_entropy() -> Path:
+    """Build the C tree with ENABLE_TRAFFIC_ENTROPY=1 into a tmpdir.
+
+    Mirrors the layout used by tests/33_traffic_entropy_build.sh:
+      - copy (or rsync) the C source tree into <work>/C/
+      - symlink the canonical frontend next to it so the Makefile's
+        `frontend` phony (`cp -R ../frontend ./frontend`) resolves
+      - invoke `make ENABLE_TRAFFIC_ENTROPY=1`
+
+    Returns the absolute path to the produced traffic-cypher-pm binary.
+    The caller is responsible for keeping the tmpdir alive for the
+    duration of the run (we do NOT auto-clean here — the tmpdir gets
+    swept on interpreter exit via the module-level `_BUILD_TMP` register).
+    """
+    work = Path(tempfile.mkdtemp(prefix="parity_te_build_"))
+    _BUILD_TMPDIRS.append(work)
+
+    c_src = REPO_ROOT / "traffic_cypher_in_C"
+    c_dst = work / "C"
+
+    # Prefer rsync (preserves perms) but fall back to cp -R.
+    rsync = subprocess.run(
+        ["which", "rsync"], capture_output=True, text=True
+    ).stdout.strip()
+    if rsync:
+        subprocess.run(
+            [
+                rsync, "-a",
+                "--exclude=*.o",
+                "--exclude=traffic-cypher",
+                "--exclude=traffic-cypher-pm",
+                "--exclude=frontend",
+                "--exclude=msm_test*",
+                f"{c_src}/", f"{c_dst}/",
+            ],
+            check=True,
+        )
+    else:
+        subprocess.run(["cp", "-R", str(c_src), str(c_dst)], check=True)
+        for stale in ("traffic-cypher", "traffic-cypher-pm", "msm_test"):
+            try:
+                (c_dst / stale).unlink()
+            except FileNotFoundError:
+                pass
+        # Wipe stale .o files
+        for o in c_dst.glob("src_c/*.o"):
+            o.unlink()
+        # And any stale frontend copy
+        fe = c_dst / "frontend"
+        if fe.exists():
+            subprocess.run(["rm", "-rf", str(fe)], check=True)
+
+    # The Makefile's `frontend` phony runs `cp -R ../frontend ./frontend`.
+    # Mirror the repo-root layout inside $work by symlinking the canonical
+    # frontend sibling.
+    (work / "frontend").symlink_to(REPO_ROOT / "frontend")
+
+    # macOS OpenSSL prefix detection (mirrors test 33).
+    env = os.environ.copy()
+    if "OPENSSL_PREFIX" not in env:
+        try:
+            brew = subprocess.run(
+                ["brew", "--prefix", "openssl"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if brew.returncode == 0 and brew.stdout.strip():
+                env["OPENSSL_PREFIX"] = brew.stdout.strip()
+            else:
+                env["OPENSSL_PREFIX"] = "/usr/local/opt/openssl"
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            env["OPENSSL_PREFIX"] = "/usr/local/opt/openssl"
+
+    info(f"[BUILD_VARIANT=traffic_entropy] make ENABLE_TRAFFIC_ENTROPY=1 in {c_dst}")
+    log = work / "build.log"
+    with open(log, "wb") as logfile:
+        rc = subprocess.run(
+            ["make", "ENABLE_TRAFFIC_ENTROPY=1"],
+            cwd=str(c_dst), env=env, stdout=logfile, stderr=subprocess.STDOUT,
+        ).returncode
+    if rc != 0:
+        sys.stderr.write(log.read_text(errors="replace"))
+        raise RuntimeError(
+            f"build with ENABLE_TRAFFIC_ENTROPY=1 failed (see {log})"
+        )
+
+    bin_path = c_dst / "traffic-cypher-pm"
+    if not bin_path.exists() or not os.access(bin_path, os.X_OK):
+        raise RuntimeError(
+            f"build produced no executable at {bin_path}"
+        )
+    info(f"[BUILD_VARIANT=traffic_entropy] built {bin_path}")
+    return bin_path
+
+
+# Tmpdirs created by build_c_with_traffic_entropy(); cleaned on exit.
+_BUILD_TMPDIRS: list[Path] = []
+
+
+def _cleanup_build_tmpdirs() -> None:
+    for d in _BUILD_TMPDIRS:
+        try:
+            subprocess.run(["rm", "-rf", str(d)], check=False)
+        except Exception:
+            pass
+
+
+import atexit  # noqa: E402  (kept local to the cleanup hook)
+atexit.register(_cleanup_build_tmpdirs)
+
+
+# ---------------------------------------------------------------------------
 # Single-impl replay
 # ---------------------------------------------------------------------------
 
@@ -367,7 +525,7 @@ def replay_against_impl(impl_name: str, binary: Path, case: dict, verbose: bool)
 # Case runner
 # ---------------------------------------------------------------------------
 
-def run_case(case: dict, verbose: bool) -> str:
+def run_case(case: dict, c_pm_path: Path, variant: str, verbose: bool) -> str:
     """Run a single case against both impls. Returns one of:
         "pass"             — normalised responses match exactly
         "expected_diff"    — responses differ, but case is flagged as KNOWN
@@ -375,13 +533,14 @@ def run_case(case: dict, verbose: bool) -> str:
     """
     name = case["name"]
     header(f"case: {name}")
-    if case.get("expected_diff"):
+    expected_diff = resolve_expected_diff(case, variant)
+    if expected_diff:
         info(f"flagged expected_diff: {case.get('reason', '(no reason given)')}")
 
     drop_keys = case.get("normalize_drop", [])
 
     try:
-        c_resp = replay_against_impl("c", C_PM_PATH, case, verbose)
+        c_resp = replay_against_impl("c", c_pm_path, case, verbose)
     except ReplayError as e:
         err(f"C impl replay failed: {e}")
         return "fail"
@@ -406,7 +565,7 @@ def run_case(case: dict, verbose: bool) -> str:
             any_diff = True
             req = case["requests"][i]
             label = f"req#{i} {req['method']} {req['path']}"
-            if case.get("expected_diff"):
+            if expected_diff:
                 warn(f"KNOWN-DIVERGENT at {label}")
             else:
                 err(f"mismatch at {label}")
@@ -419,7 +578,7 @@ def run_case(case: dict, verbose: bool) -> str:
                 print(f"    {line.rstrip()}")
 
     if any_diff:
-        if case.get("expected_diff"):
+        if expected_diff:
             warn(f"{name}: KNOWN-DIVERGENT (expected_diff=true)")
             return "expected_diff"
         return "fail"
@@ -450,7 +609,23 @@ def main() -> int:
         "--verbose", "-v", action="store_true",
         help="print every request/response status",
     )
+    ap.add_argument(
+        "--variant", default=BUILD_VARIANT,
+        help=(
+            "BUILD_VARIANT axis: 'default' (run the prebuilt C binary) or "
+            "'traffic_entropy' (rebuild C with ENABLE_TRAFFIC_ENTROPY=1 "
+            "into a tmpdir and run that). Also reads the BUILD_VARIANT env "
+            "var; CLI flag wins. Per-case `expected_diff` is resolved "
+            "against this variant."
+        ),
+    )
     args = ap.parse_args()
+
+    variant = args.variant or "default"
+    if variant not in KNOWN_VARIANTS:
+        err(f"unknown BUILD_VARIANT={variant!r}; expected one of {KNOWN_VARIANTS}")
+        return 1
+    header(f"BUILD_VARIANT={variant}")
 
     with open(args.cases_file, "r", encoding="utf-8") as f:
         cases_doc = json.load(f)
@@ -470,7 +645,26 @@ def main() -> int:
         err("no cases to run")
         return 1
 
-    for b in (C_PM_PATH, RUST_PM_PATH):
+    # Resolve the C binary for this variant. `default` reuses the
+    # pre-built canonical binary that other tests depend on. Any other
+    # variant (currently just `traffic_entropy`) rebuilds into a tmpdir
+    # so we never clobber the canonical artefact.
+    if variant == "default":
+        c_pm_path = C_PM_DEFAULT_PATH
+    elif variant == "traffic_entropy":
+        if not RUST_PM_PATH.exists():
+            err(f"Rust binary not built: {RUST_PM_PATH}")
+            return 1
+        try:
+            c_pm_path = build_c_with_traffic_entropy()
+        except Exception as e:
+            err(f"variant build failed: {e}")
+            return 1
+    else:  # already validated above, defensive only
+        err(f"unhandled variant: {variant}")
+        return 1
+
+    for b in (c_pm_path, RUST_PM_PATH):
         if not b.exists():
             err(f"binary not built: {b}")
             return 1
@@ -483,7 +677,7 @@ def main() -> int:
     pass_n = fail_n = known_n = 0
     failed_names = []
     for case in cases:
-        rc = run_case(case, args.verbose)
+        rc = run_case(case, c_pm_path, variant, args.verbose)
         if rc == "pass":
             pass_n += 1
         elif rc == "expected_diff":
