@@ -1054,18 +1054,39 @@
                 return;
             }
 
-            listEl.innerHTML = streams.map((s, i) => `
+            // Whitelist the four live states from #1a stage 3
+            // (Connecting/Active/Failed/Stopped) plus the legacy `Disabled`
+             // banner-path status from the default C build. Anything else
+             // collapses to 'unknown' so an untrusted server cannot inject
+             // arbitrary class names into the status-dot. See
+             // REMEDIATION_PLAN.md #1a stage 4d.
+            const STATUS_CLASS = {
+                'Connecting': 'connecting',
+                'Active':     'active',
+                'Failed':     'failed',
+                'Stopped':    'stopped',
+                'Disabled':   'disabled',
+            };
+            listEl.innerHTML = streams.map((s, i) => {
+                const statusClass = STATUS_CLASS[s.status] || 'unknown';
+                const statusLabel = STATUS_CLASS[s.status] ? s.status : 'Unknown';
+                const frames = (typeof s.frames_captured === 'number' && s.frames_captured > 0)
+                    ? s.frames_captured + ' frames'
+                    : '\u2014';
+                return `
                 <div class="stream-item">
-                    <span class="status-dot ${s.status.toLowerCase()}"></span>
+                    <span class="status-dot ${statusClass}"></span>
                     <div class="stream-info">
                         <div class="stream-label">${esc(s.label)}</div>
                         <div class="stream-url">${esc(s.url)}</div>
                     </div>
-                    <span style="font-size:12px;color:var(--text-muted)">${s.frames_captured} frames</span>
+                    <span class="stream-status" style="font-size:12px;color:var(--text-muted)">${esc(statusLabel)}</span>
+                    <span class="stream-frames" style="font-size:12px;color:var(--text-muted)">${esc(frames)}</span>
                     <button class="btn btn-secondary btn-icon" data-edit="${i}" title="Edit">\u270F\uFE0F</button>
                     <button class="btn btn-danger btn-icon" data-remove="${i}" title="Remove">\u2715</button>
                 </div>
-            `).join('');
+            `;
+            }).join('');
 
             listEl.querySelectorAll('[data-remove]').forEach(btn => {
                 btn.addEventListener('click', async () => {
