@@ -76,7 +76,7 @@ SOURCES = $(SRC_DIR)/str_buf.c \
 OBJECTS = $(SOURCES:.c=.o)
 
 # Targets
-.PHONY: all clean frontend
+.PHONY: all clean frontend fuzz fuzz-clean
 
 all: traffic-cypher traffic-cypher-pm frontend
 
@@ -99,3 +99,76 @@ $(SRC_DIR)/%.o: $(SRC_DIR)/%.c
 clean:
 	rm -f $(SRC_DIR)/*.o traffic-cypher traffic-cypher-pm
 	rm -rf ./frontend
+
+# ----------------------------------------------------------------------------
+# Fuzz harness (REMEDIATION_PLAN.md Week 4+ #10d).
+#
+# Builds one libFuzzer binary per target in fuzz_c/fuzz_targets/. Always uses
+# clang with -fsanitize=fuzzer,address; the regular `all` target is unaffected.
+# Run on demand:
+#
+#   make -C traffic_cypher_in_C fuzz
+#   traffic_cypher_in_C/fuzz_c/fuzz_hex_decode \
+#       traffic_cypher_in_C/fuzz_c/corpus/hex_decode \
+#       -max_total_time=60
+#
+# CI is not wired (requires clang + libFuzzer runtime on the runner). Rust
+# fuzz scaffolding under traffic_cypher_in_Rust/fuzz/ follows the same
+# "build on demand" pattern.
+# ----------------------------------------------------------------------------
+FUZZ_CC      ?= clang
+FUZZ_DIR     := fuzz_c
+FUZZ_OUT     := $(FUZZ_DIR)/fuzz_hex_decode \
+                $(FUZZ_DIR)/fuzz_json_get_string \
+                $(FUZZ_DIR)/fuzz_parse_vault_entries
+
+# Sources we recompile into each fuzz binary with sanitizers. Kept minimal
+# so iterations stay fast (avoid pulling in OpenSSL/web_server/etc).
+FUZZ_CORE_SRC := $(SRC_DIR)/str_buf.c $(SRC_DIR)/hex_utils.c \
+                 $(SRC_DIR)/base64_utils.c
+
+# vault.c needs the wrapper API + a few helpers; we link it for the two
+# JSON-targeting fuzzers. -DENABLE_FUZZ_API exposes the static-wrappers.
+# OpenSSL is still required because vault.c references EVP_* in unrelated
+# functions; the linker just keeps the symbols satisfied.
+FUZZ_VAULT_SRC := $(FUZZ_CORE_SRC) $(SRC_DIR)/vault.c $(SRC_DIR)/uuid_gen.c \
+                  $(SRC_DIR)/crypto_derivation.c
+
+# Default sanitizer set is `fuzzer` only — combining `fuzzer,address` hangs
+# libFuzzer init on macOS arm64 with Homebrew LLVM 20 (the ASan runtime
+# dyld path stalls before main returns). Linux + clang doesn't have this
+# bug, so CI can opt in:
+#   make fuzz FUZZ_SANITIZER=fuzzer,address
+FUZZ_SANITIZER ?= fuzzer
+
+FUZZ_CFLAGS  := -O1 -g -std=c11 -I include -DENABLE_FUZZ_API \
+                -fsanitize=$(FUZZ_SANITIZER) -fno-omit-frame-pointer
+FUZZ_LDFLAGS := -fsanitize=$(FUZZ_SANITIZER)
+ifeq ($(UNAME_S),Darwin)
+  FUZZ_CFLAGS  += -I$(OPENSSL_PREFIX)/include
+  # `-framework Security` is needed by uuid_gen.c (SecRandomCopyBytes).
+  FUZZ_LDFLAGS += -L$(OPENSSL_PREFIX)/lib -framework Security
+endif
+ifeq ($(UNAME_S),Linux)
+  FUZZ_CFLAGS += -D_GNU_SOURCE
+  ifdef OPENSSL_PREFIX
+    FUZZ_CFLAGS  += -I$(OPENSSL_PREFIX)/include
+    FUZZ_LDFLAGS += -L$(OPENSSL_PREFIX)/lib64 -L$(OPENSSL_PREFIX)/lib
+  endif
+endif
+FUZZ_LIBS    := -lssl -lcrypto -lpthread -lm
+
+fuzz: $(FUZZ_OUT)
+
+$(FUZZ_DIR)/fuzz_hex_decode: $(FUZZ_DIR)/fuzz_targets/fuzz_hex_decode.c $(FUZZ_CORE_SRC)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -o $@ $^ $(FUZZ_LDFLAGS)
+
+$(FUZZ_DIR)/fuzz_json_get_string: $(FUZZ_DIR)/fuzz_targets/fuzz_json_get_string.c $(FUZZ_VAULT_SRC)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -o $@ $^ $(FUZZ_LDFLAGS) $(FUZZ_LIBS)
+
+$(FUZZ_DIR)/fuzz_parse_vault_entries: $(FUZZ_DIR)/fuzz_targets/fuzz_parse_vault_entries.c $(FUZZ_VAULT_SRC)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -o $@ $^ $(FUZZ_LDFLAGS) $(FUZZ_LIBS)
+
+fuzz-clean:
+	rm -f $(FUZZ_OUT)
+	rm -rf $(FUZZ_DIR)/*.dSYM

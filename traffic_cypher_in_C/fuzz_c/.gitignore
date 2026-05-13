@@ -1,0 +1,13 @@
+# Compiled fuzz binaries + clang's debug-symbol bundles.
+fuzz_hex_decode
+fuzz_json_get_string
+fuzz_parse_vault_entries
+*.dSYM/
+
+# libFuzzer's accumulated finds. Seed corpora under corpus/<target>/ ARE
+# tracked.
+artifacts/
+crash-*
+leak-*
+slow-unit-*
+oom-*

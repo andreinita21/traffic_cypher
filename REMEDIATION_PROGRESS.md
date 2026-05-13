@@ -72,7 +72,7 @@ No system upgrades, no global package installs, no destructive commands run duri
 | More C compile-time hardening flags | done | this run — `-fstack-protector-strong -fPIE` always; Linux: `-pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack`; GCC: `-Wstringop-overflow=4` |
 | Move report binaries out of `main` | deferred | requires user policy decision (use Releases / Git LFS / branch) — out of scope for an unattended routine |
 | Week 4+ #5c DOM construction pass | done | this run — 9 attribute sinks replaced with `.value =` setters and a closure-bound copy handler |
-| Week 4+ #10d fuzzing targets | done (Rust scaffold) | this run — `traffic_cypher_in_Rust/fuzz/` with 2 cargo-fuzz targets + seed corpora + public `fuzz_parse_*` helpers; CI wiring deferred (needs nightly) |
+| Week 4+ #10d fuzzing targets | done (Rust + C) | this run — Rust: `traffic_cypher_in_Rust/fuzz/` (2 cargo-fuzz targets). C: `traffic_cypher_in_C/fuzz_c/` (3 libFuzzer targets, `ENABLE_FUZZ_API`-gated wrappers in `vault.c`, `make fuzz` target). CI wiring deferred (Rust needs nightly; C needs clang+libFuzzer runtime on the runner). |
 | Week 4+ #1a Full C MultiStreamManager port | deferred | plan calls this "~2 weeks of focused C work"; outside one-routine scope |
 
 ---
@@ -156,10 +156,39 @@ Added a cargo-fuzz sub-crate at `traffic_cypher_in_Rust/fuzz/` covering the two 
 
 ---
 
+### 2026-05-13 — Week 4+ batch 4: #10d C libFuzzer scaffolding
+
+Added the C half of #10d. Three libFuzzer targets at `traffic_cypher_in_C/fuzz_c/` driven by a new `fuzz` Make target.
+
+- `fuzz_hex_decode` — fuzzes the public `hex_decode()` in `hex_utils.c`.
+- `fuzz_json_get_string` — fuzzes the file-static `json_get_string()` in `vault.c`, reached via a thin `fuzz_json_get_string()` wrapper at the bottom of `vault.c` gated by `#ifdef ENABLE_FUZZ_API`.
+- `fuzz_parse_vault_entries` — same wrapper pattern around `parse_vault_entries()`. Highest payoff — walks the entire user-controlled vault JSON.
+
+**Files**
+- `traffic_cypher_in_C/src_c/vault.c` — appended `#ifdef ENABLE_FUZZ_API`-gated wrappers (production build untouched: regular `make` does not define the macro).
+- `traffic_cypher_in_C/Makefile` — `fuzz`, `fuzz-clean` PHONY targets. Sanitizer defaults to `FUZZ_SANITIZER=fuzzer` (no ASan) because `fuzzer,address` hangs libFuzzer init on macOS arm64 with Homebrew LLVM 20. Linux CI can opt into ASan via `make fuzz FUZZ_SANITIZER=fuzzer,address`. macOS-only `-framework Security` link is included (uuid_gen.c uses SecRandomCopyBytes).
+- `traffic_cypher_in_C/fuzz_c/fuzz_targets/{fuzz_hex_decode,fuzz_json_get_string,fuzz_parse_vault_entries}.c` (new) — libFuzzer entry points that NUL-terminate the input buffer (parsers use strstr/strlen) and bound iteration size for fast cycles.
+- `traffic_cypher_in_C/fuzz_c/corpus/<target>/` (new) — seed inputs per target (`deadbeef` hex, escaped + plain JSON, valid `entries:[]` and one entry).
+- `traffic_cypher_in_C/fuzz_c/{.gitignore,README.md}` (new).
+- `tests/27_c_fuzz_scaffolding.sh` (new) — pins target files, wrapper gating, production-build hygiene, Make target, libFuzzer entry-point exports, seed corpora, gitignore hygiene.
+
+**Verification**
+- `FUZZ_CC=/opt/homebrew/opt/llvm@20/bin/clang make -C traffic_cypher_in_C fuzz` — all three binaries build.
+- 500-iteration smoke runs of each target: complete in <1 s, find 12/20/37 new corpus units, no crashes, peak RSS 27–35 MiB.
+- `make -C traffic_cypher_in_C clean && make` — production build unchanged.
+- `bash tests/run.sh` — 30/30 PASS (was 29; +1 new scaffolding test).
+- `cargo build/test/clippy --locked` — clean.
+
+**Risks / deferred**
+- ASan+libFuzzer combo can't run locally on macOS arm64 (well-known LLVM upstream bug). Linux CI is unaffected; the Makefile makes the choice explicit.
+- CI not wired for either Rust or C fuzz harnesses. Needs nightly Rust + clang+libFuzzer runtime + corpus caching strategy. Scaffolding is the prereq; CI is a separate plumbing PR.
+
+---
+
 ## Final state at end of run
 
 - Weeks 0–3: complete (verified earlier in this file).
 - Backlog (9 items): 8/9 done. The remaining one — moving report binaries out of `main` — is deferred as a policy decision out of scope for an unattended routine.
-- Week 4+: #5c DOM construction pass complete; #10d Rust half complete (C half deferred); #1a Full C MultiStreamManager port deferred (~2 weeks of focused work per the plan).
-- Regression harness: 26 → 29 tests, all green.
-- Three commits pushed this session: `8b0ea7b` (build hardening), `827394b` (#5c DOM), and the upcoming fuzz commit.
+- Week 4+: #5c DOM construction pass complete; #10d **complete** (Rust + C); #1a Full C MultiStreamManager port deferred (~2 weeks of focused work per the plan).
+- Regression harness: 26 → 30 tests, all green.
+- Four commits pushed this session: `8b0ea7b` (build hardening), `827394b` (#5c DOM), `903c484` (Rust fuzz), and the upcoming C fuzz commit.

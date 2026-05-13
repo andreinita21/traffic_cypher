@@ -1016,3 +1016,21 @@ int save_stream_config(const stream_config_t *config) {
     free(buf);
     return write_rc;
 }
+
+/* ------------------------------------------------------------------------
+ * Fuzz API
+ *
+ * REMEDIATION_PLAN.md Week 4+ #10d. Thin wrappers around two file-scoped
+ * `static` parsers so libFuzzer harnesses in fuzz_c/ can drive them without
+ * un-static-ing the originals. Compiled in only when ENABLE_FUZZ_API is
+ * defined; the production binary keeps the smaller, file-private surface.
+ * ------------------------------------------------------------------------ */
+#ifdef ENABLE_FUZZ_API
+char *fuzz_json_get_string(const char *json, const char *key) {
+    return json_get_string(json, key);
+}
+
+int fuzz_parse_vault_entries(const char *json, vault_t *v) {
+    return parse_vault_entries(json, v);
+}
+#endif /* ENABLE_FUZZ_API */
