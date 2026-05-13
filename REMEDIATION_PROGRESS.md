@@ -208,6 +208,46 @@ Moved `traffic_cypher_benchmark_report.docx` and `traffic_cypher_benchmark_repor
 
 ---
 
+### 2026-05-13 — Week 4+ #1a stage 1: `multi_stream` C module + bounded MPSC ring + unit tests
+
+First substantive landing of the C `MultiStreamManager` port (`REMEDIATION_PLAN.md:332`). The plan estimates the *full* port at ~2 weeks; this commit delivers the foundation — the module, the bounded MPSC ring, the per-stream forwarder thread, and a unit-test harness — without touching `web_server.c` or `rotation_daemon`. The production behaviour is unchanged: the symbols ship in the binary but no caller invokes them yet.
+
+**Files**
+- `traffic_cypher_in_C/include/multi_stream.h` (new) — public API: `msm_new` / `msm_free` / `msm_add_stream` / `msm_remove_stream` / `msm_update_stream` / `msm_pick_random_frame` / `msm_get_statuses` / `msm_stream_count`. Matches the API sketch in `REMEDIATION_PLAN.md:333`. Test-only seams (`msm_test_push_frame`, `msm_test_register_slot`, `msm_test_ring_count`) gated by `ENABLE_MSM_TEST_API`.
+- `traffic_cypher_in_C/src_c/multi_stream.c` (new) — full implementation. Internals:
+  - `msm_ring_t`: bounded MPSC ring of `(stream_index, frame_t)` with `pthread_mutex_t` + `pthread_cond_t not_full` + `closing` flag. Producers block on push when full; consumer drains non-blocking via `ring_try_pop`.
+  - `stream_slot_t[VAULT_MAX_STREAMS]` (=16, matching the existing config limit). Per-slot: url/label/state/frames_captured/thread/capture_pid/active/joined.
+  - `forwarder_main`: per-stream pthread. Reads frames with the existing blocking `frame_capture_read`, pushes to the shared ring tagged with slot index, exits cleanly on `fread` EOF (induced by `SIGTERM` to the ffmpeg child).
+  - `msm_pick_random_frame`: drains the ring, keeps the *latest* frame per stream (freeing older ones), picks a stream uniformly at random with seeded `rand()`, transfers ownership. Mirrors Rust's `multi_stream.rs:217`.
+- `traffic_cypher_in_C/tests_c/msm_test.c` (new) — standalone unit-test binary. Five test cases / 28 assertions: msm_new/free smoke; zero-capacity rejection; ring FIFO + latest-wins pick; multi-slot pick uniformity (existence check) + frame counter; bounded-ring backpressure + close-wakes-blocked-producer. Doesn't spawn ffmpeg or yt-dlp — uses the test-only push seam.
+- `traffic_cypher_in_C/Makefile` — `multi_stream.c` added to `SOURCES` (so symbols ship in `traffic-cypher{,-pm}`); new `msm_test` / `msm_test-clean` phony targets that compile a separate test binary with `-DENABLE_MSM_TEST_API`. `.PHONY` list updated.
+- `.gitignore` — `traffic_cypher_in_C/msm_test{,.dSYM/}` added.
+- `tests/29_multi_stream_unit.sh` (new) — regression harness. 8 assertions: scaffolding present, public API exported, `ENABLE_MSM_TEST_API` never leaks into production `CFLAGS`, multi_stream.c is in `SOURCES`, production build clean with the new file, `msm_test` binary builds + all assertions pass, production binaries don't export `msm_test_*` symbols (via `nm`).
+
+**What's *not* in this commit (explicit non-goals for stage 1)**
+- `rotation_daemon` rewrite. The current daemon at `key_rotation.c:11` continues to mix `RAND_bytes` only and keeps `has_traffic_entropy = 0`. Stage 2 will switch it to consume `msm_pick_random_frame` once a second under `#ifdef ENABLE_TRAFFIC_ENTROPY`, and only then set the flag when a frame was actually obtained.
+- `web_server.c` wiring. `handle_add_stream` continues to respond 501 / `handle_list_streams` continues to mark every stream `Disabled`. Stage 3 will route them through `msm_add_stream` / `msm_get_statuses`.
+- `/api/build/info` flip. Stays at `traffic_entropy:false` for the C build until stage 2 lands; the `streams_status` / `build_info` cases in `parity/anchor_cases.json` remain `expected_diff:true`.
+- Feature-flag toggle. `--enable-traffic-entropy` build flag arrives with stage 2.
+
+**Verification**
+- `make -C traffic_cypher_in_C clean && make` — clean (no new warnings; existing `uuid_gen.c` `SecRandomCopyBytes` warning unchanged).
+- `make -C traffic_cypher_in_C msm_test && ./traffic_cypher_in_C/msm_test` — 28/28 PASS.
+- `bash tests/run.sh` — **32/32 PASS** in 77s on Apple Silicon (was 31; +1 new scaffolding test).
+- `cargo build --release --bins --locked` / `cargo clippy --all-targets --locked -- -D warnings` / `cargo test --locked -- --test-threads=1` — clean (no Rust files touched, sanity check only).
+- `nm -j traffic-cypher{,-pm} | grep msm_test_` — empty (paranoid check baked into `tests/29_...`).
+
+**Risks**
+- Stage-1-only: the production code path that calls into this module does not exist yet, so a regression here would be invisible to the existing parity / smoke tests. The unit-test harness is the *only* coverage — that's why it's broad (push/pop ordering, latest-wins, backpressure, close-wakes-blocked-producer).
+- `srand((unsigned)time(NULL) ^ getpid())` in `msm_pick_random_frame` — not CSPRNG-quality. Justified inline: the entropy enters the cypher via `entropy_extractor` (SHA-256 of frame pixels), not via the pick. If/when the pick becomes load-bearing, swap to `RAND_bytes`.
+- `frame_capture_read` is blocking; cancellation relies on `SIGTERM`ing the ffmpeg child so the pipe closes. This works on POSIX but is a vendored assumption — if `frame_capture_read` is later changed to use signalfd / non-blocking IO, the cancellation path needs to adapt.
+- Capacity is hard-coded to `VAULT_MAX_STREAMS=16` slots, matching the existing config schema. If that limit is ever lifted, `forwarder_arg_t.slot_index` and the snapshot arrays in `msm_pick_random_frame` need to follow.
+
+**Why this scope and not the full port**
+Per the plan and `REMEDIATION_PROGRESS.md` history, #1a is the single largest deferred item (~2 weeks of focused C work). Delivering it as one mega-commit would be both unreviewable and dangerous (it touches `key_rotation.c` + `web_server.c` + parity tests + build flags + an external behaviour switch on `/api/build/info`). The stage 1 cut is the natural seam: it ships the entire foundation, can be reviewed in isolation, is fully testable without yt-dlp/ffmpeg, and changes zero observable behaviour for the running daemon. Stages 2–4 land independently against this base.
+
+---
+
 ### 2026-05-13 — CI repair: tests-job timeout bump
 
 The last three CI runs on `main` came back with a red `tests (ubuntu-latest)` job. Triage:

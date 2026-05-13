@@ -70,13 +70,14 @@ SOURCES = $(SRC_DIR)/str_buf.c \
           $(SRC_DIR)/password_gen.c \
           $(SRC_DIR)/totp.c \
           $(SRC_DIR)/vault.c \
+          $(SRC_DIR)/multi_stream.c \
           $(SRC_DIR)/key_rotation.c \
           $(SRC_DIR)/web_server.c
 
 OBJECTS = $(SOURCES:.c=.o)
 
 # Targets
-.PHONY: all clean frontend fuzz fuzz-clean
+.PHONY: all clean frontend fuzz fuzz-clean msm_test msm_test-clean
 
 all: traffic-cypher traffic-cypher-pm frontend
 
@@ -172,3 +173,29 @@ $(FUZZ_DIR)/fuzz_parse_vault_entries: $(FUZZ_DIR)/fuzz_targets/fuzz_parse_vault_
 fuzz-clean:
 	rm -f $(FUZZ_OUT)
 	rm -rf $(FUZZ_DIR)/*.dSYM
+
+# ----------------------------------------------------------------------------
+# multi_stream unit test (REMEDIATION_PLAN.md #1a stage 1).
+#
+# Standalone test binary that exercises msm_new / push / pick / get_statuses
+# without going through ffmpeg or yt-dlp (the production environment may not
+# have either installed — see REMEDIATION_PROGRESS.md environment check).
+# Test-only seams (msm_test_push_frame, msm_test_register_slot) are gated by
+# -DENABLE_MSM_TEST_API and never enter the production binary.
+#
+#   make -C traffic_cypher_in_C msm_test && ./traffic_cypher_in_C/msm_test
+# ----------------------------------------------------------------------------
+MSM_TEST_SRC := $(SRC_DIR)/multi_stream.c $(SRC_DIR)/stream_ingestion.c \
+                $(SRC_DIR)/frame_sampler.c
+MSM_TEST_CFLAGS := -O0 -g -std=c11 -I include -DENABLE_MSM_TEST_API \
+                   -fstack-protector-strong
+ifeq ($(UNAME_S),Linux)
+  MSM_TEST_CFLAGS += -D_GNU_SOURCE
+endif
+
+msm_test: tests_c/msm_test.c $(MSM_TEST_SRC)
+	$(CC) $(MSM_TEST_CFLAGS) -o $@ $^ -lpthread
+
+msm_test-clean:
+	rm -f msm_test
+	rm -rf msm_test.dSYM
