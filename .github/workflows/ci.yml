@@ -300,20 +300,22 @@ jobs:
       - name: Build fuzz targets (clang + fuzzer,address)
         run: make -C traffic_cypher_in_C fuzz FUZZ_CC=clang FUZZ_SANITIZER=fuzzer,address
 
+      # Note: corpus subdirs are unprefixed (hex_decode, not
+      # fuzz_hex_decode) — matches the layout the targets seed from.
       - name: Run fuzz_hex_decode (60s)
         run: |
           cd traffic_cypher_in_C
-          ./fuzz_c/fuzz_hex_decode fuzz_c/corpus/fuzz_hex_decode \
+          ./fuzz_c/fuzz_hex_decode fuzz_c/corpus/hex_decode \
             -max_total_time=60 -error_exitcode=1
       - name: Run fuzz_json_get_string (60s)
         run: |
           cd traffic_cypher_in_C
-          ./fuzz_c/fuzz_json_get_string fuzz_c/corpus/fuzz_json_get_string \
+          ./fuzz_c/fuzz_json_get_string fuzz_c/corpus/json_get_string \
             -max_total_time=60 -error_exitcode=1
       - name: Run fuzz_parse_vault_entries (60s)
         run: |
           cd traffic_cypher_in_C
-          ./fuzz_c/fuzz_parse_vault_entries fuzz_c/corpus/fuzz_parse_vault_entries \
+          ./fuzz_c/fuzz_parse_vault_entries fuzz_c/corpus/parse_vault_entries \
             -max_total_time=60 -error_exitcode=1
 
       - name: Upload crashes (on failure)
