@@ -46,24 +46,46 @@ typedef struct {
     uint64_t        frames_captured;
 
     /*
-     * `active`     1 if this slot is in use (CONNECTING/ACTIVE/FAILED/STOPPED).
-     *              0 means the slot is free and reusable by add_stream.
-     * `joined`     1 once pthread_join has been called for `thread`. Used by
-     *              remove_stream's idempotency check.
+     * `active`           1 if this slot is in use (CONNECTING/ACTIVE/FAILED/STOPPED).
+     *                     0 means the slot is free and reusable by add_stream.
+     * `cancel_requested` set by msm_remove_stream so the prep pthread can
+     *                     abort early between yt-dlp resolve and ffmpeg start,
+     *                     without remove having to interrupt those externals.
+     * `prep_joined`      1 once the prep pthread has been joined.
+     * `forwarder_joined` 1 once the forwarder pthread has been joined.
      */
     int             active;
-    int             joined;
-
-    pthread_t       thread;
+    int             cancel_requested;
+    int             prep_joined;
+    int             forwarder_joined;
 
     /*
-     * `capture_pid` is the ffmpeg child PID, set by the forwarder thread
-     * immediately after frame_capture_start returns. msm_remove_stream
-     * SIGTERMs this PID under the manager mutex to unblock fread() inside the
-     * forwarder, which then exits its read loop.
+     * Two distinct pthreads can be associated with a slot:
      *
-     * Set to 0 once the forwarder has called frame_capture_stop (so a late
-     * remove() doesn't kill an unrelated PID that's been recycled).
+     *   prep_thread       transient. Runs resolve_stream_url + frame_capture_start
+     *                      asynchronously after msm_add_stream returns. Exits as
+     *                      soon as the forwarder has been spawned (or the slot
+     *                      failed / was cancelled). Joinable so msm_remove_stream
+     *                      and msm_free can wait on it.
+     *   forwarder_thread  long-lived. Set by the prep thread once frame capture
+     *                      is up. Reads frames from the ffmpeg pipe and pushes
+     *                      them into the shared ring. 0 until set.
+     *
+     * Splitting the two means msm_add_stream returns immediately with a
+     * CONNECTING slot index — the HTTP handler no longer blocks ~2-5 s on
+     * yt-dlp. Auto-replay on unlock can fan out all 16 saved streams in
+     * parallel.
+     */
+    pthread_t       prep_thread;
+    pthread_t       forwarder_thread;
+
+    /*
+     * `capture_pid` is the ffmpeg child PID, set by the prep thread after
+     * frame_capture_start succeeds. msm_remove_stream SIGTERMs this PID under
+     * the manager mutex to unblock fread() inside the forwarder, which then
+     * exits its read loop. Set to 0 once the forwarder has called
+     * frame_capture_stop (so a late remove() doesn't kill an unrelated PID
+     * that's been recycled).
      */
     pid_t           capture_pid;
 } stream_slot_t;
@@ -176,12 +198,12 @@ static void *forwarder_main(void *arg_) {
     int idx = arg->slot_index;
     frame_capture_t *capture = arg->capture;
 
-    /* Publish PID under lock so remove_stream can find it. The frame_sampler
-     * exposes pid via frame_capture_pid; we cache it once because once the
-     * capture handle is freed the pid is unreachable. */
-    pid_t pid = frame_capture_pid(capture);
+    /* Status transition CONNECTING → ACTIVE is published here, not in the
+     * prep thread, so a get_statuses() call between prep finishing and the
+     * first frame arriving sees ACTIVE (matches Rust's "spawned task = stream
+     * active" semantics). capture_pid was already published by prep before
+     * we were created. */
     pthread_mutex_lock(&msm->lock);
-    msm->slots[idx].capture_pid = pid;
     msm->slots[idx].status = STREAM_ACTIVE;
     pthread_mutex_unlock(&msm->lock);
 
@@ -251,11 +273,92 @@ static int find_free_slot_locked(multi_stream_manager_t *msm) {
     return -1;
 }
 
+/* ------------------------------------------------------------------------
+ * Prep thread — runs the slow synchronous setup (yt-dlp + ffmpeg) off the
+ * caller's thread so msm_add_stream returns in microseconds instead of
+ * seconds. See REMEDIATION_PROGRESS.md 2026-05-13 "stage 5 async refactor".
+ * ----------------------------------------------------------------------*/
+
+typedef struct {
+    multi_stream_manager_t *msm;
+    int                     slot_index;
+    char                    url[VAULT_FIELD_MAX];
+} prep_arg_t;
+
+static void *prep_main(void *arg_) {
+    prep_arg_t *arg = (prep_arg_t *)arg_;
+    multi_stream_manager_t *msm = arg->msm;
+    int idx = arg->slot_index;
+
+    char            *resolved      = NULL;
+    frame_capture_t *capture       = NULL;
+    forwarder_arg_t *fwd_arg       = NULL;
+    int              forwarder_up  = 0;
+
+    /* Phase 1: yt-dlp resolve (~2-5 s). */
+    resolved = resolve_stream_url(arg->url);
+    if (!resolved) goto done;
+
+    /* Cancel check between blocking calls so a remove issued during resolve
+     * stops here instead of marching on through ffmpeg start. */
+    pthread_mutex_lock(&msm->lock);
+    int cancelled = msm->slots[idx].cancel_requested;
+    pthread_mutex_unlock(&msm->lock);
+    if (cancelled) goto done;
+
+    /* Phase 2: ffmpeg start (~1 s). */
+    capture = frame_capture_start(resolved);
+    if (!capture) goto done;
+
+    pthread_mutex_lock(&msm->lock);
+    cancelled = msm->slots[idx].cancel_requested;
+    pthread_mutex_unlock(&msm->lock);
+    if (cancelled) goto done;
+
+    /* Phase 3: spawn the long-lived forwarder. */
+    fwd_arg = (forwarder_arg_t *)calloc(1, sizeof(*fwd_arg));
+    if (!fwd_arg) goto done;
+    fwd_arg->msm          = msm;
+    fwd_arg->slot_index   = idx;
+    fwd_arg->resolved_url = resolved;
+    fwd_arg->capture      = capture;
+
+    pthread_t fwd_tid;
+    if (pthread_create(&fwd_tid, NULL, forwarder_main, fwd_arg) != 0) goto done;
+
+    /* Publish capture_pid + forwarder_thread atomically so msm_remove_stream
+     * sees a coherent (pid, tid) pair if it fires the instant we exit. */
+    pthread_mutex_lock(&msm->lock);
+    msm->slots[idx].capture_pid      = frame_capture_pid(capture);
+    msm->slots[idx].forwarder_thread = fwd_tid;
+    pthread_mutex_unlock(&msm->lock);
+
+    /* Ownership transferred to the forwarder. */
+    forwarder_up = 1;
+    resolved = NULL;
+    capture  = NULL;
+    fwd_arg  = NULL;
+
+done:
+    if (!forwarder_up) {
+        if (capture)  frame_capture_stop(capture);
+        free(resolved);
+        free(fwd_arg);
+        pthread_mutex_lock(&msm->lock);
+        if (msm->slots[idx].active) {
+            msm->slots[idx].status = STREAM_FAILED;
+        }
+        pthread_mutex_unlock(&msm->lock);
+    }
+    free(arg);
+    return NULL;
+}
+
 int msm_add_stream(multi_stream_manager_t *msm, const char *url, const char *label) {
     if (!msm || !url || !label) return -1;
 
-    /* Reserve a slot and stash the metadata so a concurrent get_statuses()
-     * sees STREAM_CONNECTING immediately. */
+    /* Reserve a slot so a concurrent get_statuses() sees STREAM_CONNECTING
+     * immediately. All slow work happens in the prep pthread. */
     pthread_mutex_lock(&msm->lock);
     int idx = find_free_slot_locked(msm);
     if (idx < 0) {
@@ -270,45 +373,20 @@ int msm_add_stream(multi_stream_manager_t *msm, const char *url, const char *lab
     strncpy(slot->label, label, sizeof(slot->label) - 1);
     pthread_mutex_unlock(&msm->lock);
 
-    /* Outside the lock: resolve URL (may take seconds for yt-dlp) + start
-     * ffmpeg. If either fails, mark FAILED and return -1 — slot remains
-     * active so the operator can see the failure in get_statuses(). */
-    char *resolved = resolve_stream_url(url);
-    if (!resolved) {
-        pthread_mutex_lock(&msm->lock);
-        slot->status = STREAM_FAILED;
-        pthread_mutex_unlock(&msm->lock);
-        return -1;
-    }
-
-    frame_capture_t *capture = frame_capture_start(resolved);
-    if (!capture) {
-        free(resolved);
-        pthread_mutex_lock(&msm->lock);
-        slot->status = STREAM_FAILED;
-        pthread_mutex_unlock(&msm->lock);
-        return -1;
-    }
-
-    forwarder_arg_t *arg = (forwarder_arg_t *)calloc(1, sizeof(*arg));
+    prep_arg_t *arg = (prep_arg_t *)calloc(1, sizeof(*arg));
     if (!arg) {
-        frame_capture_stop(capture);
-        free(resolved);
         pthread_mutex_lock(&msm->lock);
         slot->status = STREAM_FAILED;
         pthread_mutex_unlock(&msm->lock);
         return -1;
     }
-    arg->msm = msm;
+    arg->msm        = msm;
     arg->slot_index = idx;
-    arg->resolved_url = resolved;
-    arg->capture = capture;
+    strncpy(arg->url, url, sizeof(arg->url) - 1);
 
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, forwarder_main, arg) != 0) {
+    pthread_t prep_tid;
+    if (pthread_create(&prep_tid, NULL, prep_main, arg) != 0) {
         free(arg);
-        frame_capture_stop(capture);
-        free(resolved);
         pthread_mutex_lock(&msm->lock);
         slot->status = STREAM_FAILED;
         pthread_mutex_unlock(&msm->lock);
@@ -316,7 +394,7 @@ int msm_add_stream(multi_stream_manager_t *msm, const char *url, const char *lab
     }
 
     pthread_mutex_lock(&msm->lock);
-    slot->thread = tid;
+    slot->prep_thread = prep_tid;
     pthread_mutex_unlock(&msm->lock);
 
     return idx;
@@ -333,29 +411,46 @@ int msm_remove_stream(multi_stream_manager_t *msm, int index) {
         return -1;
     }
 
-    /* SIGTERM the ffmpeg child to unblock the forwarder's fread. If the
-     * forwarder has already exited (capture_pid==0), there's nothing to
-     * signal but join below still works. */
-    pid_t pid = slot->capture_pid;
-    pthread_t tid = slot->thread;
-    int joined = slot->joined;
+    /* Set cancel_requested so the prep pthread (if still resolving) bails out
+     * between blocking calls instead of marching on to ffmpeg + forwarder.
+     * Snapshot the thread handles + pid under the lock. */
+    slot->cancel_requested = 1;
+    pthread_t prep_tid = slot->prep_thread;
+    int       prep_joined = slot->prep_joined;
     pthread_mutex_unlock(&msm->lock);
 
-    if (pid > 0) {
-        kill(pid, SIGTERM);
+    /* Join the prep pthread first. Worst case it's still inside yt-dlp; we
+     * wait for that to finish (no clean way to interrupt the external child).
+     * After this join returns, slot->forwarder_thread is in its final state:
+     * either set (prep got far enough to spawn the forwarder), or 0 (prep
+     * failed early or saw the cancel flag). */
+    if (!prep_joined && prep_tid != 0) {
+        pthread_join(prep_tid, NULL);
     }
 
-    /* Join outside the lock (forwarder needs the lock for its exit
-     * bookkeeping). pthread_join is idempotent guarded by `joined`. */
-    if (!joined && tid != 0) {
-        pthread_join(tid, NULL);
+    /* Now read the forwarder handle + pid under the lock — they're stable
+     * because the only writer (prep) has exited. */
+    pthread_mutex_lock(&msm->lock);
+    slot->prep_joined = 1;
+    pid_t      cap_pid    = slot->capture_pid;
+    pthread_t  fwd_tid    = slot->forwarder_thread;
+    int        fwd_joined = slot->forwarder_joined;
+    pthread_mutex_unlock(&msm->lock);
+
+    if (cap_pid > 0) {
+        kill(cap_pid, SIGTERM);
+    }
+    if (!fwd_joined && fwd_tid != 0) {
+        pthread_join(fwd_tid, NULL);
     }
 
     pthread_mutex_lock(&msm->lock);
-    slot->joined = 1;
-    slot->active = 0;
-    slot->capture_pid = 0;
-    slot->thread = 0;
+    slot->forwarder_joined = 1;
+    slot->active           = 0;
+    slot->cancel_requested = 0;
+    slot->capture_pid      = 0;
+    slot->prep_thread      = 0;
+    slot->forwarder_thread = 0;
     /* Leave url/label populated for the small window before a fresh
      * add_stream reuses the slot — get_statuses() looks at `active`. */
     pthread_mutex_unlock(&msm->lock);
@@ -493,26 +588,50 @@ void msm_free(multi_stream_manager_t *msm) {
      * with -1 and exits. */
     ring_close(&msm->ring);
 
-    /* SIGTERM every running capture, then join every forwarder. */
-    pthread_t to_join[VAULT_MAX_STREAMS];
-    int       n_to_join = 0;
+    /* Collect prep + forwarder tids for every active slot, mark them all
+     * cancel_requested + SIGTERM the captures, then drop the lock so the
+     * prep threads can transition through their cancel checks while we wait
+     * to join. We join in two passes (prep first, then forwarder) so prep
+     * has a chance to publish forwarder_thread before we read it. */
+    pthread_t prep_to_join[VAULT_MAX_STREAMS];
+    int       n_prep = 0;
 
     pthread_mutex_lock(&msm->lock);
     for (int i = 0; i < VAULT_MAX_STREAMS; i++) {
         stream_slot_t *s = &msm->slots[i];
         if (!s->active) continue;
+        s->cancel_requested = 1;
         if (s->capture_pid > 0) {
             kill(s->capture_pid, SIGTERM);
         }
-        if (!s->joined && s->thread != 0) {
-            to_join[n_to_join++] = s->thread;
-            s->joined = 1;
+        if (!s->prep_joined && s->prep_thread != 0) {
+            prep_to_join[n_prep++] = s->prep_thread;
+            s->prep_joined = 1;
         }
     }
     pthread_mutex_unlock(&msm->lock);
 
-    for (int i = 0; i < n_to_join; i++) {
-        pthread_join(to_join[i], NULL);
+    for (int i = 0; i < n_prep; i++) {
+        pthread_join(prep_to_join[i], NULL);
+    }
+
+    /* Prep is fully retired now — forwarder_thread fields are stable. */
+    pthread_t fwd_to_join[VAULT_MAX_STREAMS];
+    int       n_fwd = 0;
+
+    pthread_mutex_lock(&msm->lock);
+    for (int i = 0; i < VAULT_MAX_STREAMS; i++) {
+        stream_slot_t *s = &msm->slots[i];
+        if (!s->active) continue;
+        if (!s->forwarder_joined && s->forwarder_thread != 0) {
+            fwd_to_join[n_fwd++] = s->forwarder_thread;
+            s->forwarder_joined = 1;
+        }
+    }
+    pthread_mutex_unlock(&msm->lock);
+
+    for (int i = 0; i < n_fwd; i++) {
+        pthread_join(fwd_to_join[i], NULL);
     }
 
     ring_free(&msm->ring);
@@ -542,7 +661,8 @@ int msm_test_register_slot(multi_stream_manager_t *msm, const char *url, const c
     memset(slot, 0, sizeof(*slot));
     slot->active = 1;
     slot->status = STREAM_ACTIVE;
-    slot->joined = 1;  /* No real thread spawned. */
+    slot->prep_joined      = 1;  /* No real threads spawned in test mode. */
+    slot->forwarder_joined = 1;
     strncpy(slot->url, url, sizeof(slot->url) - 1);
     strncpy(slot->label, label, sizeof(slot->label) - 1);
     pthread_mutex_unlock(&msm->lock);

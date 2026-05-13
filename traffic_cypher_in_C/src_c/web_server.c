@@ -1175,18 +1175,20 @@ static void handle_add_stream(int fd, app_state_t *state, http_request_t *req) {
     }
 
 #ifdef ENABLE_TRAFFIC_ENTROPY
-    /* Route through the multi_stream manager: resolves the URL via yt-dlp,
-     * starts ffmpeg, spawns the forwarder thread that pushes captured frames
-     * into the ring the rotation_daemon consumes from. Synchronous: blocks
-     * the worker until ffmpeg is up (typically a few seconds). */
+    /* Route through the multi_stream manager. msm_add_stream is async: it
+     * reserves a slot synchronously, then spawns a prep pthread that does
+     * yt-dlp resolve + ffmpeg start in the background. We respond 202
+     * Accepted with status:"connecting" and the slot index — the operator
+     * polls GET /api/streams to observe the slot transitioning to Active or
+     * Failed. msm_add_stream still returns -1 synchronously for
+     * slot-exhaustion or allocation failure. */
     int msm_index = -1;
     if (state->msm) {
         msm_index = msm_add_stream(state->msm, url, label);
     }
     if (msm_index < 0) {
-        send_error(fd, 500, "Internal Server Error",
-                   "stream resolve or capture-start failed; "
-                   "check that yt-dlp + ffmpeg are installed");
+        send_error(fd, 503, "Service Unavailable",
+                   "no free stream slot (max 16) or manager unavailable");
         free(url); free(label);
         return;
     }
@@ -1205,8 +1207,8 @@ static void handle_add_stream(int fd, app_state_t *state, http_request_t *req) {
     pthread_mutex_unlock(&state->lock);
 
     char resp[128];
-    snprintf(resp, sizeof(resp), "{\"status\":\"added\",\"index\":%d}", msm_index);
-    send_json(fd, 200, "OK", resp);
+    snprintf(resp, sizeof(resp), "{\"status\":\"connecting\",\"index\":%d}", msm_index);
+    send_json(fd, 202, "Accepted", resp);
 #else
     /* We still persist the config so the user's stream list survives across
      * restarts — Rust users on the same machine read the same file and will

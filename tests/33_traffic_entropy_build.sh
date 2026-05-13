@@ -144,9 +144,10 @@ echo "  streams: $streams"
 [ "$streams" = "[]" ] || fail "/api/streams should be empty on fresh PM, got: $streams"
 pass "/api/streams returns [] on fresh manager"
 
-# POST a bogus URL to /api/streams: should now go through msm_add_stream
-# (instead of 501) and fail with 500 because resolve_stream_url rejects
-# anything that isn't a real reachable HTTPS livestream.
+# POST a bogus URL to /api/streams. After the stage-5 async refactor,
+# msm_add_stream returns immediately (slot reserved, prep pthread spawned)
+# and we expect 202 Accepted with status:"connecting" — failure happens in
+# the background. The slot should transition to Failed shortly after.
 add_status=$(curl -s -o "$TMPHOME/add.body" -w '%{http_code}' \
     -X POST http://127.0.0.1:9876/api/streams \
     -H "Authorization: Bearer ${token}" \
@@ -154,16 +155,57 @@ add_status=$(curl -s -o "$TMPHOME/add.body" -w '%{http_code}' \
     -d '{"url":"https://invalid.example/not-a-real-stream","label":"bogus"}')
 echo "  POST /api/streams status: $add_status"
 echo "  POST /api/streams body:   $(cat "$TMPHOME/add.body")"
-# With the flag on, we never want to see 501 again.
+
 [ "$add_status" = "501" ] \
     && fail "/api/streams POST still returns 501 with the flag set"
-# 200 (yt-dlp absent → resolve fails → msm returns -1 → 500), 500, or 400 are all
-# acceptable "the new path was taken" signals; just not 501.
+# 202 is the new expected (async). 200/400/503 are tolerated to keep the test
+# resilient to future tweaks; 500 from a sync failure is no longer expected
+# but accepted for now.
 case "$add_status" in
-    500|400|200) ;;
+    202|200|400|500|503) ;;
     *) fail "unexpected status from POST /api/streams: $add_status" ;;
 esac
 pass "POST /api/streams no longer returns 501 with the flag set"
+
+# The async refactor's other observable: POST should return promptly. We
+# already received the body, so measure end-to-end by timing a second call.
+post_start=$(python3 -c 'import time; print(time.time())')
+curl -s -o /dev/null -w '%{http_code}\n' \
+    -X POST http://127.0.0.1:9876/api/streams \
+    -H "Authorization: Bearer ${token}" \
+    -H 'Content-Type: application/json' \
+    -d '{"url":"https://invalid.example/another-bogus","label":"bogus2"}' \
+    >"$TMPHOME/add2.status"
+post_end=$(python3 -c 'import time; print(time.time())')
+elapsed=$(python3 -c "print(f'{$post_end - $post_start:.2f}')")
+echo "  second POST elapsed: ${elapsed}s, status: $(cat "$TMPHOME/add2.status")"
+# yt-dlp resolve typically takes 2-5 s; the async refactor's whole point is
+# that the POST itself completes well under 1 s. Be generous: 2 s budget.
+python3 -c "import sys; sys.exit(0 if $elapsed < 2.0 else 1)" \
+    || fail "POST /api/streams took ${elapsed}s — async refactor is not in effect"
+pass "POST /api/streams returns in <2s (async refactor in effect)"
+
+# Poll /api/streams up to 15 s — the bogus URLs will fail their resolve and
+# the slots should transition to Failed.
+got_failed=0
+for _ in $(seq 1 15); do
+    cur=$(curl -s -H "Authorization: Bearer ${token}" http://127.0.0.1:9876/api/streams)
+    if printf '%s' "$cur" | grep -q '"status":"Failed"'; then
+        got_failed=1
+        break
+    fi
+    sleep 1
+done
+if [ "$got_failed" = "1" ]; then
+    pass "background prep marked the bogus slot Failed within 15s"
+else
+    # If yt-dlp resolve takes longer (network), allow the slot to still be
+    # Connecting — that's evidence the async path is alive too.
+    cur=$(curl -s -H "Authorization: Bearer ${token}" http://127.0.0.1:9876/api/streams)
+    printf '%s' "$cur" | grep -q '"status":"Connecting"' \
+        || fail "bogus slot never reached Failed nor Connecting: $cur"
+    info "background prep still Connecting after 15s (likely slow yt-dlp resolve)"
+fi
 
 kill "$PID" 2>/dev/null || true
 wait "$PID" 2>/dev/null || true

@@ -4,6 +4,45 @@ This file tracks step-by-step status of the items defined in `REMEDIATION_PLAN.m
 
 ---
 
+### 2026-05-13 — Week 4+ #1a stage 5: async `msm_add_stream` (prep pthread)
+
+Removes the multi-second blocking caveat documented in the stage 3 entry. `msm_add_stream` no longer calls `resolve_stream_url` (yt-dlp) or `frame_capture_start` (ffmpeg) on the caller's thread — those run in a per-slot prep pthread spawned by `msm_add_stream` and joined by `msm_remove_stream` / `msm_free`.
+
+**Why this matters**
+
+- `handle_add_stream` (under `ENABLE_TRAFFIC_ENTROPY`) was the slowest HTTP path in the system: a single POST to `/api/streams` held one worker thread for ~2–5 s of yt-dlp resolve. With a 4-thread worker pool, four concurrent stream adds DoSed the daemon.
+- Stage 4a's auto-replay-on-unlock fanned `state->stream_config` through `msm_add_stream` serially in a single detached pthread. For a 16-stream config that's a 30+ s wall-clock delay before all streams come online. After this refactor the 16 prep pthreads run in parallel — wall time drops to the slowest single resolve (~5 s).
+
+**Wire-up**
+
+- `traffic_cypher_in_C/src_c/multi_stream.c`:
+  - `stream_slot_t` gains `cancel_requested`, `prep_thread`, `forwarder_thread`, `prep_joined`, `forwarder_joined`. The old single `thread` / `joined` fields are gone.
+  - New `prep_main` pthread does the three previously-synchronous phases (resolve, capture-start, forwarder-spawn). Between each phase it checks `cancel_requested` so a remove issued during yt-dlp's runtime bails out before the next external call. Failure / cancel marks `STREAM_FAILED`; success transitions ownership of the resolved URL + capture handle into the forwarder thread.
+  - `msm_add_stream` is now non-blocking: reserves a slot, snapshots url + label into a heap-owned `prep_arg_t`, `pthread_create`s the prep thread (joinable), and returns the slot index. Microsecond latency.
+  - `msm_remove_stream` joins prep first (it may still be inside yt-dlp), then reads `forwarder_thread` from the now-quiesced slot, then joins the forwarder if any. The two joins are sequenced because prep is the writer of `forwarder_thread`.
+  - `msm_free` does the same two-pass join over all active slots.
+  - `forwarder_main` no longer publishes `capture_pid` — prep does, atomically with `forwarder_thread`, so a remove that fires right when the forwarder starts sees a coherent (pid, tid) pair.
+  - Test seam (`msm_test_register_slot`) sets both `prep_joined` and `forwarder_joined` to 1 (no real threads in test mode).
+- `traffic_cypher_in_C/src_c/web_server.c` — `handle_add_stream` response under the flag is now `202 Accepted` with body `{"status":"connecting","index":N}`. The previous `500` on resolve/capture failure goes away (failure is observed asynchronously via GET `/api/streams`); the only synchronous failure is `503 Service Unavailable` when the manager is NULL or all 16 slots are taken.
+- `tests/33_traffic_entropy_build.sh` — tolerates 202 status, asserts the POST returns in <2 s (the async refactor's whole observable), polls `/api/streams` up to 15 s for the bogus slot to transition to `Failed`, falls back to accepting `Connecting` if yt-dlp resolve is slow.
+
+**Verification**
+
+- `make -C traffic_cypher_in_C clean && make` — clean. Default build untouched.
+- `make -C traffic_cypher_in_C clean && make ENABLE_TRAFFIC_ENTROPY=1` — clean.
+- `make -C traffic_cypher_in_C msm_test && ./traffic_cypher_in_C/msm_test` — 28/28 PASS (test seam updated for dual joined flags).
+- `bash tests/33_traffic_entropy_build.sh` — POST elapsed reported as `0.02s` (was multi-second pre-refactor); slot reaches `Failed` within ~1 s of the bogus URL POST.
+- `bash tests/run.sh` — **35 PASS + 1 SKIP** in 76 s on Apple Silicon (matches stage 4 baseline).
+- `cargo clippy --all-targets --locked -- -D warnings` — clean.
+
+**Risks**
+
+- `msm_remove_stream` can still take up to a yt-dlp-resolve worth of seconds in the worst case: prep is inside `resolve_stream_url` and we have no way to interrupt the external child without killing the yt-dlp PID (which `stream_ingestion.c` doesn't expose). Bounded by yt-dlp's `--socket-timeout`; in practice <10 s. Operator-facing remove is rare, so accepted.
+- Two heap allocations per add now: `prep_arg_t` (~1 KiB) is alive only during the prep thread's lifetime; `forwarder_arg_t` is alive for the forwarder's lifetime. Both freed on their thread's exit paths.
+- The `cancel_requested` check between phases is racy with the prep thread already having started the next external call — but `frame_capture_start` is fork+exec which completes in <1 s, so the worst-case wait is short. Cleaner cancellation would require teaching `frame_capture_start` to consult a cancel flag.
+
+---
+
 ### 2026-05-13 — Week 4+ #1a stage 4: five-agent fan-out (CI / docs / replay / frontend / parity)
 
 Stage 4 of #1a was scoped as five independent slices and dispatched to five worktree-isolated agents running in parallel. Each landed as its own commit on `main` after a local merge + regression-suite verification.
