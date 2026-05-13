@@ -9,8 +9,10 @@ TrafficCypher/
 ├── traffic_cypher_in_C/      # C implementation (CLI + web password manager)
 ├── traffic_cypher_in_Rust/   # Rust implementation (CLI + web password manager)
 ├── benchmark/                # Cross-implementation benchmark suite
-├── traffic_cypher_benchmark_report.pdf
-└── traffic_cypher_benchmark_report.docx
+├── frontend/                 # Shared web UI (deduped; C build mirrors it)
+├── parity/                   # Cross-implementation HTTP parity harness
+├── tests/                    # Regression test runner (bash tests/run.sh)
+└── reports/                  # Pre-built benchmark reports (.pdf, .docx)
 ```
 
 ---

@@ -70,7 +70,7 @@ No system upgrades, no global package installs, no destructive commands run duri
 | Pin Rust MSRV via `rust-toolchain.toml` | done | this run — `rust-version = "1.82"` in `Cargo.toml`, `rust-toolchain.toml` pins channel + components |
 | `[profile.release]` LTO + strip | done | this run — `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"` |
 | More C compile-time hardening flags | done | this run — `-fstack-protector-strong -fPIE` always; Linux: `-pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack`; GCC: `-Wstringop-overflow=4` |
-| Move report binaries out of `main` | deferred | requires user policy decision (use Releases / Git LFS / branch) — out of scope for an unattended routine |
+| Move report binaries out of `main` | done (in-tree reorg) | this run — moved `traffic_cypher_benchmark_report.{docx,pdf}` to `reports/`; README updated; regression test pins the location. Repo size unchanged but root tree is clean. LFS / Releases migration remains an option for a future PR. |
 | Week 4+ #5c DOM construction pass | done | this run — 9 attribute sinks replaced with `.value =` setters and a closure-bound copy handler |
 | Week 4+ #10d fuzzing targets | done (Rust + C) | this run — Rust: `traffic_cypher_in_Rust/fuzz/` (2 cargo-fuzz targets). C: `traffic_cypher_in_C/fuzz_c/` (3 libFuzzer targets, `ENABLE_FUZZ_API`-gated wrappers in `vault.c`, `make fuzz` target). CI wiring deferred (Rust needs nightly; C needs clang+libFuzzer runtime on the runner). |
 | Week 4+ #1a Full C MultiStreamManager port | deferred | plan calls this "~2 weeks of focused C work"; outside one-routine scope |
@@ -185,10 +185,23 @@ Added the C half of #10d. Three libFuzzer targets at `traffic_cypher_in_C/fuzz_c
 
 ---
 
+### 2026-05-13 — Backlog batch 2: report binaries
+
+Moved `traffic_cypher_benchmark_report.docx` and `traffic_cypher_benchmark_report.pdf` from the repository root into a new `reports/` subdirectory. Done as an in-tree reorg (low-risk, fully reversible) rather than a destructive Git LFS / filter-branch migration. Future migration to GitHub Releases or LFS can still happen — this commit just clears the root tree.
+
+**Files**
+- `reports/traffic_cypher_benchmark_report.docx`, `reports/traffic_cypher_benchmark_report.pdf` (moved via `git mv` to preserve history).
+- `README.md` — refreshed the file-tree block to point at `reports/` (and added the now-canonical `frontend/`, `parity/`, `tests/` siblings while I was in there).
+- `tests/28_report_binaries_location.sh` (new) — pins the new path and refuses any future `*.pdf` / `*.docx` at the repo root.
+
+**Verification**: `bash tests/run.sh` — **31/31 PASS** (was 30; +1 new location test).
+
+---
+
 ## Final state at end of run
 
 - Weeks 0–3: complete (verified earlier in this file).
-- Backlog (9 items): 8/9 done. The remaining one — moving report binaries out of `main` — is deferred as a policy decision out of scope for an unattended routine.
+- Backlog (9 items): **9/9 complete** (the report-binaries item resolved this batch via in-tree reorg).
 - Week 4+: #5c DOM construction pass complete; #10d **complete** (Rust + C); #1a Full C MultiStreamManager port deferred (~2 weeks of focused work per the plan).
-- Regression harness: 26 → 30 tests, all green.
-- Four commits pushed this session: `8b0ea7b` (build hardening), `827394b` (#5c DOM), `903c484` (Rust fuzz), and the upcoming C fuzz commit.
+- Regression harness: 26 → **31** tests, all green.
+- Five commits pushed this session: `8b0ea7b` (build hardening), `827394b` (#5c DOM), `903c484` (Rust fuzz), `6effb7a` (C fuzz), and the upcoming reports commit.
