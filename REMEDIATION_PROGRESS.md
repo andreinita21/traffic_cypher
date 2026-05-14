@@ -4,6 +4,67 @@ This file tracks step-by-step status of the items defined in `REMEDIATION_PLAN.m
 
 ---
 
+### 2026-05-14 — Routine re-entry: post-hygiene verification pass (no code changes)
+
+Second routine pass on 2026-05-14, on a clean working tree at `f6f1eb2`. The earlier same-day re-entry (commit `f6f1eb2`) flipped 25 stale `NEXT_STEPS.md` checkboxes; there is nothing in `REMEDIATION_PLAN.md` (Weeks 0–4+, the nine-item backlog) or `NEXT_STEPS.md` (Phases A–E) that is still pending. This entry exists to record that the build/test surfaces still pass at the exact state of `main` and that no in-flight regression has crept in.
+
+**Resume determination**
+
+| Source | Last completed week / phase |
+|---|---|
+| `REMEDIATION_PROGRESS.md` | Week 4+ items (#1a stages 1–5, #5c, #10d) all complete; all five `NEXT_STEPS.md` phases complete; fuzz-CI follow-up commits (`20b90e5`, `7e9f9ae`, `2204880`) and the fuzz-found `parse_vault_entries` OOB fix (`97df08f`) landed |
+| Git history (`git log --oneline -20`) | Same — chain from `985ea19` (Week 0 head) to `f6f1eb2` (HEAD) is intact and self-consistent |
+| Actual code inspection | Same — confirmed below by file/symbol/test checks |
+| Resume point chosen | Verification only; no functional resume |
+| Mismatch | None |
+
+**Environment check (one-time, this run)**
+
+- OS: Darwin 25.4.0 / arm64 (macOS, Apple Silicon).
+- Tools present (`which` probe): `git`, `make`, `gcc`, `clang`, `rustc`, `cargo`, `rustfmt`, `clippy-driver`, `python3`, `curl`, `jq`, `ffmpeg`, OpenSSL 3 at `/opt/homebrew/opt/openssl@3`.
+- Tools absent locally (acceptable, documented in prior entries):
+    - `yt-dlp` — only needed for `tests/34_c_auto_replay.sh`'s real-stream variant, which SKIPs cleanly without it.
+    - `actionlint` — optional per the routine; YAML reviewed manually.
+    - `pkg-config` — not required, OpenSSL is referenced via `OPENSSL_PREFIX` in the Makefile.
+- No installations performed: nothing missing was required for the work attempted this run.
+
+**Five-agent fan-out summary**
+
+| Agent | Result |
+|-------|--------|
+| **Security Agent** | No new findings on re-read. The fuzz-discovered `parse_vault_entries` OOB closed by `97df08f` still holds; no new corpus crashes locally. Backlog-nine (constant-time session compare, /api/auth/unlock rate limit, zeroize, atomic vault writes, narrow CORS, MSRV pin, LTO/strip, C hardening flags, report-bins-out-of-main) still satisfied by the existing tests (`tests/15_cors_narrow`, `tests/16_static_zeroize`, `tests/18_unlock_rate_limit`, `tests/24_hardening_flags`, `tests/41_atomic_vault_writes`). |
+| **Rust Agent** | `cargo fmt --check` ✓ (hard-gate, 0 diff), `cargo build --release --bins --locked` ✓ (cached, 0.25s), `cargo test --locked -- --test-threads=1` → **14 unit + 8 integration HTTP tests PASS / 0 fail**, `cargo clippy --all-targets --locked -- -D warnings` ✓ (cached, 0.18s). `rust-toolchain.toml` MSRV pin and `[profile.release]` LTO/strip remain in place. |
+| **C Agent** | `make -C traffic_cypher_in_C clean && make` clean on Apple Silicon — compile line carries `-DENABLE_TRAFFIC_ENTROPY` + `-D_FORTIFY_SOURCE=2 -Wformat-security -fstack-protector-strong -fPIE` (Phase C default + hardening flags both observable). Binary literal `{"build":"c","traffic_entropy":true}` present. Round-trip opt-out (`make ENABLE_TRAFFIC_ENTROPY=0`) produces `{"build":"c","traffic_entropy":false,"note":"OS entropy only; see README"}` with `-DENABLE_TRAFFIC_ENTROPY` correctly absent from the rebuilt `pm_main.o` compile line. Default build restored after the check. |
+| **Testing & CI Agent** | `bash tests/run.sh` → **37 PASS + 1 SKIP** in **87 s** (Apple Silicon). SKIP is `tests/34_c_auto_replay.sh` (no `yt-dlp` locally; expected). `bash tests/60_parity_smoke.sh` (default variant) → **5/5 PASS, 0 KNOWN-DIVERGENT, 0 FAIL** in 5.6 s. |
+| **GitHub/Repo Hygiene Agent** | `git status` clean both before and after the verification cycle. No machine-specific paths in any tracked file. Generated artefacts (`*.o`, `traffic-cypher`, `traffic-cypher-pm`, `frontend/` symlink-copy under C tree) all `.gitignore`d. `NEXT_STEPS.md` still 0 `[ ]` / 25 `[x]` — hygiene fix from `f6f1eb2` holds. |
+
+**Verification (this run)**
+
+| Check | Result |
+|------|--------|
+| `git status` (before) | clean working tree |
+| `cargo fmt --check` (hard gate) | OK (0 diff) |
+| `cargo build --release --bins --locked` | OK |
+| `cargo test --locked -- --test-threads=1` | 14 lib + 8 integration HTTP tests pass; 0 failed |
+| `cargo clippy --all-targets --locked -- -D warnings` | OK |
+| `make -C traffic_cypher_in_C clean && make` (default) | OK; binary contains `"traffic_entropy":true` |
+| `make ENABLE_TRAFFIC_ENTROPY=0` round-trip | OK; binary contains `"traffic_entropy":false` |
+| `bash tests/run.sh` | **37 PASS + 1 SKIP** (87 s) |
+| `bash tests/60_parity_smoke.sh` (default) | **5/5 PASS, 0 KNOWN-DIVERGENT, 0 FAIL** (5.6 s) |
+| `grep -c '^- \[ \]' NEXT_STEPS.md` | **0** |
+| `grep -c '^- \[x\]' NEXT_STEPS.md` | **25** |
+| `git status` (after) | clean working tree (default C build restored, no tracked-file changes) |
+
+**Why no code changes**
+
+Per the routine's "be precise and conservative" rule, and the precedent set by `f6f1eb2` and `8c06de3`. Every plan item has either landed (verified above) or has been deferred with a documented technical reason (the only deferred item, full C `MultiStreamManager` port, was scoped down to `#1a` stages 1–5 in the planning conversation and superseded by the phone-camera path in `NEXT_STEPS.md` Phase B). Inventing fresh work would violate the "do not introduce unrelated features" rule.
+
+**Remaining tasks**
+
+None in scope of `REMEDIATION_PLAN.md` or `NEXT_STEPS.md`. Future work (when planned) should land in a new plan document; the routine's resume logic will pick that up next time.
+
+---
+
 ### 2026-05-14 — Routine re-entry: NEXT_STEPS.md checkbox hygiene + verification pass
 
 Routine re-entry on a clean working tree. No new functional remediation items pending: `REMEDIATION_PLAN.md` Weeks 0–3 + the nine-item backlog + Week 4+ #5c + #10d are all complete (verified in earlier entries), and all five `NEXT_STEPS.md` phases (A–E) landed earlier this week (`199240e`, `a7975cd`, `486a071`, `30decf1`, `76bb88a`, `d145484`, with three fuzz-CI follow-up commits and one fuzz-discovered vault OOB fix at `97df08f`).
