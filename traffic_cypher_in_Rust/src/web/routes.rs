@@ -38,25 +38,35 @@ pub fn static_routes() -> Router<Arc<AppState>> {
         .route("/phone.html", get(serve_phone))
 }
 
-async fn serve_index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+async fn serve_index() -> Response {
+    // no-store: the SPA shell + assets must never be cached by the browser or
+    // an upstream CDN (Cloudflare), or frontend updates silently go unseen.
+    ([("cache-control", "no-store")], Html(INDEX_HTML)).into_response()
 }
 
 async fn serve_js() -> Response {
     (
         StatusCode::OK,
-        [("content-type", "application/javascript")],
+        [
+            ("content-type", "application/javascript"),
+            ("cache-control", "no-store"),
+        ],
         APP_JS,
     )
         .into_response()
 }
 
 async fn serve_css() -> Response {
-    (StatusCode::OK, [("content-type", "text/css")], STYLE_CSS).into_response()
+    (
+        StatusCode::OK,
+        [("content-type", "text/css"), ("cache-control", "no-store")],
+        STYLE_CSS,
+    )
+        .into_response()
 }
 
-async fn serve_phone() -> Html<&'static str> {
-    Html(PHONE_HTML)
+async fn serve_phone() -> Response {
+    ([("cache-control", "no-store")], Html(PHONE_HTML)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +115,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // Status & entropy
         .route("/status", get(get_status))
         .route("/entropy-snapshot", get(entropy_snapshot))
+        // Visualizer v2 — last two processed camera/stream frames so the
+        // dashboard can recompute the entropy pipeline client-side.
+        .route("/visualizer/frame", get(visualizer_frame))
         // Settings
         .route("/settings", get(get_settings))
         .route("/settings", put(update_settings))
@@ -213,6 +226,19 @@ struct EntropySnapshotResponse {
     is_running: bool,
     entropy_source: String,
     latest_key_hex: String,
+}
+
+#[derive(Serialize)]
+struct VisualizerFrameResponse {
+    width: u32,
+    height: u32,
+    sequence: u64,
+    /// Base64-encoded raw RGB bytes of the most recent processed frame.
+    current: Option<String>,
+    /// Base64-encoded raw RGB bytes of the frame before `current`, or null.
+    previous: Option<String>,
+    has_frame: bool,
+    entropy_source: String,
 }
 
 #[derive(Serialize)]
@@ -1266,6 +1292,45 @@ async fn entropy_snapshot(headers: HeaderMap, State(state): State<Arc<AppState>>
         }),
     )
         .into_response()
+}
+
+/// Visualizer v2 endpoint. Returns the last two camera/stream frames the
+/// rotation daemon processed (current + previous) as base64 RGB bytes so the
+/// frontend can reproduce the entropy pipeline (SHA-256, XOR delta, block
+/// hashes) in-browser. `has_frame:false` until the first frame is consumed.
+async fn visualizer_frame(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
+    if !validate_session(&headers, &state).await {
+        return unauthorized();
+    }
+
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    let vf = state.rotation_state.viz_frames.read().await;
+    let entropy_source = state.entropy_source.read().await.clone();
+
+    let body = match &vf.current {
+        Some(cur) => VisualizerFrameResponse {
+            width: cur.width,
+            height: cur.height,
+            sequence: cur.sequence,
+            current: Some(b64.encode(&cur.data)),
+            previous: vf.previous.as_ref().map(|p| b64.encode(&p.data)),
+            has_frame: true,
+            entropy_source,
+        },
+        None => VisualizerFrameResponse {
+            width: 0,
+            height: 0,
+            sequence: 0,
+            current: None,
+            previous: None,
+            has_frame: false,
+            entropy_source,
+        },
+    };
+
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 async fn get_settings(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
