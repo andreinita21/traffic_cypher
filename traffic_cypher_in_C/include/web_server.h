@@ -34,6 +34,21 @@ typedef struct {
     int      has_traffic_entropy;
     uint8_t  latest_entropy[32];
 
+    /* Visualizer v2: last two camera/stream frames the rotation daemon
+     * processed (current + previous). Heap-owned raw RGB pixel bytes; the
+     * rotation daemon writes them under `lock`, GET /api/visualizer/frame
+     * reads them. NULL until the first frame is consumed. */
+    uint8_t *viz_frame_current;
+    size_t   viz_frame_current_len;
+    uint32_t viz_frame_current_w;
+    uint32_t viz_frame_current_h;
+    uint64_t viz_frame_current_seq;
+    uint8_t *viz_frame_previous;
+    size_t   viz_frame_previous_len;
+    uint32_t viz_frame_previous_w;
+    uint32_t viz_frame_previous_h;
+    uint64_t viz_frame_previous_seq;
+
     /* Thread safety */
     pthread_mutex_t lock;
 

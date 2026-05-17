@@ -9,6 +9,26 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, Duration};
 use tracing::{debug, info};
 
+/// One captured frame retained for the Visualizer v2 endpoint.
+/// Holds the raw RGB pixel bytes plus dimensions and the daemon-assigned
+/// sequence number so the frontend can recompute the entropy pipeline.
+#[derive(Clone)]
+pub struct VizFrame {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+    pub sequence: u64,
+}
+
+/// The last two frames the rotation daemon processed (current + previous).
+/// Read by `GET /api/visualizer/frame`. Both `None` until the first
+/// camera/stream frame is consumed.
+#[derive(Default, Clone)]
+pub struct VizFrames {
+    pub current: Option<VizFrame>,
+    pub previous: Option<VizFrame>,
+}
+
 /// Shared state for the key rotation daemon.
 /// Now accumulates traffic entropy for on-demand DEK generation
 /// instead of re-encrypting the vault every second.
@@ -25,6 +45,8 @@ pub struct KeyRotationState {
     pub is_running: Arc<RwLock<bool>>,
     /// Whether we have sufficient entropy for a DEK rotation
     pub has_traffic_entropy: Arc<RwLock<bool>>,
+    /// Last two processed frames, for the Visualizer v2 endpoint.
+    pub viz_frames: Arc<RwLock<VizFrames>>,
 }
 
 impl Default for KeyRotationState {
@@ -42,6 +64,7 @@ impl KeyRotationState {
             pool_depth: Arc::new(RwLock::new(0)),
             is_running: Arc::new(RwLock::new(false)),
             has_traffic_entropy: Arc::new(RwLock::new(false)),
+            viz_frames: Arc::new(RwLock::new(VizFrames::default())),
         }
     }
 
@@ -143,6 +166,22 @@ pub async fn start_rotation_daemon(
                     *rotation_state.frames_processed.write().await = frames_total;
                     *rotation_state.pool_depth.write().await = pool.len();
                     *rotation_state.has_traffic_entropy.write().await = true;
+
+                    // Retain the last two processed frames for the
+                    // Visualizer v2 endpoint. The current frame becomes the
+                    // delta basis for the next tick; the prior current
+                    // shifts into `previous`.
+                    {
+                        let mut vf = rotation_state.viz_frames.write().await;
+                        let new_current = VizFrame {
+                            width: frame.width,
+                            height: frame.height,
+                            data: frame.data.clone(),
+                            sequence: frames_total,
+                        };
+                        vf.previous = vf.current.take();
+                        vf.current = Some(new_current);
+                    }
 
                     previous_frame_data = Some(frame.data);
                     previous_key = Some(new_key);

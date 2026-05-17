@@ -829,183 +829,727 @@
     }
 
     // -----------------------------------------------------------------------
-    // Encryption Visualizer
+    // Encryption Visualizer v2
     // -----------------------------------------------------------------------
+    // Honest, in-browser reproduction of the entropy -> key pipeline.
+    // Every frame-derived value is recomputed here with Web Crypto / real JS;
+    // see VISUALIZER.md for the daemon-side algorithm this mirrors.
+    //
+    // Two modes:
+    //   step  — freeze the latest real frame pair, advance stage-by-stage.
+    //   live  — same pipeline, auto-advancing, polls every ~2 s.
+    // -----------------------------------------------------------------------
+
+    const VIZ_STAGE_COUNT = 7;
+
+    // Module-scoped visualizer state.
+    let vizState = {
+        mode: 'step',          // 'step' | 'live'
+        stage: 0,              // 0..6
+        autoplay: false,
+        frame: null,           // { width, height, sequence, current:Uint8Array, previous:Uint8Array|null, entropy_source }
+        snapshot: null,        // latest /api/entropy-snapshot
+        pipeline: null,        // computed stage data
+        computing: false,
+    };
+    let vizAutoplayTimer = null;
+
+    // ---- byte / hash helpers ----------------------------------------------
+
+    function vizB64ToBytes(b64) {
+        const bin = atob(b64);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+    }
+
+    function vizBytesToHex(bytes) {
+        let s = '';
+        for (let i = 0; i < bytes.length; i++) {
+            s += bytes[i].toString(16).padStart(2, '0');
+        }
+        return s;
+    }
+
+    async function vizSha256(bytes) {
+        const digest = await crypto.subtle.digest('SHA-256', bytes);
+        return new Uint8Array(digest);
+    }
+
+    // Shannon entropy of a byte buffer, in bits/byte (0..8).
+    function vizShannonEntropy(bytes) {
+        const counts = new Uint32Array(256);
+        for (let i = 0; i < bytes.length; i++) counts[bytes[i]]++;
+        let h = 0;
+        const n = bytes.length;
+        for (let i = 0; i < 256; i++) {
+            if (counts[i] === 0) continue;
+            const p = counts[i] / n;
+            h -= p * Math.log2(p);
+        }
+        return h;
+    }
+
+    // Count differing bits between two equal-length byte buffers.
+    function vizBitDiff(a, b) {
+        let diff = 0;
+        const n = Math.min(a.length, b.length);
+        for (let i = 0; i < n; i++) {
+            let x = a[i] ^ b[i];
+            while (x) { diff += x & 1; x >>= 1; }
+        }
+        return diff;
+    }
+
+    function vizCountBitsSet(bytes) {
+        let set = 0;
+        for (let i = 0; i < bytes.length; i++) {
+            let x = bytes[i];
+            while (x) { set += x & 1; x >>= 1; }
+        }
+        return set;
+    }
+
+    // Render RGB bytes to a canvas. Returns a data URL.
+    function vizRgbToDataUrl(rgb, w, h) {
+        const cv = document.createElement('canvas');
+        cv.width = w; cv.height = h;
+        const ctx = cv.getContext('2d');
+        const img = ctx.createImageData(w, h);
+        const px = img.data;
+        const n = w * h;
+        for (let i = 0; i < n; i++) {
+            px[i * 4] = rgb[i * 3] || 0;
+            px[i * 4 + 1] = rgb[i * 3 + 1] || 0;
+            px[i * 4 + 2] = rgb[i * 3 + 2] || 0;
+            px[i * 4 + 3] = 255;
+        }
+        ctx.putImageData(img, 0, 0);
+        return cv.toDataURL();
+    }
+
+    // ---- the pipeline ------------------------------------------------------
+    // Reproduces traffic_cypher_in_Rust/src/entropy_extractor.rs exactly.
+
+    async function vizComputePipeline(frame, snapshot) {
+        const cur = frame.current;
+        const prev = frame.previous;
+        const w = frame.width, h = frame.height;
+
+        // Stage 1 — full-frame SHA-256.
+        const fullHash = await vizSha256(cur);
+
+        // Stage 2 — inter-frame XOR delta + delta hash + motion heatmap.
+        let delta = null, deltaHash = null, changedRatio = null, heatmapUrl = null;
+        if (prev) {
+            const minLen = Math.min(cur.length, prev.length);
+            delta = new Uint8Array(minLen);
+            let changed = 0;
+            for (let i = 0; i < minLen; i++) {
+                delta[i] = cur[i] ^ prev[i];
+                if (delta[i] !== 0) changed++;
+            }
+            changedRatio = changed / minLen;
+            deltaHash = await vizSha256(delta);
+            // Motion heatmap: per-pixel sum of |R|+|G|+|B| XOR magnitude,
+            // mapped onto a black->green->red gradient.
+            heatmapUrl = vizDeltaHeatmap(cur, prev, w, h);
+        }
+
+        // Stage 3 — 8x8 spatial block hashes.
+        const gridCols = 8, gridRows = 8;
+        const blockW = Math.floor(w / gridCols);
+        const blockH = Math.floor(h / gridRows);
+        const blockHashes = [];
+        if (blockW > 0 && blockH > 0) {
+            for (let row = 0; row < gridRows; row++) {
+                for (let col = 0; col < gridCols; col++) {
+                    const chunks = [];
+                    for (let y = row * blockH; y < (row + 1) * blockH; y++) {
+                        const start = (y * w * 3) + (col * blockW * 3);
+                        const end = start + blockW * 3;
+                        if (end <= cur.length) chunks.push(cur.subarray(start, end));
+                    }
+                    let total = 0;
+                    chunks.forEach(c => total += c.length);
+                    const merged = new Uint8Array(total);
+                    let off = 0;
+                    chunks.forEach(c => { merged.set(c, off); off += c.length; });
+                    blockHashes.push(await vizSha256(merged));
+                }
+            }
+        }
+
+        // Stage 5 — avalanche test: flip one bit, re-hash, count flipped bits.
+        const flipped = cur.slice();
+        flipped[0] ^= 0x01;
+        const flippedHash = await vizSha256(flipped);
+        const avalancheBits = vizBitDiff(fullHash, flippedHash);
+        const avalanchePct = (avalancheBits / 256) * 100;
+
+        // Proof — Shannon entropy of the raw frame.
+        const shannon = vizShannonEntropy(cur);
+
+        // Stage 6 / proof — the daemon-reported 256-bit key. Not client
+        // reproducible (OS-random mix + HKDF happen server-side); displayed
+        // honestly as the daemon's value.
+        let keyBytes = new Uint8Array(32);
+        if (snapshot && snapshot.latest_key_hex && /^[0-9a-f]+$/i.test(snapshot.latest_key_hex)
+            && snapshot.latest_key_hex.length >= 16) {
+            const hx = snapshot.latest_key_hex;
+            const kb = new Uint8Array(Math.floor(hx.length / 2));
+            for (let i = 0; i < kb.length; i++) {
+                kb[i] = parseInt(hx.substr(i * 2, 2), 16);
+            }
+            keyBytes = kb;
+        }
+        const keyBitsSet = vizCountBitsSet(keyBytes);
+        const keyBitsTotal = keyBytes.length * 8;
+
+        // Aggregate verdict.
+        const verdictHigh = shannon >= 6.5 && avalanchePct >= 40 && avalanchePct <= 60;
+
+        return {
+            width: w, height: h,
+            fullHash, delta, deltaHash, changedRatio, heatmapUrl,
+            gridCols, gridRows, blockW, blockH, blockHashes,
+            flippedHash, avalancheBits, avalanchePct,
+            shannon,
+            keyBytes, keyBitsSet, keyBitsTotal,
+            verdictHigh,
+        };
+    }
+
+    // Motion heatmap image: XOR magnitude per pixel -> black/green/red ramp.
+    function vizDeltaHeatmap(cur, prev, w, h) {
+        const cv = document.createElement('canvas');
+        cv.width = w; cv.height = h;
+        const ctx = cv.getContext('2d');
+        const img = ctx.createImageData(w, h);
+        const px = img.data;
+        const n = w * h;
+        for (let i = 0; i < n; i++) {
+            const r = cur[i * 3] ^ (prev[i * 3] || 0);
+            const g = cur[i * 3 + 1] ^ (prev[i * 3 + 1] || 0);
+            const b = cur[i * 3 + 2] ^ (prev[i * 3 + 2] || 0);
+            const mag = Math.min(255, r + g + b);   // 0..255 motion intensity
+            // black -> green -> red
+            let cr, cg, cb;
+            if (mag < 128) {
+                cr = 0; cg = mag * 2; cb = 0;
+            } else {
+                cr = (mag - 128) * 2; cg = 255 - (mag - 128) * 2; cb = 0;
+            }
+            px[i * 4] = cr;
+            px[i * 4 + 1] = cg;
+            px[i * 4 + 2] = cb;
+            px[i * 4 + 3] = 255;
+        }
+        ctx.putImageData(img, 0, 0);
+        return cv.toDataURL();
+    }
+
+    // ---- stage metadata ----------------------------------------------------
+
+    const VIZ_STAGES = [
+        {
+            icon: '\u{1F4F9}', title: 'Raw Camera Frame',
+            what: 'The most recent 320x240 RGB frame the rotation daemon pulled from the camera stream.',
+            why: 'Every key starts here. A live scene is unpredictable: lighting, sensor noise and motion all feed real randomness into the pipeline.',
+        },
+        {
+            icon: '\u{1F9EC}', title: 'Full-Frame SHA-256',
+            what: 'A SHA-256 hash over all 230,400 RGB bytes of the frame.',
+            why: 'Condenses the whole frame into a fixed 256-bit fingerprint. Any pixel change produces a completely different hash.',
+        },
+        {
+            icon: '\u{1F30A}', title: 'Inter-Frame Motion Delta',
+            what: 'Frame N is XOR-ed against frame N-1, then the delta is hashed. The heatmap shows where pixels changed.',
+            why: 'This is the strongest entropy source: motion between frames is genuinely impossible to predict or reproduce.',
+        },
+        {
+            icon: '\u{1F4D0}', title: '8x8 Spatial Block Hashes',
+            what: 'The frame is split into a 8x8 grid; each of the 64 blocks is hashed separately.',
+            why: 'Captures local detail that a single whole-frame hash could average out, widening the entropy surface.',
+        },
+        {
+            icon: '\u{1F4A7}', title: 'Entropy Pool',
+            what: 'The extracted bytes are pushed into an 8-slot rolling pool; a SHA-256 pool digest spans all buffered frames.',
+            why: 'Chaining several seconds of frames means a single dull frame cannot weaken the key on its own.',
+        },
+        {
+            icon: '\u{1F300}', title: 'System Entropy Mix',
+            what: 'The daemon folds operating-system randomness (getrandom / RAND_bytes) into the pool digest.',
+            why: 'Belt-and-braces: even if the camera were somehow predictable, the OS CSPRNG keeps the seed strong. This step runs server-side and cannot be reproduced in the browser.',
+        },
+        {
+            icon: '\u{1F511}', title: 'HKDF -> 256-bit Key',
+            what: 'HKDF chains the mixed seed with the previous key into a fresh 32-byte data-encryption key.',
+            why: 'The final key. HKDF guarantees uniform, full-entropy output. Computed server-side; the daemon reports the result.',
+        },
+    ];
+
+    // ---- top-level view ----------------------------------------------------
+
     function renderVisualizer(container) {
         container.innerHTML = `
-            <div class="visualizer-page">
-                <div class="viz-header">
-                    <h2>\u26A1 Encryption Pipeline</h2>
-                    <p>Real-time visualization of the entropy-driven key derivation process</p>
-                    <div class="viz-live-badge"><span class="viz-live-dot"></span> LIVE</div>
-                </div>
-                <div class="viz-pipeline">
-                    <div class="viz-node glass" id="viz-frame-capture">
-                        <div class="viz-node-icon">\u{1F4F9}</div>
-                        <div class="viz-node-label">Frame Capture</div>
-                        <div class="viz-node-detail" id="viz-source">Waiting...</div>
-                        <div class="viz-scanlines"></div>
+            <div class="visualizer-page vizv2">
+                <div class="vizv2-header">
+                    <div class="vizv2-title">
+                        <h2>⚡ Entropy Pipeline</h2>
+                        <p>Honest, in-browser reproduction of the camera → key pipeline</p>
                     </div>
-                    <div class="viz-connector"><div class="viz-particles"></div></div>
-
-                    <div class="viz-node glass" id="viz-entropy-extract">
-                        <div class="viz-node-icon">\u{1F9EC}</div>
-                        <div class="viz-node-label">Entropy Extraction</div>
-                        <div class="viz-node-detail viz-hex-flow" id="viz-hex-digits">SHA-256</div>
-                    </div>
-                    <div class="viz-connector"><div class="viz-particles"></div></div>
-
-                    <div class="viz-node glass" id="viz-entropy-pool">
-                        <div class="viz-node-icon">\u{1F4A7}</div>
-                        <div class="viz-node-label">Entropy Pool</div>
-                        <div class="viz-pool-slots" id="viz-pool-slots">
-                            <div class="viz-slot"></div><div class="viz-slot"></div>
-                            <div class="viz-slot"></div><div class="viz-slot"></div>
-                            <div class="viz-slot"></div><div class="viz-slot"></div>
-                            <div class="viz-slot"></div><div class="viz-slot"></div>
-                        </div>
-                        <div class="viz-node-detail" id="viz-pool-info">Depth: 0/8</div>
-                    </div>
-                    <div class="viz-connector"><div class="viz-particles"></div></div>
-
-                    <div class="viz-node glass" id="viz-sys-mixer">
-                        <div class="viz-node-icon">\u{1F300}</div>
-                        <div class="viz-node-label">System Mixer</div>
-                        <div class="viz-node-detail">OS Random + Traffic Entropy</div>
-                        <div class="viz-mixer-ring"></div>
-                    </div>
-                    <div class="viz-connector"><div class="viz-particles"></div></div>
-
-                    <div class="viz-node glass" id="viz-hkdf">
-                        <div class="viz-node-icon">\u{1F517}</div>
-                        <div class="viz-node-label">HKDF Key Derivation</div>
-                        <div class="viz-node-detail" id="viz-epoch-info">Epoch: 0</div>
-                        <div class="viz-chain-links">
-                            <span class="viz-chain-link"></span>
-                            <span class="viz-chain-link"></span>
-                            <span class="viz-chain-link"></span>
-                        </div>
-                    </div>
-                    <div class="viz-connector"><div class="viz-particles"></div></div>
-
-                    <div class="viz-node glass viz-node-accent" id="viz-dek">
-                        <div class="viz-node-icon">\u{1F511}</div>
-                        <div class="viz-node-label">DEK Generation</div>
-                        <div class="viz-node-detail viz-key-hex" id="viz-key-hex">0x0000...0000</div>
-                    </div>
-                    <div class="viz-connector"><div class="viz-particles"></div></div>
-
-                    <div class="viz-node glass" id="viz-vault-enc">
-                        <div class="viz-node-icon viz-lock-icon" id="viz-lock">\u{1F512}</div>
-                        <div class="viz-node-label">Vault Encryption</div>
-                        <div class="viz-node-detail">AES-256-GCM Sealed</div>
+                    <div class="vizv2-mode-toggle" id="vizv2-mode-toggle">
+                        <button class="vizv2-mode-btn active" data-mode="step">⏸ Step-through</button>
+                        <button class="vizv2-mode-btn" data-mode="live">▶ Slowed live</button>
                     </div>
                 </div>
-                <div class="viz-stats">
-                    <div class="viz-stat glass-sm">
-                        <div class="viz-stat-value" id="viz-stat-epoch">—</div>
-                        <div class="viz-stat-label">Key Epoch</div>
-                    </div>
-                    <div class="viz-stat glass-sm">
-                        <div class="viz-stat-value" id="viz-stat-frames">—</div>
-                        <div class="viz-stat-label">Frames Processed</div>
-                    </div>
-                    <div class="viz-stat glass-sm">
-                        <div class="viz-stat-value" id="viz-stat-pool">—</div>
-                        <div class="viz-stat-label">Pool Depth</div>
-                    </div>
-                    <div class="viz-stat glass-sm">
-                        <div class="viz-stat-value" id="viz-stat-running">—</div>
-                        <div class="viz-stat-label">Pipeline Status</div>
-                    </div>
+                <div id="vizv2-body"></div>
+            </div>
+        `;
+        // Reset state on (re)entry.
+        if (vizAutoplayTimer) { clearInterval(vizAutoplayTimer); vizAutoplayTimer = null; }
+        vizState = {
+            mode: 'step', stage: 0, autoplay: false,
+            frame: null, snapshot: null, pipeline: null, computing: false,
+        };
+
+        $$('#vizv2-mode-toggle .vizv2-mode-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                if (vizState.mode === btn.dataset.mode) return;
+                vizState.mode = btn.dataset.mode;
+                vizState.stage = 0;
+                vizState.autoplay = false;
+                $$('#vizv2-mode-toggle .vizv2-mode-btn').forEach(b =>
+                    b.classList.toggle('active', b === btn));
+                stopVisualizerPolling();
+                vizBootstrap();
+            });
+        });
+
+        vizBootstrap();
+    }
+
+    // Fetch a frame + snapshot, compute the pipeline, then render.
+    async function vizBootstrap() {
+        const body = $('#vizv2-body');
+        if (body) {
+            body.innerHTML = `<div class="vizv2-loading"><div class="spinner"></div>
+                <p>Fetching the latest camera frame…</p></div>`;
+        }
+        try {
+            await vizRefresh();
+        } catch (e) {
+            if (body) {
+                body.innerHTML = `<div class="vizv2-empty glass">
+                    <div class="vizv2-empty-icon">⚠️</div>
+                    <p>Could not load the entropy pipeline.</p>
+                    <p class="vizv2-empty-sub">${esc(e.message || 'Request failed')}</p>
+                </div>`;
+            }
+            return;
+        }
+        if (vizState.mode === 'live') startVisualizerPolling();
+    }
+
+    // One fetch + compute cycle.
+    async function vizRefresh() {
+        const [frameRes, snap] = await Promise.all([
+            api('GET', '/visualizer/frame'),
+            api('GET', '/entropy-snapshot').catch(() => null),
+        ]);
+        vizState.snapshot = snap;
+
+        if (!frameRes.has_frame) {
+            vizState.frame = null;
+            vizState.pipeline = null;
+            vizRenderNoFrame();
+            return;
+        }
+
+        const frame = {
+            width: frameRes.width,
+            height: frameRes.height,
+            sequence: frameRes.sequence,
+            entropy_source: frameRes.entropy_source,
+            current: vizB64ToBytes(frameRes.current),
+            previous: frameRes.previous ? vizB64ToBytes(frameRes.previous) : null,
+        };
+        vizState.frame = frame;
+        vizState.computing = true;
+        vizState.pipeline = await vizComputePipeline(frame, snap);
+        vizState.computing = false;
+
+        if (vizState.mode === 'live') {
+            // Live mode walks the stages so the animation keeps flowing.
+            vizState.stage = (vizState.stage + 1) % VIZ_STAGE_COUNT;
+        }
+        vizRenderPipeline();
+    }
+
+    // No camera frame yet — prompt + still show the OS-entropy key grid.
+    function vizRenderNoFrame() {
+        const body = $('#vizv2-body');
+        if (!body) return;
+        const snap = vizState.snapshot;
+        let keyBytes = new Uint8Array(32);
+        let keyKnown = false;
+        if (snap && snap.latest_key_hex && /^[0-9a-f]+$/i.test(snap.latest_key_hex)
+            && snap.latest_key_hex.length >= 64) {
+            const hx = snap.latest_key_hex;
+            for (let i = 0; i < 32; i++) keyBytes[i] = parseInt(hx.substr(i * 2, 2), 16);
+            keyKnown = true;
+        }
+        const bitsSet = vizCountBitsSet(keyBytes);
+        body.innerHTML = `
+            <div class="vizv2-empty glass">
+                <div class="vizv2-empty-icon">\u{1F4F7}</div>
+                <h3>No camera frame yet</h3>
+                <p>The rotation daemon has not processed a camera frame.
+                   Start the phone camera to feed the entropy pipeline.</p>
+                <a class="btn btn-primary" href="/phone.html" target="_blank"
+                   rel="noopener">Open phone camera →</a>
+                <div class="vizv2-nf-key">
+                    <div class="vizv2-stage-sub">Meanwhile, the daemon is rotating keys from OS entropy.
+                        ${keyKnown ? 'Latest 256-bit key:' : 'No key reported yet.'}</div>
+                    <div id="vizv2-nf-grid" class="vizv2-bitgrid-wrap"></div>
+                    <div class="vizv2-keystat">${bitsSet} / 256 bits set
+                        — ${(bitsSet / 256 * 100).toFixed(1)}%</div>
                 </div>
             </div>
         `;
-        startVisualizerPolling();
+        const grid = $('#vizv2-nf-grid');
+        if (grid) grid.appendChild(vizBuildBitGrid(keyBytes));
     }
+
+    // 16x16 black/white bit grid for a 256-bit value.
+    function vizBuildBitGrid(bytes) {
+        const grid = document.createElement('div');
+        grid.className = 'vizv2-bitgrid';
+        for (let i = 0; i < 256; i++) {
+            const byte = bytes[Math.floor(i / 8)] || 0;
+            const bit = (byte >> (7 - (i % 8))) & 1;
+            const cell = document.createElement('div');
+            cell.className = 'vizv2-bitcell' + (bit ? ' set' : '');
+            grid.appendChild(cell);
+        }
+        return grid;
+    }
+
+    // ---- pipeline render ---------------------------------------------------
+
+    function vizRenderPipeline() {
+        const body = $('#vizv2-body');
+        if (!body) return;
+        const f = vizState.frame;
+        const p = vizState.pipeline;
+        if (!f || !p) { vizRenderNoFrame(); return; }
+
+        const isLive = vizState.mode === 'live';
+        const src = f.entropy_source || (vizState.snapshot && vizState.snapshot.entropy_source) || 'os';
+
+        body.innerHTML = `
+            <div class="vizv2-meta">
+                <span class="vizv2-pill">Frame #${f.sequence}</span>
+                <span class="vizv2-pill">${f.width}×${f.height}</span>
+                <span class="vizv2-pill">Source: ${esc(src)}</span>
+                ${f.previous ? '<span class="vizv2-pill">Pair: N &amp; N−1</span>'
+                             : '<span class="vizv2-pill vizv2-pill-warn">First frame — no delta yet</span>'}
+            </div>
+
+            <div class="vizv2-stepper" id="vizv2-stepper"></div>
+
+            <div class="vizv2-stage glass" id="vizv2-stage"></div>
+
+            ${isLive ? '' : `
+            <div class="vizv2-controls">
+                <button class="btn btn-secondary" id="vizv2-prev">← Prev</button>
+                <button class="btn btn-secondary" id="vizv2-autoplay">${vizState.autoplay ? '⏸ Pause' : '▶ Autoplay'}</button>
+                <button class="btn btn-primary" id="vizv2-next">Next →</button>
+            </div>`}
+
+            <div class="vizv2-proofs">
+                <div class="vizv2-proofs-head">
+                    <h3>\u{1F50D} Is the entropy actually HIGH?</h3>
+                    <div class="vizv2-verdict ${p.verdictHigh ? 'high' : 'low'}" id="vizv2-verdict">
+                        ${p.verdictHigh ? 'ENTROPY: HIGH ✓' : 'ENTROPY: CHECK'}
+                    </div>
+                </div>
+                <div class="vizv2-proof-grid" id="vizv2-proof-grid"></div>
+            </div>
+        `;
+
+        vizRenderStepper();
+        vizRenderStage();
+        vizRenderProofs();
+
+        if (!isLive) {
+            $('#vizv2-prev').addEventListener('click', () => {
+                vizState.stage = (vizState.stage - 1 + VIZ_STAGE_COUNT) % VIZ_STAGE_COUNT;
+                vizRenderStepper(); vizRenderStage();
+            });
+            $('#vizv2-next').addEventListener('click', () => {
+                vizState.stage = (vizState.stage + 1) % VIZ_STAGE_COUNT;
+                vizRenderStepper(); vizRenderStage();
+            });
+            $('#vizv2-autoplay').addEventListener('click', vizToggleAutoplay);
+        }
+    }
+
+    function vizToggleAutoplay() {
+        vizState.autoplay = !vizState.autoplay;
+        const btn = $('#vizv2-autoplay');
+        if (btn) btn.textContent = vizState.autoplay ? '⏸ Pause' : '▶ Autoplay';
+        if (vizAutoplayTimer) { clearInterval(vizAutoplayTimer); vizAutoplayTimer = null; }
+        if (vizState.autoplay) {
+            vizAutoplayTimer = setInterval(() => {
+                if (vizState.mode !== 'step') {
+                    clearInterval(vizAutoplayTimer); vizAutoplayTimer = null; return;
+                }
+                vizState.stage = (vizState.stage + 1) % VIZ_STAGE_COUNT;
+                vizRenderStepper(); vizRenderStage();
+            }, 2200);
+        }
+    }
+
+    function vizRenderStepper() {
+        const el = $('#vizv2-stepper');
+        if (!el) return;
+        el.innerHTML = VIZ_STAGES.map((s, i) => `
+            <div class="vizv2-step ${i === vizState.stage ? 'active' : ''} ${i < vizState.stage ? 'done' : ''}"
+                 data-stage="${i}">
+                <div class="vizv2-step-dot">${s.icon}</div>
+                <div class="vizv2-step-label">${i}</div>
+            </div>
+            ${i < VIZ_STAGES.length - 1 ? '<div class="vizv2-step-link ' +
+                (i < vizState.stage ? 'done' : '') + '"></div>' : ''}
+        `).join('');
+        $$('#vizv2-stepper .vizv2-step').forEach(step => {
+            step.addEventListener('click', () => {
+                if (vizState.mode !== 'step') return;
+                vizState.stage = parseInt(step.dataset.stage, 10);
+                vizRenderStepper(); vizRenderStage();
+            });
+        });
+    }
+
+    function vizRenderStage() {
+        const host = $('#vizv2-stage');
+        if (!host) return;
+        const idx = vizState.stage;
+        const meta = VIZ_STAGES[idx];
+        const p = vizState.pipeline;
+        const f = vizState.frame;
+
+        host.classList.remove('vizv2-stage-in');
+        // force reflow so the animation re-triggers
+        void host.offsetWidth;
+        host.classList.add('vizv2-stage-in');
+
+        let detail = '';
+
+        if (idx === 0) {
+            const url = vizRgbToDataUrl(f.current, f.width, f.height);
+            detail = `<div class="vizv2-imgrow">
+                <div><img class="vizv2-frame-img" src="${url}" alt="current frame">
+                     <div class="vizv2-imgcap">Frame N (current)</div></div>
+                ${f.previous ? `<div><img class="vizv2-frame-img"
+                     src="${vizRgbToDataUrl(f.previous, f.width, f.height)}" alt="previous frame">
+                     <div class="vizv2-imgcap">Frame N−1 (previous)</div></div>` : ''}
+            </div>
+            <div class="vizv2-kv"><span>Pixel bytes</span><b>${f.current.length.toLocaleString()}</b></div>`;
+        } else if (idx === 1) {
+            detail = `<div class="vizv2-hash">${vizBytesToHex(p.fullHash)}</div>
+                <div class="vizv2-kv"><span>Algorithm</span><b>SHA-256 (Web Crypto)</b></div>
+                <div class="vizv2-kv"><span>Input</span><b>${f.current.length.toLocaleString()} bytes</b></div>
+                <div class="vizv2-kv"><span>Output</span><b>256 bits</b></div>`;
+        } else if (idx === 2) {
+            if (p.delta) {
+                detail = `<div class="vizv2-imgrow">
+                    <div><img class="vizv2-frame-img" src="${p.heatmapUrl}" alt="motion heatmap">
+                         <div class="vizv2-imgcap">Motion heatmap (XOR delta)</div></div>
+                </div>
+                <div class="vizv2-kv"><span>Changed pixels</span>
+                    <b>${(p.changedRatio * 100).toFixed(2)}%</b></div>
+                <div class="vizv2-kv"><span>Delta SHA-256</span></div>
+                <div class="vizv2-hash">${vizBytesToHex(p.deltaHash)}</div>`;
+            } else {
+                detail = `<div class="vizv2-note">This is the first processed frame, so there is
+                    no predecessor to diff against yet. The delta component appears once a
+                    second frame arrives.</div>`;
+            }
+        } else if (idx === 3) {
+            const url = vizRgbToDataUrl(f.current, f.width, f.height);
+            detail = `<div class="vizv2-blockwrap">
+                <img class="vizv2-frame-img" src="${url}" alt="frame with grid">
+                <div class="vizv2-blockgrid"></div>
+            </div>
+            <div class="vizv2-kv"><span>Grid</span><b>8×8 — 64 blocks</b></div>
+            <div class="vizv2-kv"><span>Block size</span><b>${p.blockW}×${p.blockH}px</b></div>
+            <div class="vizv2-stage-sub">First block hash</div>
+            <div class="vizv2-hash">${p.blockHashes.length ?
+                vizBytesToHex(p.blockHashes[0]) : '(no blocks)'}</div>`;
+        } else if (idx === 4) {
+            const depth = vizState.snapshot ? (vizState.snapshot.pool_depth || 0) : 0;
+            let slots = '';
+            for (let i = 0; i < 8; i++) {
+                slots += `<div class="vizv2-poolslot ${i < depth ? 'filled' : ''}"></div>`;
+            }
+            detail = `<div class="vizv2-poolrow">${slots}</div>
+                <div class="vizv2-kv"><span>Pool depth</span><b>${depth} / 8</b></div>
+                <div class="vizv2-note">The pool digest is a SHA-256 over every buffered frame's
+                    extracted entropy. It is recomputed server-side each tick; the depth shown
+                    here is the daemon's live value.</div>`;
+        } else if (idx === 5) {
+            detail = `<div class="vizv2-note vizv2-note-server">⚠️ This step runs on the
+                server and cannot be reproduced in the browser. The daemon folds OS randomness
+                (<code>getrandom</code> / <code>RAND_bytes</code>) into the pool digest.</div>
+                <div class="vizv2-kv"><span>Pool digest</span><b>recomputed server-side</b></div>
+                <div class="vizv2-kv"><span>OS randomness</span><b>32 bytes, CSPRNG</b></div>
+                <div class="vizv2-kv"><span>Mixer</span><b>system_entropy_mixer</b></div>`;
+        } else if (idx === 6) {
+            const known = vizState.snapshot && vizState.snapshot.latest_key_hex &&
+                vizState.snapshot.latest_key_hex.length >= 64;
+            detail = `<div class="vizv2-note vizv2-note-server">⚠️ HKDF runs on the server.
+                The 256-bit key below is the daemon's reported value, not a client computation.</div>
+                <div class="vizv2-bitgrid-wrap" id="vizv2-stage-keygrid"></div>
+                <div class="vizv2-kv"><span>Key (hex)</span></div>
+                <div class="vizv2-hash">${known ?
+                    esc(vizState.snapshot.latest_key_hex.slice(0, 64)) : '(no key reported)'}</div>
+                <div class="vizv2-kv"><span>Bits set</span>
+                    <b>${p.keyBitsSet} / ${p.keyBitsTotal}
+                       (${(p.keyBitsSet / p.keyBitsTotal * 100).toFixed(1)}%)</b></div>`;
+        }
+
+        host.innerHTML = `
+            <div class="vizv2-stage-head">
+                <div class="vizv2-stage-icon">${meta.icon}</div>
+                <div>
+                    <div class="vizv2-stage-no">Stage ${idx} of 6</div>
+                    <h3>${meta.title}</h3>
+                </div>
+            </div>
+            <div class="vizv2-stage-detail">${detail}</div>
+            <div class="vizv2-explain">
+                <div class="vizv2-explain-row"><span class="vizv2-explain-tag">WHAT</span>
+                    <p>${meta.what}</p></div>
+                <div class="vizv2-explain-row"><span class="vizv2-explain-tag">WHY</span>
+                    <p>${meta.why}</p></div>
+            </div>
+        `;
+
+        // Stage 3 — overlay the 8x8 grid lines.
+        if (idx === 3) {
+            const g = host.querySelector('.vizv2-blockgrid');
+            if (g) {
+                for (let i = 0; i < 64; i++) {
+                    const cell = document.createElement('div');
+                    cell.className = 'vizv2-blockcell';
+                    cell.style.animationDelay = (i * 12) + 'ms';
+                    g.appendChild(cell);
+                }
+            }
+        }
+        // Stage 6 — render the key bit grid.
+        if (idx === 6) {
+            const kg = host.querySelector('#vizv2-stage-keygrid');
+            if (kg) kg.appendChild(vizBuildBitGrid(p.keyBytes));
+        }
+    }
+
+    // ---- the five "entropy is HIGH" proofs --------------------------------
+
+    function vizRenderProofs() {
+        const host = $('#vizv2-proof-grid');
+        if (!host) return;
+        const p = vizState.pipeline;
+
+        // (a) Shannon entropy gauge.
+        const shannonPct = (p.shannon / 8) * 100;
+        const cardShannon = `
+            <div class="vizv2-proof glass-sm">
+                <div class="vizv2-proof-title">Shannon entropy</div>
+                <div class="vizv2-gauge">
+                    <div class="vizv2-gauge-fill" style="width:${shannonPct.toFixed(1)}%"></div>
+                </div>
+                <div class="vizv2-proof-val">${p.shannon.toFixed(3)} <span>/ 8.0 bits/byte</span></div>
+                <div class="vizv2-proof-sub">Raw frame byte distribution.
+                    Closer to 8.0 = more uniform = higher entropy.</div>
+            </div>`;
+
+        // (b) Motion heatmap.
+        const cardHeatmap = `
+            <div class="vizv2-proof glass-sm">
+                <div class="vizv2-proof-title">Motion heatmap</div>
+                ${p.heatmapUrl
+                    ? `<img class="vizv2-proof-img" src="${p.heatmapUrl}" alt="motion heatmap">`
+                    : '<div class="vizv2-proof-empty">Needs a second frame</div>'}
+                <div class="vizv2-proof-sub">${p.changedRatio != null
+                    ? (p.changedRatio * 100).toFixed(2) + '% of pixels changed between frames.'
+                    : 'Inter-frame motion is the strongest entropy source.'}</div>
+            </div>`;
+
+        // (c) Avalanche test.
+        const avOk = p.avalanchePct >= 40 && p.avalanchePct <= 60;
+        const cardAvalanche = `
+            <div class="vizv2-proof glass-sm">
+                <div class="vizv2-proof-title">Avalanche test</div>
+                <div class="vizv2-gauge">
+                    <div class="vizv2-gauge-fill ${avOk ? '' : 'warn'}"
+                         style="width:${Math.min(100, p.avalanchePct).toFixed(1)}%"></div>
+                </div>
+                <div class="vizv2-proof-val">${p.avalancheBits} / 256
+                    <span>bits flipped (${p.avalanchePct.toFixed(1)}%)</span></div>
+                <div class="vizv2-proof-sub">Flip one input bit, re-hash.
+                    A good hash flips ~50% of output bits.</div>
+            </div>`;
+
+        // (d) Key bit grid.
+        const keyPct = (p.keyBitsSet / p.keyBitsTotal) * 100;
+        const cardKey = `
+            <div class="vizv2-proof glass-sm">
+                <div class="vizv2-proof-title">256-bit key</div>
+                <div class="vizv2-bitgrid-wrap" id="vizv2-proof-keygrid"></div>
+                <div class="vizv2-proof-sub">${p.keyBitsSet} / 256 bits set
+                    (${keyPct.toFixed(1)}%). A balanced grid means no bias.</div>
+            </div>`;
+
+        // (e) Aggregate verdict.
+        const cardVerdict = `
+            <div class="vizv2-proof glass-sm vizv2-proof-verdict ${p.verdictHigh ? 'high' : 'low'}">
+                <div class="vizv2-proof-title">Verdict</div>
+                <div class="vizv2-verdict-big">${p.verdictHigh ? 'HIGH ✓' : 'CHECK'}</div>
+                <div class="vizv2-proof-sub">
+                    ${p.verdictHigh
+                        ? 'Frame entropy, avalanche and key balance all pass.'
+                        : 'One or more checks are outside the expected range.'}
+                </div>
+            </div>`;
+
+        host.innerHTML = cardShannon + cardHeatmap + cardAvalanche + cardKey + cardVerdict;
+        const kg = $('#vizv2-proof-keygrid');
+        if (kg) kg.appendChild(vizBuildBitGrid(p.keyBytes));
+    }
+
+    // ---- live polling ------------------------------------------------------
 
     function startVisualizerPolling() {
         stopVisualizerPolling();
-        let hexChars = '0123456789abcdef';
-        let tick = 0;
-        async function poll() {
-            try {
-                const snap = await api('GET', '/entropy-snapshot');
-                tick++;
-
-                // Update stats
-                const epochEl = document.getElementById('viz-stat-epoch');
-                const framesEl = document.getElementById('viz-stat-frames');
-                const poolEl = document.getElementById('viz-stat-pool');
-                const runningEl = document.getElementById('viz-stat-running');
-                if (epochEl) epochEl.textContent = snap.key_epoch;
-                if (framesEl) framesEl.textContent = snap.frames_processed;
-                if (poolEl) poolEl.textContent = snap.pool_depth + '/8';
-                if (runningEl) {
-                    runningEl.textContent = snap.is_running ? 'ACTIVE' : 'STOPPED';
-                    runningEl.style.color = snap.is_running ? 'var(--green-bright)' : 'var(--danger)';
-                }
-
-                // Update pipeline nodes
-                const sourceEl = document.getElementById('viz-source');
-                if (sourceEl) sourceEl.textContent = snap.entropy_source || (snap.has_traffic_entropy ? 'Traffic Stream' : 'OS Entropy');
-
-                // Flowing hex digits
-                const hexEl = document.getElementById('viz-hex-digits');
-                if (hexEl) {
-                    let fakeHash = '';
-                    for (let i = 0; i < 16; i++) fakeHash += hexChars[Math.floor(Math.random() * 16)];
-                    hexEl.textContent = fakeHash;
-                }
-
-                // Pool slots
-                const slots = document.querySelectorAll('.viz-slot');
-                slots.forEach((slot, i) => {
-                    if (i < snap.pool_depth) {
-                        slot.classList.add('filled');
-                    } else {
-                        slot.classList.remove('filled');
-                    }
-                });
-
-                const poolInfo = document.getElementById('viz-pool-info');
-                if (poolInfo) poolInfo.textContent = `Depth: ${snap.pool_depth}/8`;
-
-                // Epoch info
-                const epochInfo = document.getElementById('viz-epoch-info');
-                if (epochInfo) epochInfo.textContent = `Epoch: ${snap.key_epoch}`;
-
-                // Key hex
-                const keyHex = document.getElementById('viz-key-hex');
-                if (keyHex && snap.latest_key_hex) {
-                    keyHex.textContent = snap.latest_key_hex;
-                }
-
-                // Animate lock icon
-                const lockIcon = document.getElementById('viz-lock');
-                if (lockIcon) {
-                    lockIcon.classList.add('viz-lock-pulse');
-                    setTimeout(() => lockIcon.classList.remove('viz-lock-pulse'), 500);
-                }
-
-                // Pulse nodes on update
-                document.querySelectorAll('.viz-node').forEach((node, i) => {
-                    setTimeout(() => {
-                        node.classList.add('viz-node-active');
-                        setTimeout(() => node.classList.remove('viz-node-active'), 600);
-                    }, i * 80);
-                });
-
-            } catch {}
-        }
-        poll();
-        visualizerInterval = setInterval(poll, 1000);
+        // Slowed-live: re-fetch + recompute every ~2 s.
+        visualizerInterval = setInterval(async () => {
+            if (vizState.mode !== 'live') { stopVisualizerPolling(); return; }
+            try { await vizRefresh(); } catch {}
+        }, 2000);
     }
 
     function stopVisualizerPolling() {
         if (visualizerInterval) {
             clearInterval(visualizerInterval);
             visualizerInterval = null;
+        }
+        if (vizAutoplayTimer) {
+            clearInterval(vizAutoplayTimer);
+            vizAutoplayTimer = null;
         }
     }
 

@@ -94,6 +94,30 @@ void *rotation_daemon(void *arg) {
                        has_previous ? 32 : 0,
                        32, new_key);
 
+            /* Visualizer v2: retain the last two processed frames (current +
+             * previous) so GET /api/visualizer/frame can serve them. We copy
+             * the pixels because `frame.data` is about to be moved into
+             * `previous_frame_data` for the next tick's delta basis. */
+            uint8_t *viz_copy = (uint8_t *)malloc(frame.data_len);
+            if (viz_copy) {
+                memcpy(viz_copy, frame.data, frame.data_len);
+                pthread_mutex_lock(&state->lock);
+                free(state->viz_frame_previous);
+                state->viz_frame_previous     = state->viz_frame_current;
+                state->viz_frame_previous_len = state->viz_frame_current_len;
+                state->viz_frame_previous_w   = state->viz_frame_current_w;
+                state->viz_frame_previous_h   = state->viz_frame_current_h;
+                state->viz_frame_previous_seq = state->viz_frame_current_seq;
+                state->viz_frame_current      = viz_copy;
+                state->viz_frame_current_len  = frame.data_len;
+                state->viz_frame_current_w    = frame.width;
+                state->viz_frame_current_h    = frame.height;
+                /* Sequence = count of frames consumed (1-based). frames_processed
+                 * is bumped further below, so the next value is +1. */
+                state->viz_frame_current_seq  = state->frames_processed + 1;
+                pthread_mutex_unlock(&state->lock);
+            }
+
             /* Rotate previous_frame_data — current frame's pixels become the
              * delta basis for the next tick. */
             free(previous_frame_data);
@@ -157,6 +181,14 @@ void *rotation_daemon(void *arg) {
 
     pthread_mutex_lock(&state->lock);
     state->rotation_running = 0;
+    /* Release retained Visualizer frames so a daemon restart (re-unlock)
+     * starts from a clean slate instead of serving stale pixels. */
+    free(state->viz_frame_current);
+    free(state->viz_frame_previous);
+    state->viz_frame_current      = NULL;
+    state->viz_frame_previous     = NULL;
+    state->viz_frame_current_len  = 0;
+    state->viz_frame_previous_len = 0;
     pthread_mutex_unlock(&state->lock);
 
     entropy_pool_free(&pool);

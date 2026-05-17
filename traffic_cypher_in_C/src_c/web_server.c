@@ -1,6 +1,7 @@
 #include "web_server.h"
 #include "vault.h"
 #include "hex_utils.h"
+#include "base64_utils.h"
 #include "str_buf.h"
 #include "uuid_gen.h"
 #include "password_gen.h"
@@ -377,6 +378,21 @@ static int parse_request(int fd, http_request_t *req) {
     return 0;
 }
 
+/* write(2) on a socket may write fewer bytes than requested, especially for
+ * large bodies (the Visualizer v2 endpoint serves ~600 KB of base64 frame
+ * pixels). Loop until the whole buffer is sent or the connection breaks. */
+static void write_all(int fd, const char *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            break;  /* peer closed / fatal error — nothing more we can do */
+        }
+        off += (size_t)n;
+    }
+}
+
 static void send_response(int fd, http_response_t *resp) {
     char header[4096];
     int header_len = snprintf(header, sizeof(header),
@@ -390,9 +406,9 @@ static void send_response(int fd, http_response_t *resp) {
         "\r\n",
         resp->status, resp->status_text, resp->content_type, resp->body_len);
 
-    write(fd, header, (size_t)header_len);
+    write_all(fd, header, (size_t)header_len);
     if (resp->body && resp->body_len > 0) {
-        write(fd, resp->body, resp->body_len);
+        write_all(fd, resp->body, resp->body_len);
     }
 }
 
@@ -1163,6 +1179,96 @@ static void handle_entropy_snapshot(int fd, app_state_t *state) {
     send_json(fd, 200, "OK", buf);
 }
 
+/* Visualizer v2 endpoint. Serves the last two camera/stream frames the
+ * rotation daemon processed (current + previous) as base64 RGB bytes so the
+ * dashboard can recompute the entropy pipeline in-browser. Mirrors the Rust
+ * GET /api/visualizer/frame. has_frame:false until the first frame lands. */
+static void handle_visualizer_frame(int fd, app_state_t *state) {
+    pthread_mutex_lock(&state->lock);
+
+    /* Copy frame pointers/dims out under the lock, then release it before
+     * the (potentially large) base64 encode + serialization. The pixel
+     * buffers themselves are only freed by the rotation daemon, which holds
+     * the lock when it does so — so we duplicate them here to be safe
+     * against a concurrent daemon stop. */
+    size_t cur_len = state->viz_frame_current_len;
+    size_t prev_len = state->viz_frame_previous_len;
+    uint8_t *cur = NULL, *prev = NULL;
+    if (state->viz_frame_current && cur_len > 0) {
+        cur = (uint8_t *)malloc(cur_len);
+        if (cur) memcpy(cur, state->viz_frame_current, cur_len);
+    }
+    if (state->viz_frame_previous && prev_len > 0) {
+        prev = (uint8_t *)malloc(prev_len);
+        if (prev) memcpy(prev, state->viz_frame_previous, prev_len);
+    }
+    uint32_t w = state->viz_frame_current_w;
+    uint32_t h = state->viz_frame_current_h;
+    uint64_t seq = state->viz_frame_current_seq;
+    char entropy_source[16];
+    strncpy(entropy_source, state->entropy_source, sizeof(entropy_source) - 1);
+    entropy_source[sizeof(entropy_source) - 1] = '\0';
+    int has_frame = (cur != NULL);
+
+    pthread_mutex_unlock(&state->lock);
+
+    str_buf sb;
+    sb_init(&sb, has_frame ? cur_len * 2 + 512 : 256);
+
+    if (!has_frame) {
+        sb_appendf(&sb,
+            "{\"width\":0,\"height\":0,\"sequence\":0,"
+            "\"current\":null,\"previous\":null,\"has_frame\":false,"
+            "\"entropy_source\":\"%s\"}",
+            entropy_source);
+    } else {
+        sb_appendf(&sb,
+            "{\"width\":%u,\"height\":%u,\"sequence\":%llu,\"current\":\"",
+            w, h, (unsigned long long)seq);
+
+        /* base64_encode needs ((len+2)/3)*4 + 1 bytes of output room. */
+        size_t cur_b64_cap = ((cur_len + 2) / 3) * 4 + 1;
+        char *cur_b64 = (char *)malloc(cur_b64_cap);
+        if (cur_b64) {
+            base64_encode(cur, cur_len, cur_b64);
+            sb_append(&sb, cur_b64);
+            free(cur_b64);
+        }
+
+        sb_append(&sb, "\",\"previous\":");
+        if (prev) {
+            size_t prev_b64_cap = ((prev_len + 2) / 3) * 4 + 1;
+            char *prev_b64 = (char *)malloc(prev_b64_cap);
+            if (prev_b64) {
+                base64_encode(prev, prev_len, prev_b64);
+                sb_append(&sb, "\"");
+                sb_append(&sb, prev_b64);
+                sb_append(&sb, "\"");
+                free(prev_b64);
+            } else {
+                sb_append(&sb, "null");
+            }
+        } else {
+            sb_append(&sb, "null");
+        }
+
+        sb_appendf(&sb, ",\"has_frame\":true,\"entropy_source\":\"%s\"}",
+                   entropy_source);
+    }
+
+    free(cur);
+    free(prev);
+
+    char *buf = sb_release(&sb, NULL);
+    if (!buf) {
+        send_error(fd, 500, "Internal Server Error",
+                   "visualizer frame serialization failed");
+        return;
+    }
+    send_json(fd, 200, "OK", buf);
+    free(buf);
+}
+
 static void handle_get_settings(int fd, app_state_t *state) {
     pthread_mutex_lock(&state->lock);
 
@@ -1811,6 +1917,11 @@ static void handle_request(int fd, app_state_t *state, http_request_t *req) {
     }
     if (strcmp(req->path, "/api/entropy-snapshot") == 0 && strcmp(req->method, "GET") == 0) {
         handle_entropy_snapshot(fd, state);
+        return;
+    }
+    /* Visualizer v2 — last two processed camera/stream frames. */
+    if (strcmp(req->path, "/api/visualizer/frame") == 0 && strcmp(req->method, "GET") == 0) {
+        handle_visualizer_frame(fd, state);
         return;
     }
 
