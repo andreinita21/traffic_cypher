@@ -1246,13 +1246,19 @@
         if (!f || !p) { vizRenderNoFrame(); return; }
 
         const isLive = vizState.mode === 'live';
-        const src = f.entropy_source || (vizState.snapshot && vizState.snapshot.entropy_source) || 'os';
+        const snap = vizState.snapshot;
+        // Honest live signal: the rotation daemon's has_traffic_entropy flag
+        // (true while camera/stream frames flow, cleared after a few idle
+        // ticks). The static entropy_source string is set once at unlock and
+        // goes stale — it must not be trusted for the live source readout.
+        const hasTraffic = !!(snap && snap.has_traffic_entropy);
+        const src = hasTraffic ? 'Live camera / traffic feed' : 'OS entropy only';
 
         body.innerHTML = `
             <div class="vizv2-meta">
                 <span class="vizv2-pill">Frame #${f.sequence}</span>
                 <span class="vizv2-pill">${f.width}×${f.height}</span>
-                <span class="vizv2-pill">Source: ${esc(src)}</span>
+                <span class="vizv2-pill ${hasTraffic ? '' : 'vizv2-pill-warn'}">Source: ${esc(src)}</span>
                 ${f.previous ? '<span class="vizv2-pill">Pair: N &amp; N−1</span>'
                              : '<span class="vizv2-pill vizv2-pill-warn">First frame — no delta yet</span>'}
             </div>
