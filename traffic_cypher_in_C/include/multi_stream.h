@@ -46,6 +46,8 @@ typedef struct {
     stream_state_t status;
     uint64_t       frames_captured;
     slot_kind_t    kind;
+    int            enabled;          /* 1 = participates in pick_random_frame; 0 = inert */
+    uint64_t       last_frame_unix;  /* Unix seconds of the most recent frame; 0 if none */
 } stream_status_t;
 
 typedef struct multi_stream_manager multi_stream_manager_t;
@@ -115,8 +117,29 @@ int  msm_pick_random_frame(multi_stream_manager_t *msm, frame_t *out);
  */
 int  msm_get_statuses(multi_stream_manager_t *msm, stream_status_t *out, int max);
 
+/*
+ * Translate a compacted "active index" (the position in the list returned by
+ * msm_get_statuses) to a raw slot index suitable for msm_remove_stream /
+ * msm_set_enabled / msm_update_stream. Returns the raw slot index on success,
+ * or -1 if `active_index` is negative or there are fewer than active_index+1
+ * active slots. Necessary because msm_get_statuses skips inactive slots, so
+ * the position in the returned list does not match `msm->slots[]`.
+ */
+int  msm_active_index_to_slot(multi_stream_manager_t *msm, int active_index);
+
 /* Number of slots currently in use (CONNECTING/ACTIVE/FAILED/STOPPED). */
 int  msm_stream_count(multi_stream_manager_t *msm);
+
+/*
+ * Toggle whether the slot at `index` participates in the rotation daemon's
+ * frame picking. Disabled slots' captures keep running (ffmpeg keeps reading
+ * frames; phone POSTs keep being accepted) but the daemon skips frames
+ * coming from those slots when computing the next DEK. When every active
+ * slot is disabled the daemon naturally falls back to OS-only entropy.
+ *
+ * Returns 0 on success, -1 if `index` is out of range or the slot is empty.
+ */
+int  msm_set_enabled(multi_stream_manager_t *msm, int index, int enabled);
 
 /*
  * Phone-camera slot registration. Reserves an MSM slot of kind SLOT_PHONE

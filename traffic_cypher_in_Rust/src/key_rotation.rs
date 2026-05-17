@@ -93,6 +93,12 @@ pub async fn start_rotation_daemon(
     let mut previous_key: Option<Vec<u8>> = None;
     let mut epoch: u64 = 0;
     let mut frames_total: u64 = 0;
+    // Windowed traffic-entropy flag: once we go TRAFFIC_GRACE_TICKS ticks
+    // (1 s each) without picking a frame, clear the runtime flag so the
+    // dashboard's /api/entropy-snapshot honestly reflects "OS only now".
+    // Reset on the next picked frame.
+    let mut misses_in_a_row: u32 = 0;
+    const TRAFFIC_GRACE_TICKS: u32 = 3;
     let mut cancel = cancel;
 
     loop {
@@ -129,6 +135,7 @@ pub async fn start_rotation_daemon(
 
                     epoch += 1;
                     frames_total += 1;
+                    misses_in_a_row = 0;
 
                     // Store the latest mixed entropy for on-demand DEK generation
                     *rotation_state.latest_entropy.write().await = new_key.clone();
@@ -153,19 +160,28 @@ pub async fn start_rotation_daemon(
                     );
 
                     epoch += 1;
+                    misses_in_a_row = misses_in_a_row.saturating_add(1);
 
                     // Store OS entropy too (weaker but still useful)
                     *rotation_state.latest_entropy.write().await = new_key.clone();
                     *rotation_state.key_epoch.write().await = epoch;
                     *rotation_state.pool_depth.write().await = pool.len();
+                    if misses_in_a_row >= TRAFFIC_GRACE_TICKS {
+                        // Honest: no traffic frame in the grace window.
+                        *rotation_state.has_traffic_entropy.write().await = false;
+                    }
 
                     previous_key = Some(new_key);
 
                     debug!("Entropy epoch {} (no stream frame, OS entropy only)", epoch);
                 }
             }
-            _ = cancel.changed() => {
-                if *cancel.borrow() {
+            res = cancel.changed() => {
+                // Err means every sender was dropped — the owner went away
+                // without an explicit send(true). Treat that as a stop too,
+                // otherwise the daemon busy-spins (changed() then resolves
+                // Err immediately on every poll).
+                if res.is_err() || *cancel.borrow() {
                     info!("Entropy collection daemon stopping");
                     break;
                 }

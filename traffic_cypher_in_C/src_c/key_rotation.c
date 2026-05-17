@@ -6,6 +6,7 @@
 #include "multi_stream.h"
 #include "frame_sampler.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +49,13 @@ void *rotation_daemon(void *arg) {
     uint8_t *previous_frame_data = NULL;
     size_t   previous_frame_data_len = 0;
     uint64_t epoch = 0;
+
+    /* Consecutive ticks (1 s each) without a frame from any source. When
+     * the run reaches TRAFFIC_GRACE_TICKS the runtime flag clears, so
+     * /api/entropy-snapshot accurately reports the daemon has fallen back
+     * to OS entropy. Set back to true on the next frame. */
+    int      misses_in_a_row = 0;
+    const int TRAFFIC_GRACE_TICKS = 3;
 
     while (1) {
         sleep(1);
@@ -119,14 +127,28 @@ void *rotation_daemon(void *arg) {
             entropy_pool_push(&pool, pool_chain, 32);
         }
 
+        if (got_frame) {
+            misses_in_a_row = 0;
+        } else if (misses_in_a_row < INT_MAX) {
+            misses_in_a_row++;
+        }
+
         pthread_mutex_lock(&state->lock);
         memcpy(state->latest_entropy, new_key, 32);
         state->key_epoch = epoch;
         state->pool_depth = entropy_pool_len(&pool);
         if (got_frame) {
             state->frames_processed++;
-            /* Monotonic once set, matching Rust at key_rotation.rs:138. */
             state->has_traffic_entropy = 1;
+            strncpy(state->entropy_source, "traffic",
+                    sizeof(state->entropy_source) - 1);
+        } else if (misses_in_a_row >= TRAFFIC_GRACE_TICKS) {
+            /* Windowed: 3 consecutive misses means no live source is
+             * contributing. Clear the flag honestly — the dashboard polls
+             * /api/entropy-snapshot to surface the switch to the operator. */
+            state->has_traffic_entropy = 0;
+            strncpy(state->entropy_source, "os",
+                    sizeof(state->entropy_source) - 1);
         }
         pthread_mutex_unlock(&state->lock);
     }

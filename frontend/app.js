@@ -13,6 +13,11 @@
     let currentView = 'vault'; // vault | settings | help | visualizer
     let totpTimers = {};
     let statusInterval = null;
+    let streamsInterval = null;
+    // Last known runtime entropy-source flag from /api/status.rotation.
+    // Used by the status poller to toast on every honest transition so the
+    // operator notices the moment phone/YouTube frames stop flowing.
+    let lastHasTrafficEntropy = null;
     let dangerModeTimer = null;
     let visualizerInterval = null;
 
@@ -89,7 +94,24 @@
     // -----------------------------------------------------------------------
     // Unlock Screen
     // -----------------------------------------------------------------------
-    function renderUnlock(app) {
+    async function renderUnlock(app) {
+        // Probe whether a vault exists before deciding which form to render.
+        // If the probe fails we fall back to the unlock form (safer than
+        // showing a confirm field that would silently create a new vault).
+        let isFirstSetup = false;
+        try {
+            const status = await api('GET', '/auth/status');
+            isFirstSetup = status.vault_exists === false;
+        } catch {}
+
+        if (isFirstSetup) {
+            renderFirstSetup(app);
+        } else {
+            renderUnlockForm(app);
+        }
+    }
+
+    function renderUnlockForm(app) {
         app.innerHTML = `
             <div class="unlock-screen">
                 <div class="unlock-card glass">
@@ -123,6 +145,61 @@
                 $('#unlock-error').textContent = err.message;
                 btn.disabled = false;
                 btn.textContent = 'Unlock';
+            }
+        });
+    }
+
+    function renderFirstSetup(app) {
+        app.innerHTML = `
+            <div class="unlock-screen">
+                <div class="unlock-card glass">
+                    <span class="logo-icon">\u{1F512}</span>
+                    <h1>Traffic Cypher</h1>
+                    <p class="subtitle">Set up your master password</p>
+                    <p style="font-size:13px;color:var(--text-muted);margin:8px 0 16px;line-height:1.5">
+                        No vault found. Choose a strong master password — it cannot be recovered if forgotten.
+                    </p>
+                    <form id="setup-form">
+                        <input type="password" id="setup-pw" placeholder="New master password" autocomplete="new-password" autofocus>
+                        <div style="height:10px"></div>
+                        <input type="password" id="setup-pw-confirm" placeholder="Confirm master password" autocomplete="new-password">
+                        <div style="height:16px"></div>
+                        <button type="submit" class="btn btn-primary btn-full" id="setup-btn">Create vault</button>
+                        <p id="setup-error" style="color:var(--danger);font-size:13px;margin-top:12px;display:none"></p>
+                    </form>
+                </div>
+            </div>
+        `;
+        $('#setup-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = $('#setup-btn');
+            const err = $('#setup-error');
+            const pw = $('#setup-pw').value;
+            const confirm = $('#setup-pw-confirm').value;
+            err.style.display = 'none';
+            if (!pw) {
+                err.style.display = 'block';
+                err.textContent = 'Password is required';
+                return;
+            }
+            if (pw !== confirm) {
+                err.style.display = 'block';
+                err.textContent = 'Passwords do not match';
+                return;
+            }
+            btn.disabled = true;
+            btn.textContent = 'Creating vault...';
+            try {
+                const data = await api('POST', '/auth/unlock', { master_password: pw });
+                sessionToken = data.token;
+                await loadCredentials();
+                renderApp();
+                startStatusPolling();
+            } catch (e2) {
+                err.style.display = 'block';
+                err.textContent = e2.message;
+                btn.disabled = false;
+                btn.textContent = 'Create vault';
             }
         });
     }
@@ -179,9 +256,10 @@
         // Render current view
         const content = $('#main-content');
         stopVisualizerPolling();
+        stopStreamsPolling();
         if (currentView === 'vault') renderVault(content);
         else if (currentView === 'visualizer') renderVisualizer(content);
-        else if (currentView === 'settings') renderSettings(content);
+        else if (currentView === 'settings') { renderSettings(content); startStreamsPolling(); }
         else if (currentView === 'help') renderHelp(content);
     }
 
@@ -1088,15 +1166,40 @@
                 'phone':  '\u{1F4F1} phone',
                 'ffmpeg': '\u{1F4FA} stream',
             };
+            // Count enabled traffic sources so the OS-entropy footer can
+            // report whether the daemon is actually falling back. Disabled
+            // slots are counted but inert; if every slot is disabled the
+            // pick_random_frame call returns no frame and the rotation
+            // daemon takes its OS-only fallback path automatically.
+            const enabledCount = streams.filter(s => s.enabled !== false).length;
+
             listEl.innerHTML = streams.map((s, i) => {
-                const statusClass = STATUS_CLASS[s.status] || 'unknown';
-                const statusLabel = STATUS_CLASS[s.status] ? s.status : 'Unknown';
+                let statusClass = STATUS_CLASS[s.status] || 'unknown';
+                let statusLabel = STATUS_CLASS[s.status] ? s.status : 'Unknown';
                 const kindBadge   = KIND_BADGE[s.kind] || '';
                 const frames = (typeof s.frames_captured === 'number' && s.frames_captured > 0)
                     ? s.frames_captured + ' frames'
                     : '\u2014';
+                // enabled defaults to true if the server hasn't sent the
+                // field yet (forward-compat with older builds).
+                const enabled = s.enabled !== false;
+                // Liveness: if the server says the slot was Active but no
+                // frame arrived in the last few seconds, surface "Idle"
+                // so the operator sees that the source went stale even
+                // though it's still registered.
+                if (s.status === 'Active' && s.live === false) {
+                    statusClass = 'stopped';
+                    const idle = (typeof s.seconds_idle === 'number') ? ' (' + s.seconds_idle + 's)' : '';
+                    statusLabel = 'Idle' + idle;
+                }
+                const toggleAction = enabled ? 'disable' : 'enable';
+                const toggleTitle  = enabled
+                    ? 'Disable \u2014 daemon will skip this source'
+                    : 'Enable \u2014 daemon will include this source again';
+                const toggleIcon   = enabled ? '\u23F8' /* \u23F8 */ : '\u25B6' /* \u25B6 */;
+                const rowStyle = enabled ? '' : 'opacity:0.55';
                 return `
-                <div class="stream-item">
+                <div class="stream-item" style="${rowStyle}">
                     <span class="status-dot ${statusClass}"></span>
                     <div class="stream-info">
                         <div class="stream-label">${esc(s.label)}</div>
@@ -1105,11 +1208,45 @@
                     <span class="stream-kind" style="font-size:11px;color:var(--text-muted)">${esc(kindBadge)}</span>
                     <span class="stream-status" style="font-size:12px;color:var(--text-muted)">${esc(statusLabel)}</span>
                     <span class="stream-frames" style="font-size:12px;color:var(--text-muted)">${esc(frames)}</span>
+                    <button class="btn btn-secondary btn-icon" data-toggle="${i}" data-action="${toggleAction}" title="${esc(toggleTitle)}">${toggleIcon}</button>
                     <button class="btn btn-secondary btn-icon" data-edit="${i}" title="Edit">\u270F\uFE0F</button>
                     <button class="btn btn-danger btn-icon" data-remove="${i}" title="Remove">\u2715</button>
                 </div>
             `;
             }).join('');
+
+            // Footer row: OS entropy is always available as the fallback.
+            // Shows as "Active fallback" when no traffic source is enabled,
+            // "Standby" otherwise.
+            const osActive = enabledCount === 0 || streams.length === 0;
+            const osDot = osActive ? 'active' : 'stopped';
+            const osLabel = osActive ? 'Active fallback' : 'Standby';
+            listEl.insertAdjacentHTML('beforeend', `
+                <div class="stream-item" style="opacity:0.85;background:rgba(255,255,255,0.02)">
+                    <span class="status-dot ${osDot}"></span>
+                    <div class="stream-info">
+                        <div class="stream-label">OS entropy</div>
+                        <div class="stream-url">RAND_bytes \u2014 always available; used when no traffic source is enabled or producing frames.</div>
+                    </div>
+                    <span class="stream-kind" style="font-size:11px;color:var(--text-muted)">\u{1F4BE} os</span>
+                    <span class="stream-status" style="font-size:12px;color:var(--text-muted)">${esc(osLabel)}</span>
+                    <span class="stream-frames" style="font-size:12px;color:var(--text-muted)">\u2014</span>
+                </div>
+            `);
+
+            listEl.querySelectorAll('[data-toggle]').forEach(btn => {
+                btn.addEventListener('click', async () => {
+                    const idx = btn.dataset.toggle;
+                    const action = btn.dataset.action;
+                    try {
+                        await api('POST', `/streams/${idx}/${action}`);
+                        showToast(`Stream ${action}d`);
+                        loadStreams();
+                    } catch (e) {
+                        showToast(e.message, 'error');
+                    }
+                });
+            });
 
             listEl.querySelectorAll('[data-remove]').forEach(btn => {
                 btn.addEventListener('click', async () => {
@@ -1325,7 +1462,7 @@
                         <li><strong>Clipboard auto-clear</strong> &mdash; copied passwords are cleared from clipboard after 30 seconds</li>
                         <li><strong>Password history</strong> &mdash; when you change a password, the previous one is saved (up to 10)</li>
                         <li><strong>Local-only</strong> &mdash; your vault never leaves your machine. No cloud, no sync, no telemetry</li>
-                        <li><strong>Localhost only</strong> &mdash; the web UI only binds to 127.0.0.1 and is not accessible from other machines</li>
+                        <li><strong>Network binding</strong> &mdash; the web UI binds to 127.0.0.1 (localhost only) by default; operators can expose it on a LAN or tunnel by setting the <code>TC_BIND_ADDR</code> environment variable</li>
                     </ul>
                 </div>
 
@@ -1343,7 +1480,7 @@
                     <ul>
                         <li><strong>Vault file</strong> &mdash; stored at <code>~/.traffic_cypher_vault.json</code></li>
                         <li><strong>Stream config</strong> &mdash; stored at <code>~/.traffic_cypher_streams.json</code></li>
-                        <li><strong>Web UI</strong> &mdash; accessible at <code>http://127.0.0.1:9876</code></li>
+                        <li><strong>Web UI</strong> &mdash; bind address and port are set by <code>TC_BIND_ADDR</code> / <code>TC_PORT</code> (default <code>http://127.0.0.1:9876</code>)</li>
                         <li><strong>Requirements</strong> &mdash; <code>ffmpeg</code> and <code>yt-dlp</code> must be installed for livestream entropy</li>
                     </ul>
                 </div>
@@ -1387,14 +1524,53 @@
                 if (rotInfo) rotInfo.textContent = `Epoch: ${status.rotation.key_epoch}`;
                 if (streamInfo) streamInfo.textContent = `Streams: ${status.stream_count} active`;
                 if (entryCount) entryCount.textContent = `${status.entry_count} entries`;
+
+                // Watch the runtime traffic-entropy flag — the backend
+                // resets it to false after ~3 s without a frame, so a
+                // flip here means a real source change. Toast either
+                // direction so the operator sees the daemon honestly
+                // fall back to OS entropy and recover when frames flow
+                // again.
+                const cur = status.rotation && status.rotation.has_traffic_entropy;
+                if (typeof cur === 'boolean') {
+                    if (lastHasTrafficEntropy === null) {
+                        // first sample — just record, no toast on first paint
+                    } else if (cur !== lastHasTrafficEntropy) {
+                        if (cur) {
+                            showToast('Traffic entropy active — using stream frames', 'success');
+                        } else {
+                            showToast('No live traffic source — switched to OS entropy', 'warn');
+                        }
+                    }
+                    lastHasTrafficEntropy = cur;
+                }
             } catch {}
-        }, 3000);
+        }, 1500);
     }
 
     function stopStatusPolling() {
         if (statusInterval) {
             clearInterval(statusInterval);
             statusInterval = null;
+        }
+        lastHasTrafficEntropy = null;
+    }
+
+    // The settings view's stream list needs faster updates than the
+    // generic status bar so disabled/idle/active transitions are visible
+    // within a second of the change.
+    function startStreamsPolling() {
+        stopStreamsPolling();
+        streamsInterval = setInterval(() => {
+            if (currentView !== 'settings') return;
+            if (!document.getElementById('stream-list')) return;
+            loadStreams();
+        }, 1500);
+    }
+    function stopStreamsPolling() {
+        if (streamsInterval) {
+            clearInterval(streamsInterval);
+            streamsInterval = null;
         }
     }
 

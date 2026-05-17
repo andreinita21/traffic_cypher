@@ -16,27 +16,34 @@
   body {
     display: flex; flex-direction: column;
     align-items: center; justify-content: flex-start;
-    padding: 24px 16px;
+    padding: 20px 14px 32px;
   }
   h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
-  .sub { font-size: 13px; color: #9a9a9a; margin: 0 0 24px; }
+  .sub { font-size: 13px; color: #9a9a9a; margin: 0 0 20px; text-align: center; max-width: 360px; }
 
   .panel {
     width: 100%; max-width: 420px;
     background: #161616; border: 1px solid #2a2a2a;
-    border-radius: 12px; padding: 20px;
-    margin-bottom: 16px;
+    border-radius: 12px; padding: 16px;
+    margin-bottom: 14px;
   }
   label { display: block; font-size: 12px; color: #9a9a9a; margin-bottom: 6px; }
-  input[type="text"] {
+  input[type="text"], select {
     width: 100%; background: #0a0a0a; color: #e7e7e7;
     border: 1px solid #333; border-radius: 8px;
     padding: 10px 12px; font-size: 16px;
     -webkit-appearance: none; appearance: none;
   }
-  input[type="text"]:focus { outline: 1px solid #4a90e2; border-color: #4a90e2; }
+  input[type="text"]:focus, select:focus { outline: 1px solid #4a90e2; border-color: #4a90e2; }
+  select { background-image: linear-gradient(45deg, transparent 50%, #888 50%), linear-gradient(135deg, #888 50%, transparent 50%);
+    background-position: calc(100% - 18px) center, calc(100% - 12px) center;
+    background-size: 6px 6px, 6px 6px;
+    background-repeat: no-repeat;
+    padding-right: 36px;
+  }
+
   button {
-    width: 100%; margin-top: 14px;
+    width: 100%; margin-top: 12px;
     background: #4a90e2; color: white; border: none;
     border-radius: 8px; padding: 12px 16px;
     font-size: 15px; font-weight: 600;
@@ -44,81 +51,267 @@
   }
   button:disabled { background: #2a2a2a; color: #555; cursor: not-allowed; }
   button.secondary { background: #2a2a2a; color: #c0c0c0; }
+  button.danger { background: #e07a5f; color: white; }
 
-  video, canvas { width: 100%; max-width: 320px; border-radius: 8px; background: #000; }
+  /* Preview is always rendered. Object-fit:cover keeps a clean
+   * landscape framing even when the device is portrait. */
+  .preview-wrap {
+    position: relative;
+    width: 100%; aspect-ratio: 4 / 3;
+    background: #000;
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 12px;
+  }
+  video, canvas {
+    width: 100%; height: 100%;
+    object-fit: cover;
+  }
   canvas { display: none; }
+  .preview-overlay {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: #888; font-size: 13px; padding: 12px; text-align: center;
+    pointer-events: none;
+  }
+  .preview-overlay.hidden { display: none; }
+  .preview-flash {
+    position: absolute; top: 8px; right: 8px;
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #5fa86b; opacity: 0;
+    transition: opacity 0.12s;
+  }
+  .preview-flash.on { opacity: 1; }
 
-  .row { display: flex; justify-content: space-between; font-size: 13px; padding: 6px 0; }
+  .row { display: flex; justify-content: space-between; font-size: 13px; padding: 5px 0; }
   .row .k { color: #888; }
   .row .v { color: #e7e7e7; font-variant-numeric: tabular-nums; }
-  .err { color: #e07a5f; font-size: 13px; margin-top: 8px; min-height: 1em; }
-  .ok  { color: #5fa86b; }
 
+  .err { color: #e07a5f; font-size: 13px; margin-top: 8px; min-height: 1em; }
+  .warn-block {
+    background: rgba(224, 122, 95, 0.08);
+    border: 1px solid rgba(224, 122, 95, 0.3);
+    color: #f0a48d;
+    border-radius: 10px;
+    padding: 14px;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .warn-block code {
+    background: rgba(255,255,255,0.05);
+    border-radius: 4px; padding: 1px 5px;
+    font-family: ui-monospace, monospace; font-size: 12px;
+    color: #e7e7e7;
+  }
   .hidden { display: none !important; }
 </style>
 </head>
 <body>
 <h1>Traffic Cypher · Phone Camera</h1>
-<p class="sub">Stream this phone's camera to your local Traffic Cypher daemon as an entropy source.</p>
+<p class="sub">Stream this device's camera to the Traffic Cypher daemon as an entropy source.</p>
 
-<div id="setup" class="panel">
-  <label for="cam-name">Camera name</label>
-  <input id="cam-name" type="text" placeholder="e.g. kitchen-phone" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false">
-  <button id="start-btn">Start streaming</button>
-  <div id="setup-err" class="err"></div>
+<!-- Secure-context fallback. Shown when navigator.mediaDevices is undefined,
+     which happens when this page is served over plain HTTP from a non-
+     localhost origin. The browser refuses to expose camera APIs in that
+     case; we can't work around it from JS. -->
+<div id="insecure-panel" class="panel hidden">
+  <div class="warn-block">
+    <strong>Camera unavailable.</strong>
+    The browser has hidden the camera API on this page because it isn't on
+    <code>localhost</code> or an HTTPS origin. Pick one:
+    <ul style="margin: 8px 0 0 18px; padding: 0;">
+      <li>Open this page on the laptop running the daemon at
+        <code>http://127.0.0.1:9876/phone.html</code>.</li>
+      <li>Or in Chrome on this device: open <code>chrome://flags</code>,
+        find <em>Insecure origins treated as secure</em>, add
+        <code id="origin-hint"></code> to the list, switch to Enabled,
+        relaunch Chrome, then revisit this page.</li>
+      <li>Or put TLS in front of the daemon (e.g. <code>mkcert</code> +
+        a reverse proxy) and load this page over HTTPS.</li>
+    </ul>
+  </div>
 </div>
 
-<div id="live" class="panel hidden">
-  <video id="preview" autoplay playsinline muted></video>
-  <canvas id="capture" width="320" height="240"></canvas>
-  <div class="row"><span class="k">Name</span><span class="v" id="live-name">—</span></div>
-  <div class="row"><span class="k">Slot</span><span class="v" id="live-slot">—</span></div>
-  <div class="row"><span class="k">Frames sent</span><span class="v" id="live-frames">0</span></div>
-  <div class="row"><span class="k">Last result</span><span class="v" id="live-status">—</span></div>
-  <button id="stop-btn" class="secondary" style="margin-top:14px;">Stop streaming</button>
+<!-- Setup panel: live preview + name input + camera selector. Visible
+     once we know the browser can grant camera access. The preview is
+     populated as soon as the user picks a camera (or as soon as the
+     page loads if a default is available). -->
+<div id="setup-panel" class="panel hidden">
+  <div class="preview-wrap">
+    <video id="preview" autoplay playsinline muted></video>
+    <canvas id="capture" width="320" height="240"></canvas>
+    <div id="preview-msg" class="preview-overlay">Waiting for camera permission…</div>
+    <div id="flash" class="preview-flash" title="frame sent"></div>
+  </div>
+
+  <label for="cam-select">Camera</label>
+  <select id="cam-select"><option value="">Default camera</option></select>
+
+  <label for="cam-name" style="margin-top:10px">Stream name</label>
+  <input id="cam-name" type="text" placeholder="e.g. kitchen-phone"
+         autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false">
+
+  <button id="start-btn">Start streaming</button>
+  <button id="stop-btn" class="danger hidden">Stop streaming</button>
+  <div id="setup-err" class="err"></div>
+
+  <div id="live-stats" class="hidden" style="margin-top:14px;padding-top:12px;border-top:1px solid #2a2a2a">
+    <div class="row"><span class="k">Slot</span><span class="v" id="live-slot">—</span></div>
+    <div class="row"><span class="k">Frames sent</span><span class="v" id="live-frames">0</span></div>
+    <div class="row"><span class="k">Last result</span><span class="v" id="live-status">—</span></div>
+  </div>
 </div>
 
 <script>
 'use strict';
 (function () {
-  var setupEl  = document.getElementById('setup');
-  var liveEl   = document.getElementById('live');
-  var nameEl   = document.getElementById('cam-name');
-  var startBtn = document.getElementById('start-btn');
-  var stopBtn  = document.getElementById('stop-btn');
-  var errEl    = document.getElementById('setup-err');
-  var videoEl  = document.getElementById('preview');
-  var canvasEl = document.getElementById('capture');
-  var liveName = document.getElementById('live-name');
-  var liveSlot = document.getElementById('live-slot');
-  var liveFr   = document.getElementById('live-frames');
-  var liveSt   = document.getElementById('live-status');
+  var insecurePanel = document.getElementById('insecure-panel');
+  var setupPanel    = document.getElementById('setup-panel');
+  var originHint    = document.getElementById('origin-hint');
+  var camSelect     = document.getElementById('cam-select');
+  var nameEl        = document.getElementById('cam-name');
+  var startBtn      = document.getElementById('start-btn');
+  var stopBtn       = document.getElementById('stop-btn');
+  var errEl         = document.getElementById('setup-err');
+  var videoEl       = document.getElementById('preview');
+  var canvasEl      = document.getElementById('capture');
+  var previewMsg    = document.getElementById('preview-msg');
+  var flashEl       = document.getElementById('flash');
+  var liveStats     = document.getElementById('live-stats');
+  var liveSlot      = document.getElementById('live-slot');
+  var liveFr        = document.getElementById('live-frames');
+  var liveSt        = document.getElementById('live-status');
+
+  // Secure-context check. navigator.mediaDevices is undefined when the
+  // page is served over plain HTTP from a non-localhost origin. This is
+  // a browser policy we can't work around from JS — show a helpful panel
+  // so the user can fix it themselves.
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    originHint.textContent = window.location.origin;
+    insecurePanel.classList.remove('hidden');
+    return;
+  }
+
+  // Browser can expose the camera. Light up the setup panel.
+  setupPanel.classList.remove('hidden');
 
   var state = {
     label: '',
     slot: null,
     token: null,
-    stream: null,
+    stream: null,        // active MediaStream from getUserMedia
+    selectedId: '',      // chosen deviceId (or '' for default)
     timerId: null,
     framesSent: 0,
+    streaming: false,
   };
 
-  function setErr(msg)  { errEl.textContent = msg; errEl.classList.remove('ok'); }
+  function setErr(msg)  { errEl.textContent = msg; }
   function clearErr()   { errEl.textContent = ''; }
+  function setPreviewMsg(text) {
+    if (text) { previewMsg.textContent = text; previewMsg.classList.remove('hidden'); }
+    else { previewMsg.classList.add('hidden'); }
+  }
+
+  // Stop and free any active MediaStream. Called between camera switches
+  // and when the user clicks Stop.
+  function stopStream() {
+    if (state.stream) {
+      state.stream.getTracks().forEach(function (t) { t.stop(); });
+      state.stream = null;
+    }
+    videoEl.srcObject = null;
+  }
+
+  // Open the camera with the currently-selected deviceId. Always re-
+  // initialises so a camera switch produces a fresh stream.
+  async function openCamera(deviceId) {
+    stopStream();
+    setPreviewMsg('Opening camera…');
+    var constraints = {
+      audio: false,
+      video: {
+        width:  { ideal: 320 },
+        height: { ideal: 240 },
+      },
+    };
+    if (deviceId) {
+      constraints.video.deviceId = { exact: deviceId };
+    } else {
+      // Prefer rear camera on phones if no explicit choice yet.
+      constraints.video.facingMode = 'environment';
+    }
+    try {
+      state.stream = await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (e) {
+      setErr('Camera access denied: ' + (e && e.message || e));
+      setPreviewMsg('Camera access denied');
+      return false;
+    }
+    videoEl.srcObject = state.stream;
+    setPreviewMsg('');
+    // After permission, labels become available. Refresh the device list.
+    await refreshCameraList();
+    return true;
+  }
+
+  // Populate the camera <select> with the available video inputs.
+  // Labels are blank before the first permission grant — getUserMedia
+  // unlocks them, so this is normally called twice (once at page load
+  // for the IDs, again after the first openCamera for the labels).
+  async function refreshCameraList() {
+    if (!navigator.mediaDevices.enumerateDevices) return;
+    var devices;
+    try {
+      devices = await navigator.mediaDevices.enumerateDevices();
+    } catch (e) {
+      return; // device enumeration is best-effort
+    }
+    var cams = devices.filter(function (d) { return d.kind === 'videoinput'; });
+    // Preserve the user's current selection if possible.
+    var prev = camSelect.value;
+    camSelect.innerHTML = '<option value="">Default camera</option>';
+    cams.forEach(function (cam, i) {
+      var opt = document.createElement('option');
+      opt.value = cam.deviceId;
+      opt.textContent = cam.label || ('Camera ' + (i + 1));
+      camSelect.appendChild(opt);
+    });
+    if (prev && cams.some(function (c) { return c.deviceId === prev; })) {
+      camSelect.value = prev;
+    }
+  }
+
+  // Camera switching while preview is live or while streaming.
+  camSelect.addEventListener('change', async function () {
+    state.selectedId = camSelect.value;
+    var ok = await openCamera(state.selectedId);
+    // If we were already streaming and the camera switch failed, stop
+    // the stream cleanly; the user can restart with a working camera.
+    if (!ok && state.streaming) await stop();
+  });
 
   startBtn.addEventListener('click', start);
   stopBtn.addEventListener('click', stop);
 
+  // Page load: try to open the default camera so the preview is alive
+  // immediately. The user can then change the camera or just hit Start.
+  (async function init() {
+    await refreshCameraList();           // first pass — IDs only
+    await openCamera('');                // default camera → preview alive
+    await refreshCameraList();           // second pass — now with labels
+  })();
+
   async function start() {
     var label = (nameEl.value || '').trim();
-    if (!label) { setErr('Camera name is required.'); return; }
-    if (label.length > 64) { setErr('Camera name must be ≤ 64 characters.'); return; }
+    if (!label) { setErr('Stream name is required.'); return; }
+    if (label.length > 64) { setErr('Stream name must be ≤ 64 characters.'); return; }
+    if (!state.stream) { setErr('Camera is not open. Pick a camera above.'); return; }
     clearErr();
     startBtn.disabled = true;
     startBtn.textContent = 'Starting…';
 
     try {
-      // 1. Register with the server. No Bearer auth required for /api/streams/phone.
       var resp = await fetch('/api/streams/phone', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -132,46 +325,60 @@
       state.label = label;
       state.slot = reg.index;
       state.token = reg.upload_token;
+      state.framesSent = 0;
+      state.streaming = true;
 
-      // 2. Open the camera. Will fail without HTTPS or localhost on most browsers.
-      state.stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 320 }, height: { ideal: 240 }, facingMode: 'environment' },
-        audio: false,
-      });
-      videoEl.srcObject = state.stream;
-
-      // 3. Swap setup → live panel, start 1-FPS capture loop.
-      setupEl.classList.add('hidden');
-      liveEl.classList.remove('hidden');
-      liveName.textContent = state.label;
       liveSlot.textContent = String(state.slot);
       liveFr.textContent = '0';
       liveSt.textContent = 'starting…';
+      liveStats.classList.remove('hidden');
+
+      startBtn.classList.add('hidden');
+      stopBtn.classList.remove('hidden');
+      camSelect.disabled = true;
+      nameEl.disabled = true;
 
       state.timerId = setInterval(captureAndSend, 1000);
     } catch (e) {
       setErr(String(e && e.message || e));
       startBtn.disabled = false;
       startBtn.textContent = 'Start streaming';
+      state.streaming = false;
     }
   }
 
-  function stop() {
+  async function stop() {
     if (state.timerId) clearInterval(state.timerId);
     state.timerId = null;
-    if (state.stream) state.stream.getTracks().forEach(function (t) { t.stop(); });
-    state.stream = null;
+
+    // Tell the server to release the slot. Best-effort — the rotation
+    // daemon naturally stops getting frames once we stop POSTing, but
+    // the slot would otherwise linger until the daemon's next cleanup.
+    if (state.slot !== null && state.token) {
+      try {
+        await fetch('/api/streams/phone/' + state.slot + '/release', {
+          method: 'POST',
+          headers: { 'X-Upload-Token': state.token },
+        });
+      } catch (_) { /* best effort */ }
+    }
+
     state.token = null;
-    state.slot = null;
-    state.framesSent = 0;
-    liveEl.classList.add('hidden');
-    setupEl.classList.remove('hidden');
+    state.slot  = null;
+    state.streaming = false;
+
+    liveStats.classList.add('hidden');
+    stopBtn.classList.add('hidden');
+    startBtn.classList.remove('hidden');
     startBtn.disabled = false;
     startBtn.textContent = 'Start streaming';
+    camSelect.disabled = false;
+    nameEl.disabled = false;
   }
 
-  /* Encode canvas RGBA → P6 PPM. 320*240*3 = 230400 bytes of pixels + a ~15-byte
-   * header. Drops the alpha channel; entropy pipeline doesn't need it. */
+  /* Encode the canvas's RGBA buffer to a P6 PPM blob. Drops alpha; the
+   * entropy pipeline doesn't need it. 320*240*3 = 230400 bytes + a ~15-
+   * byte header per frame. */
   function rgbaToPpm(imgData) {
     var w = imgData.width, h = imgData.height;
     var rgba = imgData.data;
@@ -208,6 +415,8 @@
         state.framesSent++;
         liveFr.textContent = String(state.framesSent);
         liveSt.textContent = 'OK';
+        flashEl.classList.add('on');
+        setTimeout(function () { flashEl.classList.remove('on'); }, 120);
       } else {
         liveSt.textContent = 'HTTP ' + r.status;
       }

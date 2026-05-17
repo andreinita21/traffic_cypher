@@ -24,6 +24,8 @@ desktop.ini
 *.exe
 traffic_cypher_in_C/traffic-cypher
 traffic_cypher_in_C/traffic-cypher-pm
+traffic_cypher_in_C/traffic-cypher-pm-debug
+traffic_cypher_in_C/traffic-cypher-pm-debug.dSYM/
 traffic_cypher_in_C/msm_test
 traffic_cypher_in_C/msm_test.dSYM/
 

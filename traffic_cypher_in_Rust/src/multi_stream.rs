@@ -15,6 +15,26 @@ pub struct StreamStatus {
     pub status: StreamState,
     pub frames_captured: u64,
     pub kind: SlotKind,
+    /// Operator-controlled gate. When false, `pick_random_frame` skips
+    /// frames from this slot so the rotation daemon treats it as inert.
+    /// The underlying capture or phone POST loop keeps running.
+    pub enabled: bool,
+    /// Unix-seconds of the most recent frame that arrived for this slot.
+    /// `None` if no frame has arrived yet. The web layer derives `live`
+    /// and `seconds_idle` fields from this against a 3-second window;
+    /// `last_frame_unix` itself is not serialised in the HTTP response
+    /// (matches the C build's /api/streams JSON shape).
+    #[serde(skip)]
+    pub last_frame_unix: Option<u64>,
+    /// Derived: whether a frame arrived within the staleness window.
+    /// Populated by the HTTP layer before serialisation; not stored.
+    #[serde(default)]
+    pub live: bool,
+    /// Derived: seconds since the most recent frame. Serialised as
+    /// `null` when no frame has arrived yet, matching the C build's
+    /// /api/streams JSON shape exactly.
+    #[serde(default)]
+    pub seconds_idle: Option<u64>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, PartialEq)]
@@ -96,6 +116,10 @@ struct StreamHandle {
     /// client presents (as 64-char lowercase hex) in `X-Upload-Token` on
     /// every frame POST. Wiped on remove. Not exposed via `get_statuses()`.
     upload_token: Option<[u8; 32]>,
+    /// Operator-controlled gate; see `StreamStatus::enabled`.
+    enabled: bool,
+    /// Unix-seconds of the most recent frame; see `StreamStatus::last_frame_unix`.
+    last_frame_unix: Option<u64>,
 }
 
 impl Default for MultiStreamManager {
@@ -137,6 +161,8 @@ impl MultiStreamManager {
             child: None,
             kind: SlotKind::Ffmpeg,
             upload_token: None,
+            enabled: true,
+            last_frame_unix: None,
         });
 
         // 1. Resolve the YouTube URL into a direct stream URL
@@ -265,7 +291,10 @@ impl MultiStreamManager {
         Ok(())
     }
 
-    /// Return the current status of every stream.
+    /// Return the current status of every stream. The HTTP layer is
+    /// expected to call `derive_liveness()` on each entry before
+    /// serialising so the dashboard sees `live` / `seconds_idle` flags
+    /// that match the C build's JSON shape.
     pub fn get_statuses(&self) -> Vec<StreamStatus> {
         self.streams
             .iter()
@@ -275,8 +304,28 @@ impl MultiStreamManager {
                 status: h.status.clone(),
                 frames_captured: h.frames_captured,
                 kind: h.kind.clone(),
+                enabled: h.enabled,
+                last_frame_unix: h.last_frame_unix,
+                live: false,
+                seconds_idle: None,
             })
             .collect()
+    }
+
+    /// Operator gate: include or exclude this slot's frames from
+    /// `pick_random_frame`. The underlying capture / phone POST loop
+    /// keeps running; only the rotation daemon's pick changes. Returns
+    /// `Err` if the index is out of range.
+    pub fn set_enabled(&mut self, index: usize, enabled: bool) -> Result<()> {
+        if index >= self.streams.len() {
+            bail!(
+                "Stream index {} out of range (have {})",
+                index,
+                self.streams.len()
+            );
+        }
+        self.streams[index].enabled = enabled;
+        Ok(())
     }
 
     /// Non-blocking attempt to pick a random frame from the available streams.
@@ -291,10 +340,25 @@ impl MultiStreamManager {
         // Drain all pending frames from the channel (non-blocking)
         let mut by_stream: HashMap<usize, Vec<Frame>> = HashMap::new();
 
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         while let Ok((stream_index, frame)) = self.frame_rx.try_recv() {
-            // Update frames_captured counter
-            if stream_index < self.streams.len() {
+            // Update frames_captured counter + liveness timestamp (count
+            // and timestamp arrive even from disabled slots — only the
+            // pick is gated).
+            let enabled = if stream_index < self.streams.len() {
                 self.streams[stream_index].frames_captured += 1;
+                self.streams[stream_index].last_frame_unix = Some(now_unix);
+                self.streams[stream_index].enabled
+            } else {
+                false
+            };
+            if !enabled {
+                // Operator-disabled source — drop the frame so the
+                // rotation daemon doesn't treat it as a candidate.
+                continue;
             }
             by_stream.entry(stream_index).or_default().push(frame);
         }
@@ -339,6 +403,8 @@ impl MultiStreamManager {
             child: None,
             kind: SlotKind::Phone,
             upload_token: Some(token),
+            enabled: true,
+            last_frame_unix: None,
         });
         (index, token_hex)
     }
@@ -377,11 +443,18 @@ impl MultiStreamManager {
         if !ct_eq_hex64(token_hex, &expected_hex) {
             return Err(PhoneFrameError::TokenMismatch);
         }
-        // CONNECTING → ACTIVE on the first successful frame.
+        // CONNECTING → ACTIVE on the first successful frame; also bump
+        // the liveness timestamp so the dashboard can detect when the
+        // phone stops POSTing.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let slot_mut = &mut self.streams[index];
         if slot_mut.status == StreamState::Connecting {
             slot_mut.status = StreamState::Active;
         }
+        slot_mut.last_frame_unix = Some(now_unix);
         // Non-blocking send so a full ring doesn't deadlock under the
         // manager mutex. The phone client retries on the next tick.
         self.frame_tx

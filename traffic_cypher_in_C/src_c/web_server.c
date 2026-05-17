@@ -691,6 +691,14 @@ static void handle_unlock(int fd, app_state_t *state, http_request_t *req) {
         return;
     }
 
+    /* Snapshot whether a vault file existed *before* load_vault — load_vault
+     * silently generates a fresh DEK when the file is missing (first-run
+     * path) but doesn't write the file. We persist it ourselves below so
+     * /api/auth/status reports vault_exists=true on the very next refresh.
+     * Without this, a brand-new user who hasn't added a credential yet would
+     * be shown the first-setup screen again after every reload. */
+    int was_first_run = (access(vault_path(), F_OK) != 0);
+
     unlocked_vault_t unlocked;
     if (load_vault(master_pw, &unlocked) != 0) {
         pthread_mutex_lock(&state->lock);
@@ -731,6 +739,17 @@ static void handle_unlock(int fd, app_state_t *state, http_request_t *req) {
     /* Start rotation daemon */
     state->rotation_stop = 0;
     pthread_create(&state->rotation_thread, NULL, rotation_daemon, state);
+
+    /* First-time setup: persist the empty vault now so the next /auth/status
+     * probe sees vault_exists=true. Without this, a refresh before any
+     * credential write would route back to the first-setup screen. */
+    if (was_first_run) {
+        if (save_vault_with_state(state) != 0) {
+            fprintf(stderr, "warning: first-run save_vault failed; "
+                            "vault file will appear only after the first "
+                            "credential write\n");
+        }
+    }
 
     char resp_buf[512];
     snprintf(resp_buf, sizeof(resp_buf),
@@ -777,8 +796,14 @@ static void handle_auth_status(int fd, app_state_t *state) {
     }
     pthread_mutex_unlock(&state->lock);
 
-    char buf[64];
-    snprintf(buf, sizeof(buf), "{\"unlocked\":%s}", unlocked ? "true" : "false");
+    /* vault_exists drives first-setup vs unlock UI on the frontend. Use
+     * access() so we don't try to parse a half-written file. */
+    int vault_exists = (access(vault_path(), F_OK) == 0) ? 1 : 0;
+
+    char buf[96];
+    snprintf(buf, sizeof(buf), "{\"unlocked\":%s,\"vault_exists\":%s}",
+             unlocked ? "true" : "false",
+             vault_exists ? "true" : "false");
     send_json(fd, 200, "OK", buf);
 }
 
@@ -1252,22 +1277,45 @@ static void handle_add_stream(int fd, app_state_t *state, http_request_t *req) {
 
 static void handle_remove_stream(int fd, app_state_t *state, int index) {
 #ifdef ENABLE_TRAFFIC_ENTROPY
-    /* MSM-level removal (joins prep/forwarder for ffmpeg slots; just clears
-     * the slot for phone slots). Returns -1 if the slot was empty. */
-    int msm_rc = state->msm ? msm_remove_stream(state->msm, index) : -1;
+    /* The `index` arrives from the URL as the *compacted* position in the
+     * list returned by GET /streams (msm_get_statuses skips inactive slots,
+     * so a hole in `msm->slots[]` makes raw and compacted indices diverge).
+     * Translate first; without this the wrong slot was being removed —
+     * "Stream index out of range" if the compacted tail went past the last
+     * raw slot, and silent mis-removal otherwise. */
+    int raw_idx = state->msm ? msm_active_index_to_slot(state->msm, index) : -1;
 
-    /* Phone slots are MSM-only — they don't live in stream_config, so the
-     * shift-down below is skipped. Whether we acknowledge depends on whether
-     * MSM actually had the slot. */
+    /* Snapshot the URL *before* removing from MSM so we can later identify
+     * the matching stream_config entry by URL (phone slots aren't persisted,
+     * so an index-based config removal mis-targets when phone and ffmpeg
+     * slots are interleaved). */
+    char removed_url[VAULT_FIELD_MAX] = {0};
+    if (raw_idx >= 0) {
+        stream_status_t snap[VAULT_MAX_STREAMS];
+        int n = msm_get_statuses(state->msm, snap, VAULT_MAX_STREAMS);
+        if (index >= 0 && index < n) {
+            strncpy(removed_url, snap[index].url, sizeof(removed_url) - 1);
+        }
+    }
+
+    int msm_rc = (raw_idx >= 0) ? msm_remove_stream(state->msm, raw_idx) : -1;
+
+    /* Find the matching stream_config entry by URL (phone slots have no
+     * config entry, so this naturally no-ops for them). */
     int touched_config = 0;
     pthread_mutex_lock(&state->lock);
-    if (index >= 0 && index < state->stream_config.stream_count) {
-        memmove(&state->stream_config.streams[index],
-                &state->stream_config.streams[index + 1],
-                ((size_t)state->stream_config.stream_count - (size_t)index - 1) * sizeof(stream_entry_t));
-        state->stream_config.stream_count--;
-        save_stream_config(&state->stream_config);
-        touched_config = 1;
+    if (removed_url[0]) {
+        for (int i = 0; i < state->stream_config.stream_count; i++) {
+            if (strcmp(state->stream_config.streams[i].url, removed_url) == 0) {
+                memmove(&state->stream_config.streams[i],
+                        &state->stream_config.streams[i + 1],
+                        ((size_t)state->stream_config.stream_count - (size_t)i - 1) * sizeof(stream_entry_t));
+                state->stream_config.stream_count--;
+                save_stream_config(&state->stream_config);
+                touched_config = 1;
+                break;
+            }
+        }
     }
     pthread_mutex_unlock(&state->lock);
 
@@ -1313,6 +1361,8 @@ static void handle_list_streams(int fd, app_state_t *state) {
     /* Read live state from the multi_stream manager. */
     stream_status_t statuses[VAULT_MAX_STREAMS];
     int n = state->msm ? msm_get_statuses(state->msm, statuses, VAULT_MAX_STREAMS) : 0;
+    uint64_t now_unix = (uint64_t)time(NULL);
+    const uint64_t STALE_AFTER_SEC = 3;
     for (int i = 0; i < n; i++) {
         if (i > 0) sb_append(&sb, ",");
         sb_append(&sb, "{\"url\":\"");
@@ -1327,7 +1377,26 @@ static void handle_list_streams(int fd, app_state_t *state) {
         sb_append(&sb, num);
         sb_append(&sb, ",\"kind\":\"");
         sb_append(&sb, statuses[i].kind == SLOT_PHONE ? "phone" : "ffmpeg");
-        sb_append(&sb, "\"}");
+        sb_append(&sb, "\",\"enabled\":");
+        sb_append(&sb, statuses[i].enabled ? "true" : "false");
+        /* Liveness: `live` is true iff a frame arrived within the last
+         * STALE_AFTER_SEC seconds. `seconds_idle` is the operator-facing
+         * delta from `now`. Dashboard uses both to flip the row's status
+         * text from "Active" to "Idle" without losing the underlying
+         * status semantics. */
+        uint64_t last = statuses[i].last_frame_unix;
+        int is_live = (last != 0 && now_unix >= last && (now_unix - last) <= STALE_AFTER_SEC);
+        sb_append(&sb, ",\"live\":");
+        sb_append(&sb, is_live ? "true" : "false");
+        sb_append(&sb, ",\"seconds_idle\":");
+        if (last == 0) {
+            sb_append(&sb, "null");
+        } else {
+            snprintf(num, sizeof(num), "%llu",
+                     (unsigned long long)(now_unix >= last ? now_unix - last : 0));
+            sb_append(&sb, num);
+        }
+        sb_append(&sb, "}");
     }
 #else
     pthread_mutex_lock(&state->lock);
@@ -1691,10 +1760,47 @@ static void handle_request(int fd, app_state_t *state, http_request_t *req) {
         }
     }
     if (strncmp(req->path, "/api/streams/", 13) == 0) {
-        int idx = atoi(req->path + 13);
-        if (strcmp(req->method, "DELETE") == 0) {
-            handle_remove_stream(fd, state, idx);
-            return;
+        const char *tail = req->path + 13;
+        char *endp = NULL;
+        long idx = strtol(tail, &endp, 10);
+        if (endp != tail && idx >= 0 && idx < VAULT_MAX_STREAMS) {
+            /* /api/streams/{N} — DELETE removes the slot. */
+            if (*endp == '\0' && strcmp(req->method, "DELETE") == 0) {
+                handle_remove_stream(fd, state, (int)idx);
+                return;
+            }
+#ifdef ENABLE_TRAFFIC_ENTROPY
+            /* /api/streams/{N}/enable | /disable — operator toggles whether
+             * the rotation daemon picks frames from this slot. The
+             * underlying capture or phone-frame intake keeps running so the
+             * toggle is instant; flipping back ON resumes contribution on
+             * the next captured frame.
+             *
+             * `idx` here is the compacted active-list position from GET
+             * /streams; translate to raw slot index before calling
+             * msm_set_enabled (same divergence as handle_remove_stream). */
+            if ((strcmp(endp, "/enable") == 0 || strcmp(endp, "/disable") == 0)
+                && strcmp(req->method, "POST") == 0) {
+                int want_enabled = (strcmp(endp, "/enable") == 0);
+                int raw_idx = state->msm
+                    ? msm_active_index_to_slot(state->msm, (int)idx)
+                    : -1;
+                int rc = (raw_idx >= 0)
+                    ? msm_set_enabled(state->msm, raw_idx, want_enabled)
+                    : -1;
+                if (rc == 0) {
+                    char resp[96];
+                    snprintf(resp, sizeof(resp),
+                             "{\"status\":\"%s\",\"index\":%ld}",
+                             want_enabled ? "enabled" : "disabled", idx);
+                    send_json(fd, 200, "OK", resp);
+                } else {
+                    send_error(fd, 400, "Bad Request",
+                               "stream slot out of range or empty");
+                }
+                return;
+            }
+#endif
         }
     }
 
@@ -1819,10 +1925,23 @@ int web_server_start(app_state_t *state, int port) {
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
+    /* Bind address is 127.0.0.1 by default — exposing the daemon on a LAN
+     * means the unlock endpoint, phone-camera endpoints, and all credential
+     * routes are reachable from any host that can route to this machine.
+     * Operators that explicitly want LAN access can set TC_BIND_ADDR=0.0.0.0
+     * (or a specific interface address). Per-IP rate limiting on /api/auth
+     * /unlock is in place (#8), but you still want network-level isolation
+     * if the daemon is reachable from untrusted hosts. */
+    const char *bind_str = getenv("TC_BIND_ADDR");
+    if (!bind_str || !*bind_str) bind_str = "127.0.0.1";
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (inet_pton(AF_INET, bind_str, &addr.sin_addr) != 1) {
+        fprintf(stderr, "[ERROR] invalid TC_BIND_ADDR=%s (expected IPv4 dotted-decimal)\n", bind_str);
+        close(server_fd);
+        return -1;
+    }
     addr.sin_port = htons((uint16_t)port);
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -1867,8 +1986,8 @@ int web_server_start(app_state_t *state, int port) {
     pthread_attr_destroy(&worker_attr);
     g_workers_started = 1;
 
-    fprintf(stderr, "[INFO] Listening on http://127.0.0.1:%d (workers=%d, queue=%d)\n",
-            port, POOL_WORKERS, QUEUE_CAP);
+    fprintf(stderr, "[INFO] Listening on http://%s:%d (workers=%d, queue=%d)\n",
+            bind_str, port, POOL_WORKERS, QUEUE_CAP);
 
     while (server_running) {
         struct sockaddr_in client_addr;

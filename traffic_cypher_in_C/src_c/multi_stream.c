@@ -70,6 +70,19 @@ typedef struct {
     int             cancel_requested;
     int             prep_joined;
     int             forwarder_joined;
+    /* Operator-controlled gate. Default ON (set in msm_add_stream /
+     * msm_register_phone). When OFF, pick_random_frame skips frames from
+     * this slot — the underlying capture or phone POST loop keeps running
+     * but its frames don't influence the DEK chain. Lets the operator
+     * choose which sources contribute without tearing down the slot. */
+    int             enabled;
+    /* Unix-seconds of the most recent frame that arrived for this slot.
+     * Updated by msm_push_phone_frame (phone path) and by
+     * msm_pick_random_frame (ffmpeg path — when the daemon drains a
+     * frame from the ring it's proof the source produced one recently).
+     * Stays at 0 until the first frame; consumed by the web layer to
+     * derive a `live` boolean for the dashboard. */
+    uint64_t        last_frame_unix;
 
     /*
      * Two distinct pthreads can be associated with a slot:
@@ -380,6 +393,7 @@ int msm_add_stream(multi_stream_manager_t *msm, const char *url, const char *lab
     stream_slot_t *slot = &msm->slots[idx];
     memset(slot, 0, sizeof(*slot));
     slot->active = 1;
+    slot->enabled = 1;
     slot->status = STREAM_CONNECTING;
     strncpy(slot->url, url, sizeof(slot->url) - 1);
     strncpy(slot->label, label, sizeof(slot->label) - 1);
@@ -528,13 +542,25 @@ int msm_pick_random_frame(multi_stream_manager_t *msm, frame_t *out) {
             continue;
         }
 
-        /* Count the capture for the slot, even if we end up discarding the
-         * frame because a newer one arrived from the same stream. */
+        /* Count the capture even when the slot is operator-disabled — the
+         * frame still arrived. But take the snapshot of `enabled` under
+         * the lock so we can decide afterwards whether the frame can be
+         * a candidate for the random pick. */
+        int slot_enabled = 0;
         pthread_mutex_lock(&msm->lock);
         if (msm->slots[drained_index].active) {
             msm->slots[drained_index].frames_captured++;
+            msm->slots[drained_index].last_frame_unix = (uint64_t)time(NULL);
+            slot_enabled = msm->slots[drained_index].enabled;
         }
         pthread_mutex_unlock(&msm->lock);
+
+        /* Disabled slots: count the frame but don't let it influence the
+         * pick — the rotation daemon should treat that source as inert. */
+        if (!slot_enabled) {
+            free(drained_frame.data);
+            continue;
+        }
 
         if (have[drained_index]) {
             /* Replace older with newer; free the older. */
@@ -589,10 +615,43 @@ int msm_get_statuses(multi_stream_manager_t *msm, stream_status_t *out, int max)
         out[n].status = msm->slots[i].status;
         out[n].frames_captured = msm->slots[i].frames_captured;
         out[n].kind = msm->slots[i].kind;
+        out[n].enabled = msm->slots[i].enabled;
+        out[n].last_frame_unix = msm->slots[i].last_frame_unix;
         n++;
     }
     pthread_mutex_unlock(&msm->lock);
     return n;
+}
+
+int msm_active_index_to_slot(multi_stream_manager_t *msm, int active_index) {
+    if (!msm || active_index < 0) return -1;
+    int seen = 0;
+    int raw = -1;
+    pthread_mutex_lock(&msm->lock);
+    for (int i = 0; i < VAULT_MAX_STREAMS; i++) {
+        if (!msm->slots[i].active) continue;
+        if (seen == active_index) {
+            raw = i;
+            break;
+        }
+        seen++;
+    }
+    pthread_mutex_unlock(&msm->lock);
+    return raw;
+}
+
+int msm_set_enabled(multi_stream_manager_t *msm, int index, int enabled) {
+    if (!msm) return -1;
+    if (index < 0 || index >= VAULT_MAX_STREAMS) return -1;
+    pthread_mutex_lock(&msm->lock);
+    stream_slot_t *slot = &msm->slots[index];
+    if (!slot->active) {
+        pthread_mutex_unlock(&msm->lock);
+        return -1;
+    }
+    slot->enabled = enabled ? 1 : 0;
+    pthread_mutex_unlock(&msm->lock);
+    return 0;
 }
 
 int msm_stream_count(multi_stream_manager_t *msm) {
@@ -704,6 +763,7 @@ int msm_register_phone(multi_stream_manager_t *msm, const char *label,
     stream_slot_t *slot = &msm->slots[idx];
     memset(slot, 0, sizeof(*slot));
     slot->active = 1;
+    slot->enabled = 1;
     slot->kind = SLOT_PHONE;
     slot->status = STREAM_CONNECTING;  /* → ACTIVE on first successful frame */
     slot->prep_joined = 1;             /* No prep thread to join */
@@ -747,10 +807,13 @@ int msm_push_phone_frame(multi_stream_manager_t *msm, int index,
         pthread_mutex_unlock(&msm->lock);
         return -2;
     }
-    /* First successful frame transitions CONNECTING → ACTIVE. */
+    /* First successful frame transitions CONNECTING → ACTIVE; subsequent
+     * frames also refresh the liveness timestamp so the dashboard can
+     * detect when the phone stops POSTing. */
     if (slot->status == STREAM_CONNECTING) {
         slot->status = STREAM_ACTIVE;
     }
+    slot->last_frame_unix = (uint64_t)time(NULL);
     pthread_mutex_unlock(&msm->lock);
 
     /* Copy pixels into a heap-owned frame so the caller can release their
@@ -795,6 +858,7 @@ int msm_test_register_slot(multi_stream_manager_t *msm, const char *url, const c
     stream_slot_t *slot = &msm->slots[idx];
     memset(slot, 0, sizeof(*slot));
     slot->active = 1;
+    slot->enabled = 1;
     slot->status = STREAM_ACTIVE;
     slot->prep_joined      = 1;  /* No real threads spawned in test mode. */
     slot->forwarder_joined = 1;

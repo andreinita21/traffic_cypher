@@ -91,6 +91,11 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/streams", post(add_stream))
         .route("/streams/{index}", delete(remove_stream))
         .route("/streams/{index}", put(update_stream))
+        // Operator gate — toggle whether this slot contributes frames to
+        // the rotation daemon's pick. Underlying capture / phone POSTs
+        // keep running; only the daemon's selection changes.
+        .route("/streams/{index}/enable", post(enable_stream))
+        .route("/streams/{index}/disable", post(disable_stream))
         // Phone-camera entropy endpoints (NEXT_STEPS.md Phase B).
         // No Bearer auth on register/frame — the per-slot upload token (returned
         // by /streams/phone, presented in X-Upload-Token on each frame POST)
@@ -125,6 +130,7 @@ struct UnlockResponse {
 #[derive(Serialize)]
 struct AuthStatusResponse {
     unlocked: bool,
+    vault_exists: bool,
 }
 
 #[derive(Deserialize)]
@@ -382,6 +388,12 @@ async fn unlock(State(state): State<Arc<AppState>>, Json(req): Json<UnlockReques
         return rate_limited_response(secs);
     }
 
+    // Snapshot whether a vault file existed *before* load_vault. load_vault
+    // silently fabricates an empty in-memory vault when the file is missing
+    // (first-run path) but doesn't write it. We persist it ourselves below so
+    // /api/auth/status reports vault_exists=true on the very next refresh.
+    let was_first_run = !vault::vault_path().exists();
+
     // Try to load vault with master password only (envelope encryption)
     match vault::load_vault(&req.master_password) {
         Ok(unlocked) => {
@@ -428,7 +440,15 @@ async fn unlock(State(state): State<Arc<AppState>>, Json(req): Json<UnlockReques
                 }
             });
 
-            // Start entropy collection daemon
+            // Start entropy collection daemon. First cancel any daemon left
+            // over from a previous unlock — without this, every unlock that
+            // isn't preceded by a lock (session expiry, double-unlock, the
+            // first-run path below) leaks a daemon. The leaked daemon never
+            // stops: dropping its cancel sender makes changed() fire but
+            // borrow() still reads false, so it busy-spins forever.
+            if let Some(old_cancel) = state.rotation_cancel.write().await.take() {
+                let _ = old_cancel.send(true);
+            }
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
             *state.rotation_cancel.write().await = Some(cancel_tx);
 
@@ -437,6 +457,25 @@ async fn unlock(State(state): State<Arc<AppState>>, Json(req): Json<UnlockReques
             tokio::spawn(async move {
                 key_rotation::start_rotation_daemon(sm_clone, rs_clone, cancel_rx).await;
             });
+
+            // First-time setup: persist the empty vault now so the next
+            // /auth/status probe sees vault_exists=true. Without this, a
+            // refresh before any credential write routes back to the
+            // first-setup screen.
+            if was_first_run {
+                let v = state.vault.read().await;
+                let dek_guard = state.current_dek.read().await;
+                let dek = dek_guard.as_ref().expect("DEK was just set above");
+                let master = state.master_password.read().await;
+                let esrc = state.entropy_source.read().await;
+                if let Err(e) = vault::save_vault(&v, master.as_str(), dek, &esrc) {
+                    tracing::warn!(
+                        "first-run save_vault failed: {} — vault file will appear \
+                         only after the first credential write",
+                        e
+                    );
+                }
+            }
 
             (
                 StatusCode::OK,
@@ -493,6 +532,7 @@ async fn lock(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Respons
 
 async fn auth_status(State(state): State<Arc<AppState>>) -> Json<AuthStatusResponse> {
     let unlocked = *state.is_unlocked.read().await;
+    let vault_exists = vault::vault_path().exists();
     // Check auto-lock
     if unlocked && state.check_auto_lock().await {
         // Auto-lock: clear DEK and session
@@ -502,9 +542,9 @@ async fn auth_status(State(state): State<Arc<AppState>>) -> Json<AuthStatusRespo
         *state.session_token.write().await = None;
         *state.is_unlocked.write().await = false;
         *state.current_dek.write().await = None;
-        return Json(AuthStatusResponse { unlocked: false });
+        return Json(AuthStatusResponse { unlocked: false, vault_exists });
     }
-    Json(AuthStatusResponse { unlocked })
+    Json(AuthStatusResponse { unlocked, vault_exists })
 }
 
 async fn verify_password(
@@ -855,7 +895,25 @@ async fn list_streams(headers: HeaderMap, State(state): State<Arc<AppState>>) ->
     }
 
     let mgr = state.stream_manager.lock().await;
-    let statuses = mgr.get_statuses();
+    let mut statuses = mgr.get_statuses();
+    // Derive `live` + `seconds_idle` from the slot's `last_frame_unix`.
+    // 3-second staleness window — must agree with the C build's
+    // STALE_AFTER_SEC in web_server.c::handle_list_streams.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    const STALE_AFTER_SEC: u64 = 3;
+    for s in &mut statuses {
+        if let Some(last) = s.last_frame_unix {
+            let idle = now_unix.saturating_sub(last);
+            s.live = idle <= STALE_AFTER_SEC;
+            s.seconds_idle = Some(idle);
+        } else {
+            s.live = false;
+            s.seconds_idle = None;
+        }
+    }
     (StatusCode::OK, Json(statuses)).into_response()
 }
 
@@ -911,13 +969,29 @@ async fn remove_stream(
     }
 
     let mut mgr = state.stream_manager.lock().await;
+
+    // Snapshot the URL of the slot we're about to remove *before* calling
+    // remove_stream, so we can locate its persisted config entry by URL.
+    // Indexing config.streams by `index` directly is wrong when phone slots
+    // are interleaved in the live manager — phone slots have no config
+    // entry, so the positions diverge and the wrong ffmpeg row would be
+    // unpersisted (or the call would silently no-op).
+    let removed_url = mgr
+        .get_statuses()
+        .get(index)
+        .map(|s| s.url.clone());
+
     match mgr.remove_stream(index).await {
         Ok(()) => {
-            // Update config
-            let mut config = vault::load_stream_config();
-            if index < config.streams.len() {
-                config.streams.remove(index);
-                let _ = vault::save_stream_config(&config);
+            // Update config by URL match (phone slots are not persisted,
+            // so this naturally no-ops for them).
+            if let Some(url) = removed_url {
+                let mut config = vault::load_stream_config();
+                let before = config.streams.len();
+                config.streams.retain(|s| s.url != url);
+                if config.streams.len() != before {
+                    let _ = vault::save_stream_config(&config);
+                }
             }
             (
                 StatusCode::OK,
@@ -959,6 +1033,46 @@ async fn update_stream(
             )
                 .into_response()
         }
+        Err(e) => err_json(StatusCode::BAD_REQUEST, &format!("{}", e)),
+    }
+}
+
+/// POST /api/streams/{index}/enable
+async fn enable_stream(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Path(index): Path<usize>,
+) -> Response {
+    if !validate_session(&headers, &state).await {
+        return unauthorized();
+    }
+    let mut mgr = state.stream_manager.lock().await;
+    match mgr.set_enabled(index, true) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "enabled", "index": index})),
+        )
+            .into_response(),
+        Err(e) => err_json(StatusCode::BAD_REQUEST, &format!("{}", e)),
+    }
+}
+
+/// POST /api/streams/{index}/disable
+async fn disable_stream(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Path(index): Path<usize>,
+) -> Response {
+    if !validate_session(&headers, &state).await {
+        return unauthorized();
+    }
+    let mut mgr = state.stream_manager.lock().await;
+    match mgr.set_enabled(index, false) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "disabled", "index": index})),
+        )
+            .into_response(),
         Err(e) => err_json(StatusCode::BAD_REQUEST, &format!("{}", e)),
     }
 }

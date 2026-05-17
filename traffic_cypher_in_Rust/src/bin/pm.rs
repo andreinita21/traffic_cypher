@@ -1,7 +1,8 @@
 //! Traffic Cypher Password Manager — Web UI
 //!
-//! Starts an axum web server on 127.0.0.1:9876 serving the password manager
-//! dashboard with liquid glass UI.
+//! Starts an axum web server serving the password manager dashboard.
+//! Bind address/port default to 127.0.0.1:9876; override with the
+//! TC_BIND_ADDR and TC_PORT environment variables.
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -20,6 +21,14 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    // Bind address and port are configurable for LAN / reverse-proxy / tunnel
+    // deployments (e.g. a cloudflared tunnel). Defaults stay 127.0.0.1:9876 so
+    // the documented localhost-only threat model holds unless an operator
+    // explicitly opts in by setting these env vars.
+    let bind_addr = std::env::var("TC_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port = std::env::var("TC_PORT").unwrap_or_else(|_| "9876".to_string());
+    let listen = format!("{bind_addr}:{port}");
+
     println!(
         r#"
 ╔══════════════════════════════════════════════════════════╗
@@ -27,17 +36,16 @@ async fn main() -> Result<()> {
 ║     T R A F F I C   C Y P H E R                          ║
 ║   Entropy-Driven Password Manager                        ║
 ║                                                          ║
-║   Dashboard: http://127.0.0.1:9876                       ║
-║                                                          ║
 ╚══════════════════════════════════════════════════════════╝
 "#
     );
+    println!("   Dashboard: http://{listen}\n");
 
     let state = Arc::new(web::state::AppState::new());
     let router = web::create_router(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:9876").await?;
-    info!("Listening on http://127.0.0.1:9876");
+    let listener = tokio::net::TcpListener::bind(listen.as_str()).await?;
+    info!("Listening on http://{listen}");
 
     axum::serve(listener, router).await?;
 
