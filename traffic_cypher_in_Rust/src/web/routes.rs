@@ -542,9 +542,15 @@ async fn auth_status(State(state): State<Arc<AppState>>) -> Json<AuthStatusRespo
         *state.session_token.write().await = None;
         *state.is_unlocked.write().await = false;
         *state.current_dek.write().await = None;
-        return Json(AuthStatusResponse { unlocked: false, vault_exists });
+        return Json(AuthStatusResponse {
+            unlocked: false,
+            vault_exists,
+        });
     }
-    Json(AuthStatusResponse { unlocked, vault_exists })
+    Json(AuthStatusResponse {
+        unlocked,
+        vault_exists,
+    })
 }
 
 async fn verify_password(
@@ -976,10 +982,7 @@ async fn remove_stream(
     // are interleaved in the live manager — phone slots have no config
     // entry, so the positions diverge and the wrong ffmpeg row would be
     // unpersisted (or the call would silently no-op).
-    let removed_url = mgr
-        .get_statuses()
-        .get(index)
-        .map(|s| s.url.clone());
+    let removed_url = mgr.get_statuses().get(index).map(|s| s.url.clone());
 
     match mgr.remove_stream(index).await {
         Ok(()) => {
