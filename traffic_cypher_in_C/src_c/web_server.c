@@ -393,6 +393,13 @@ static void write_all(int fd, const char *buf, size_t len) {
     }
 }
 
+/* Route-match a path, tolerating a trailing ?query so cache-busting asset
+ * URLs (e.g. /app.js?v=2) still reach the static-file handlers. */
+static int path_is(const char *path, const char *route) {
+    size_t n = strlen(route);
+    return strncmp(path, route, n) == 0 && (path[n] == '\0' || path[n] == '?');
+}
+
 static void send_response(int fd, http_response_t *resp) {
     char header[4096];
     int header_len = snprintf(header, sizeof(header),
@@ -402,6 +409,7 @@ static void send_response(int fd, http_response_t *resp) {
         "Access-Control-Allow-Origin: http://127.0.0.1:9876\r\n"
         "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
         "Access-Control-Allow-Headers: Content-Type\r\n"
+        "Cache-Control: no-store\r\n"
         "Connection: close\r\n"
         "\r\n",
         resp->status, resp->status_text, resp->content_type, resp->body_len);
@@ -1697,7 +1705,7 @@ static void handle_request(int fd, app_state_t *state, http_request_t *req) {
 
     /* Static files */
     if (strcmp(req->method, "GET") == 0) {
-        if (strcmp(req->path, "/") == 0) {
+        if (path_is(req->path, "/")) {
             if (frontend_index) {
                 http_response_t resp = {200, "OK", "text/html", frontend_index, frontend_index_len};
                 send_response(fd, &resp);
@@ -1706,21 +1714,21 @@ static void handle_request(int fd, app_state_t *state, http_request_t *req) {
             }
             return;
         }
-        if (strcmp(req->path, "/app.js") == 0) {
+        if (path_is(req->path, "/app.js")) {
             if (frontend_js) {
                 http_response_t resp = {200, "OK", "application/javascript", frontend_js, frontend_js_len};
                 send_response(fd, &resp);
             }
             return;
         }
-        if (strcmp(req->path, "/style.css") == 0) {
+        if (path_is(req->path, "/style.css")) {
             if (frontend_css) {
                 http_response_t resp = {200, "OK", "text/css", frontend_css, frontend_css_len};
                 send_response(fd, &resp);
             }
             return;
         }
-        if (strcmp(req->path, "/phone.html") == 0) {
+        if (path_is(req->path, "/phone.html")) {
             if (frontend_phone) {
                 http_response_t resp = {200, "OK", "text/html", frontend_phone, frontend_phone_len};
                 send_response(fd, &resp);

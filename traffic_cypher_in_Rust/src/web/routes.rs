@@ -38,25 +38,35 @@ pub fn static_routes() -> Router<Arc<AppState>> {
         .route("/phone.html", get(serve_phone))
 }
 
-async fn serve_index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+async fn serve_index() -> Response {
+    // no-store: the SPA shell + assets must never be cached by the browser or
+    // an upstream CDN (Cloudflare), or frontend updates silently go unseen.
+    ([("cache-control", "no-store")], Html(INDEX_HTML)).into_response()
 }
 
 async fn serve_js() -> Response {
     (
         StatusCode::OK,
-        [("content-type", "application/javascript")],
+        [
+            ("content-type", "application/javascript"),
+            ("cache-control", "no-store"),
+        ],
         APP_JS,
     )
         .into_response()
 }
 
 async fn serve_css() -> Response {
-    (StatusCode::OK, [("content-type", "text/css")], STYLE_CSS).into_response()
+    (
+        StatusCode::OK,
+        [("content-type", "text/css"), ("cache-control", "no-store")],
+        STYLE_CSS,
+    )
+        .into_response()
 }
 
-async fn serve_phone() -> Html<&'static str> {
-    Html(PHONE_HTML)
+async fn serve_phone() -> Response {
+    ([("cache-control", "no-store")], Html(PHONE_HTML)).into_response()
 }
 
 // ---------------------------------------------------------------------------
